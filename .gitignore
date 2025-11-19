@@ -1,5 +1,6 @@
 # Virtual environment
 py313/
+py312/
 
 # Python cache
 __pycache__/

@@ -1,15 +1,36 @@
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, Label, Button, RichLog
+from textual.screen import ModalScreen
 from textual.binding import Binding
 import asyncio
+import pyperclip 
+
+class QuitScreen(ModalScreen):
+    CSS = """
+    QuitScreen { align: center middle; }
+    #dialog { grid-size: 2; grid-gutter: 1 2; grid-rows: 1fr 3; padding: 0 1; width: 60; height: 11; border: thick $background 80%; background: $surface; }
+    #question { column-span: 2; height: 1fr; width: 1fr; content-align: center middle; }
+    Button { width: 100%; }
+    """
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label("Are you sure you want to quit?", id="question"),
+            Button("Quit", variant="error", id="quit"),
+            Button("Cancel", variant="primary", id="cancel"),
+            id="dialog",
+        )
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "quit": self.app.exit()
+        else: self.app.pop_screen()
 
 class ChatItem(ListItem):
-    def __init__(self, name, ip):
+    def __init__(self, name, ip, port):
         super().__init__()
         self.contact_name = name
         self.contact_ip = ip
-        self.add_child(Label(f"{name} ({ip})"))
+        self.contact_port = port
+        self.add_child(Label(f"{name} ({ip}:{port})"))
 
 class MessengerTUI(App):
     CSS = """
@@ -21,118 +42,146 @@ class MessengerTUI(App):
     Input { dock: bottom; }
     """
     
-    BINDINGS = [("ctrl+q", "quit", "Quit")]
+    BINDINGS = [
+        Binding("ctrl+q", "request_quit", "Quit"),
+        Binding("c", "copy_last_message", "Copy Msg"),
+        Binding("l", "copy_logs", "Copy Logs"),
+        Binding("r", "refresh_peers", "Refresh Network"),
+    ]
 
-    def __init__(self, udp_protocol, discovery, storage):
+    def __init__(self, udp_protocol, discovery, storage, user_id, bind_ip=None):
         super().__init__()
         self.proto = udp_protocol
         self.discovery = discovery
         self.storage = storage
-        self.current_chat_ip = None
-        # Historial simple en memoria: IP -> lista de strings formateados
+        self.user_id = user_id 
+        self.bind_ip = bind_ip # Guardamos la IP de binding
+        self.current_chat_addr = None 
         self.message_history = {}
+        self.last_msg_content = ""
+        self.log_buffer = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(classes="sidebar"):
             yield Label("  📡 Discovered Peers", id="lbl_peers")
             yield ListView(id="contact_list")
+            yield Button("Refresh Peers", id="btn_refresh", variant="primary")
         with Vertical(classes="chat-area"):
-            # Usamos RichLog para permitir scroll y append (.write)
             yield RichLog(highlight=True, markup=True, id="chat_box", classes="messages")
             yield RichLog(highlight=True, markup=True, id="log_box", classes="logs")
             yield Input(placeholder="Type secure message...", id="msg_input")
         yield Footer()
 
-    def on_mount(self):
+    async def on_mount(self):
         self.title = "🇪🇸 DNIe Secure Messenger"
-        # Hook up callbacks
         self.proto.on_log = self.add_log
         self.proto.on_message = self.receive_message
         self.discovery.on_found = self.add_peer
+        self.discovery.on_log = self.add_log 
         
-        # Mensajes iniciales
         self.query_one("#chat_box", RichLog).write("Select a contact to chat")
-        self.query_one("#log_box", RichLog).write("System Logs...")
+        self.add_log(f"System initializing for {self.user_id} on {self.bind_ip or 'ALL'}")
+
+        username = f"User-{self.user_id}"
+        # Pasamos la IP de binding al iniciar el discovery
+        await self.discovery.start(username, bind_ip=self.bind_ip)
+
+    def action_request_quit(self):
+        self.push_screen(QuitScreen())
+
+    def action_refresh_peers(self):
+        self.add_log("🔄 Triggering mDNS refresh...")
+        self.discovery.refresh()
+
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "btn_refresh":
+            self.action_refresh_peers()
+
+    def action_copy_last_message(self):
+        if self.last_msg_content:
+            try:
+                pyperclip.copy(self.last_msg_content)
+                self.notify("Last message copied!")
+            except Exception as e:
+                self.add_log(f"❌ Clipboard error: {e}")
+        else:
+            self.add_log("⚠️ No message to copy.")
+
+    def action_copy_logs(self):
+        if self.log_buffer:
+            try:
+                full_log = "\n".join(self.log_buffer)
+                pyperclip.copy(full_log)
+                self.notify("System logs copied!")
+            except Exception as e:
+                self.add_log(f"❌ Log copy error: {e}")
 
     def add_log(self, text):
-        """Agrega un log. Se llama desde el mismo loop de eventos, actualización directa."""
-        # CORREGIDO: Eliminado call_from_thread
-        log_box = self.query_one("#log_box", RichLog)
-        log_box.write(text)
+        self.log_buffer.append(text)
+        if len(self.log_buffer) > 1000: self.log_buffer.pop(0)
+        self.query_one("#log_box", RichLog).write(text)
 
-    def add_peer(self, name, ip, props):
-        """Agrega un peer descubierto. Actualización directa."""
-        # CORREGIDO: Eliminado call_from_thread
+    def add_peer(self, name, ip, port, props):
         lst = self.query_one("#contact_list", ListView)
         
-        # Registrar clave pública si viene en el descubrimiento
         pub_hex = props.get('pub', '')
         if pub_hex:
             try:
                 import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
                 pub_bytes = bytes.fromhex(pub_hex)
                 pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
-                # Lanzamos tarea asíncrona para guardar en DB
-                asyncio.create_task(self.storage.register_contact(ip, pub_key, props.get('user', name)))
-            except:
-                pass
+                asyncio.create_task(self.storage.register_contact(ip, port, pub_key, props.get('user', name)))
+            except: pass
 
-        # Evitar duplicados visuales
         for child in lst.children:
-            if child.contact_ip == ip: return
+            if child.contact_ip == ip and child.contact_port == port: return
         
-        item = ChatItem(props.get('user', name), ip)
+        clean_name = name.split('.')[0]
+        item = ChatItem(props.get('user', clean_name), ip, port)
         lst.append(item)
-        self.add_log(f"🔎 Found peer: {name} at {ip}")
+        self.add_log(f"🔎 Found peer: {clean_name} at {ip}:{port}")
 
     def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
-        self.current_chat_ip = item.contact_ip
+        self.current_chat_addr = (item.contact_ip, item.contact_port)
         chat_box = self.query_one("#chat_box", RichLog)
         chat_box.clear()
-        chat_box.write(f"Chatting with {item.contact_name}...\n")
+        chat_box.write(f"Chatting with {item.contact_name} ({item.contact_ip}:{item.contact_port})...\n")
         
-        # Restaurar historial si existe
-        if self.current_chat_ip in self.message_history:
-            for line in self.message_history[self.current_chat_ip]:
-                chat_box.write(line)
+        key = f"{item.contact_ip}:{item.contact_port}"
+        if key in self.message_history:
+            for line in self.message_history[key]: chat_box.write(line)
 
     async def on_input_submitted(self, event: Input.Submitted):
-        if not self.current_chat_ip:
+        if not self.current_chat_addr:
             self.add_log("⚠️ Select a contact first!")
             return
-        
         text = event.value
         event.input.value = ""
-        
-        # Formatear y guardar mensaje propio
         formatted_msg = f"[bold green][You]:[/] {text}"
-        self._save_history(self.current_chat_ip, formatted_msg)
+        self.last_msg_content = text
         
-        # Actualizar UI
-        chat = self.query_one("#chat_box", RichLog)
-        chat.write(formatted_msg)
-        
-        # Enviar por red
-        self.proto.send_message((self.current_chat_ip, 443), text)
+        key = f"{self.current_chat_addr[0]}:{self.current_chat_addr[1]}"
+        self._save_history(key, formatted_msg)
+        self.query_one("#chat_box", RichLog).write(formatted_msg)
+        self.proto.send_message(self.current_chat_addr, text)
 
     def receive_message(self, addr, msg):
-        """Recibe mensaje. Actualización directa."""
-        # CORREGIDO: Eliminado call_from_thread
-        ip = addr[0]
+        ip, port = addr
         text = msg.get('text', '')
+        self.last_msg_content = text
         formatted_msg = f"[bold yellow][Peer]:[/] {text}"
+        key = f"{ip}:{port}"
+        self._save_history(key, formatted_msg)
         
-        self._save_history(ip, formatted_msg)
-        
-        if self.current_chat_ip == ip:
-            chat = self.query_one("#chat_box", RichLog)
-            chat.write(formatted_msg)
+        curr_ip = self.current_chat_addr[0] if self.current_chat_addr else None
+        curr_port = self.current_chat_addr[1] if self.current_chat_addr else None
+        if curr_ip == ip and curr_port == port:
+            self.query_one("#chat_box", RichLog).write(formatted_msg)
         else:
-            self.add_log(f"📨 New message from {ip}")
+            self.add_log(f"📨 New message from {ip}:{port}")
 
-    def _save_history(self, ip, line):
-        if ip not in self.message_history:
-            self.message_history[ip] = []
-        self.message_history[ip].append(line)
+    def _save_history(self, key, line):
+        if key not in self.message_history: self.message_history[key] = []
+        self.message_history[key].append(line)

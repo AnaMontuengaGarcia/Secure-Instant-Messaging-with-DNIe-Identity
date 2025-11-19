@@ -3,27 +3,32 @@ import os
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 
-DB_PATH = "data/messenger.db"
-
 class Storage:
-    def __init__(self):
-        if not os.path.exists('data'):
-            os.makedirs('data')
+    def __init__(self, data_dir="data"):
+        self.data_dir = data_dir
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
+        self.db_path = os.path.join(data_dir, "messenger.db")
             
     async def init(self):
-        self.db = await aiosqlite.connect(DB_PATH)
+        self.db = await aiosqlite.connect(self.db_path)
+        # Actualizamos la tabla contacts para incluir PORT como parte de la clave primaria
+        # (Necesario para pruebas locales donde la IP es idéntica)
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
-                ip TEXT PRIMARY KEY,
+                ip TEXT,
+                port INTEGER,
                 pubkey_hex TEXT,
                 friendly_name TEXT,
-                trusted INTEGER DEFAULT 0
+                trusted INTEGER DEFAULT 0,
+                PRIMARY KEY (ip, port)
             )
         """)
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 contact_ip TEXT,
+                contact_port INTEGER,
                 direction TEXT,
                 content TEXT,
                 timestamp REAL
@@ -33,7 +38,7 @@ class Storage:
 
     async def get_static_key(self):
         """Carga o genera la clave de identidad X25519 del nodo local"""
-        key_path = "data/identity.key"
+        key_path = os.path.join(self.data_dir, "identity.key")
         if os.path.exists(key_path):
             with open(key_path, "rb") as f:
                 private_bytes = f.read()
@@ -48,43 +53,41 @@ class Storage:
                 ))
             return priv
 
-    async def register_contact(self, ip, pubkey_obj, name="Unknown"):
+    async def register_contact(self, ip, port, pubkey_obj, name="Unknown"):
         pub_hex = pubkey_obj.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw
         ).hex()
         
-        # TOFU: Si no existe, insertamos. Si existe y clave distinta, ALERTAR (aquí simplificado)
-        async with self.db.execute("SELECT pubkey_hex FROM contacts WHERE ip = ?", (ip,)) as cursor:
+        async with self.db.execute("SELECT pubkey_hex FROM contacts WHERE ip = ? AND port = ?", (ip, port)) as cursor:
             row = await cursor.fetchone()
             if row:
                 if row[0] != pub_hex:
-                    print(f"🚨 SECURITY ALERT: Key changed for {ip}!")
+                    print(f"🚨 SECURITY ALERT: Key changed for {ip}:{port}!")
                     return
             else:
                 await self.db.execute(
-                    "INSERT INTO contacts (ip, pubkey_hex, friendly_name, trusted) VALUES (?, ?, ?, 1)",
-                    (ip, pub_hex, name)
+                    "INSERT INTO contacts (ip, port, pubkey_hex, friendly_name, trusted) VALUES (?, ?, ?, ?, 1)",
+                    (ip, port, pub_hex, name)
                 )
                 await self.db.commit()
 
-    def get_pubkey_by_ip(self, ip):
-        # Síncrono para uso rápido en callback de red (idealmente cachear en memoria)
-        # Aquí simulamos caché o lectura
+    def get_pubkey_by_addr(self, ip, port):
+        # Síncrono para uso rápido en callback de red (simulamos caché o lectura rápida)
         import sqlite3
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute("SELECT pubkey_hex FROM contacts WHERE ip = ?", (ip,))
+        c.execute("SELECT pubkey_hex FROM contacts WHERE ip = ? AND port = ?", (ip, port))
         row = c.fetchone()
         conn.close()
         if row:
             return x25519.X25519PublicKey.from_public_bytes(bytes.fromhex(row[0]))
         return None
 
-    async def log_msg(self, ip, direction, text):
+    async def log_msg(self, ip, port, direction, text):
         import time
         await self.db.execute(
-            "INSERT INTO messages (contact_ip, direction, content, timestamp) VALUES (?, ?, ?, ?)",
-            (ip, direction, text, time.time())
+            "INSERT INTO messages (contact_ip, contact_port, direction, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (ip, port, direction, text, time.time())
         )
         await self.db.commit()
