@@ -25,12 +25,17 @@ class QuitScreen(ModalScreen):
         else: self.app.pop_screen()
 
 class ChatItem(ListItem):
+    """Elemento de lista personalizado para contactos"""
     def __init__(self, name, ip, port):
         super().__init__()
         self.contact_name = name
         self.contact_ip = ip
         self.contact_port = port
-        self.add_child(Label(f"{name} ({ip}:{port})"))
+        self.display_label = f"{name} ({ip}:{port})"
+
+    def compose(self) -> ComposeResult:
+        # CORRECCIÓN: Usamos compose en lugar de add_child en __init__
+        yield Label(self.display_label)
 
 class MessengerTUI(App):
     CSS = """
@@ -55,7 +60,7 @@ class MessengerTUI(App):
         self.discovery = discovery
         self.storage = storage
         self.user_id = user_id 
-        self.bind_ip = bind_ip # Guardamos la IP de binding
+        self.bind_ip = bind_ip 
         self.current_chat_addr = None 
         self.message_history = {}
         self.last_msg_content = ""
@@ -84,7 +89,6 @@ class MessengerTUI(App):
         self.add_log(f"System initializing for {self.user_id} on {self.bind_ip or 'ALL'}")
 
         username = f"User-{self.user_id}"
-        # Pasamos la IP de binding al iniciar el discovery
         await self.discovery.start(username, bind_ip=self.bind_ip)
 
     def action_request_quit(self):
@@ -120,30 +124,50 @@ class MessengerTUI(App):
     def add_log(self, text):
         self.log_buffer.append(text)
         if len(self.log_buffer) > 1000: self.log_buffer.pop(0)
-        self.query_one("#log_box", RichLog).write(text)
+        # Protección por si el widget no está listo
+        try:
+            self.query_one("#log_box", RichLog).write(text)
+        except: pass
 
     def add_peer(self, name, ip, port, props):
-        lst = self.query_one("#contact_list", ListView)
-        
-        pub_hex = props.get('pub', '')
-        if pub_hex:
-            try:
-                import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
-                pub_bytes = bytes.fromhex(pub_hex)
-                pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
-                asyncio.create_task(self.storage.register_contact(ip, port, pub_key, props.get('user', name)))
-            except: pass
+        # Protección de hilo: Asegurar que corremos en el hilo principal
+        # (Aunque Textual suele manejar esto, el sniffer viene de un hilo crudo)
+        try:
+            self.call_from_thread(self._add_peer_thread_safe, name, ip, port, props)
+        except:
+            # Si ya estamos en el hilo principal, llamar directo
+            self._add_peer_thread_safe(name, ip, port, props)
 
-        for child in lst.children:
-            if child.contact_ip == ip and child.contact_port == port: return
-        
-        clean_name = name.split('.')[0]
-        item = ChatItem(props.get('user', clean_name), ip, port)
-        lst.append(item)
-        self.add_log(f"🔎 Found peer: {clean_name} at {ip}:{port}")
+    def _add_peer_thread_safe(self, name, ip, port, props):
+        try:
+            lst = self.query_one("#contact_list", ListView)
+            
+            # Guardar en DB
+            pub_hex = props.get('pub', '')
+            if pub_hex:
+                try:
+                    import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
+                    pub_bytes = bytes.fromhex(pub_hex)
+                    pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
+                    asyncio.create_task(self.storage.register_contact(ip, port, pub_key, props.get('user', name)))
+                except: pass
+
+            # Evitar duplicados visuales
+            for child in lst.children:
+                if isinstance(child, ChatItem):
+                    if child.contact_ip == ip and child.contact_port == port: return
+            
+            clean_name = name.split('.')[0]
+            item = ChatItem(props.get('user', clean_name), ip, port)
+            lst.append(item)
+            self.add_log(f"🔎 Found peer: {clean_name} at {ip}:{port}")
+        except Exception as e:
+            self.add_log(f"⚠️ UI Error adding peer: {e}")
 
     def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
+        if not isinstance(item, ChatItem): return
+        
         self.current_chat_addr = (item.contact_ip, item.contact_port)
         chat_box = self.query_one("#chat_box", RichLog)
         chat_box.clear()
@@ -158,6 +182,8 @@ class MessengerTUI(App):
             self.add_log("⚠️ Select a contact first!")
             return
         text = event.value
+        if not text: return
+        
         event.input.value = ""
         formatted_msg = f"[bold green][You]:[/] {text}"
         self.last_msg_content = text
@@ -168,6 +194,13 @@ class MessengerTUI(App):
         self.proto.send_message(self.current_chat_addr, text)
 
     def receive_message(self, addr, msg):
+        # Protección de hilo para mensajes entrantes
+        try:
+            self.call_from_thread(self._receive_message_thread_safe, addr, msg)
+        except:
+            self._receive_message_thread_safe(addr, msg)
+
+    def _receive_message_thread_safe(self, addr, msg):
         ip, port = addr
         text = msg.get('text', '')
         self.last_msg_content = text

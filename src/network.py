@@ -4,11 +4,18 @@ import struct
 import logging
 import json
 import time
-from zeroconf import ServiceInfo, IPVersion, Zeroconf, InterfaceChoice
+import re
+from zeroconf import ServiceInfo, IPVersion, Zeroconf, InterfaceChoice, DNSIncoming
 from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
 from protocol import NoiseIKState
 
 MDNS_TYPE = "_dni-im._udp.local."
+
+# Constantes DNS
+_TYPE_A = 1
+_TYPE_PTR = 12
+_TYPE_TXT = 16
+_TYPE_SRV = 33
 
 class SessionManager:
     def __init__(self, local_static_key, db):
@@ -45,7 +52,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
         sock = transport.get_extra_info('socket')
         try:
             addr = sock.getsockname()
-            self.on_log(f"✅ UDP Listening on {addr[0]}:{addr[1]}")
+            self.on_log(f"✅ UDP Bound to {addr[0]}:{addr[1]}")
         except: pass
 
     def datagram_received(self, data, addr):
@@ -115,6 +122,85 @@ class UDPProtocol(asyncio.DatagramProtocol):
         except Exception as e:
             self.on_log(f"❌ Send failed: {e}")
 
+class RawSniffer(asyncio.DatagramProtocol):
+    """
+    Sniffer robusto que imita check_mdns.py y usa extracción por Regex.
+    CORREGIDO: Eliminado filtro agresivo por puerto que bloqueaba peers reales.
+    """
+    def __init__(self, service):
+        self.service = service
+
+    def connection_made(self, transport):
+        self.transport = transport
+        # Socket ya configurado externamente
+
+    def datagram_received(self, data, addr):
+        # Filtro básico
+        if b"_dni-im" not in data: return
+
+        # self.service.on_log(f"🔍 RAW PACKET from {addr} ({len(data)}b)")
+
+        try:
+            found_info = None
+
+            # A) Decodificación DNS
+            try:
+                msg = DNSIncoming(data)
+                for record in msg.answers + msg.additionals:
+                    if MDNS_TYPE in record.name and "User-" in record.name:
+                        found_info = self._parse_record_name(record.name)
+                        if found_info: break
+            except: pass
+
+            # B) Regex sobre bytes (Fuerza bruta)
+            if not found_info:
+                try:
+                    raw_text = data.decode('utf-8', errors='ignore')
+                    match = re.search(r'User-([a-zA-Z0-9]+)_(\d+)', raw_text)
+                    if match:
+                        name = match.group(1)
+                        port = int(match.group(2))
+                        found_info = (name, port)
+                except: pass
+
+            if found_info:
+                name, port = found_info
+                
+                # CORRECCIÓN: Eliminado filtro 'if port == self.service.port: return'
+                # Ahora confiamos en el filtrado por clave pública o IP.
+                
+                props = {'user': name}
+                
+                # Intentar extraer clave pública
+                try:
+                    raw_text = data.decode('utf-8', errors='ignore')
+                    pub_match = re.search(r'pub=([a-fA-F0-9]+)', raw_text)
+                    if pub_match:
+                        props['pub'] = pub_match.group(1)
+                        
+                        # FILTRO SEGURO: Solo descartar si la clave es IDÉNTICA a la mía
+                        if props['pub'] == self.service.pubkey_b64:
+                            return
+                except: pass
+
+                self.service.on_found(name, addr[0], port, props)
+
+        except Exception as e:
+            self.service.on_log(f"⚠️ Sniffer exception: {e}")
+
+    def _parse_record_name(self, record_name):
+        try:
+            base = record_name.split(MDNS_TYPE)[0]
+            if base.startswith("User-"):
+                base = base[5:]
+            if "_" in base:
+                parts = base.split('_')
+                port_str = parts[-1].replace('.', '')
+                name = "_".join(parts[:-1])
+                return name, int(port_str)
+        except: pass
+        return None
+
 class DiscoveryService:
     def __init__(self, port, pubkey_bytes, on_service_found, on_log=None):
         self.aiozc = None 
@@ -123,20 +209,25 @@ class DiscoveryService:
         self.on_found = on_service_found
         self.on_log = on_log if on_log else lambda x: None
         self.info = None
-        self.browser = None
         self.loop = None
+        self.sniffer_transport = None
+        self.bind_ip = None
 
     async def start(self, username, bind_ip=None):
         self.loop = asyncio.get_running_loop()
+        self.bind_ip = bind_ip
         
-        # Configuración estándar para LAN: Usar todas las interfaces
-        # Esto permite escuchar tanto en Ethernet como en WiFi simultáneamente
-        self.aiozc = AsyncZeroconf(interfaces=InterfaceChoice.All, ip_version=IPVersion.V4Only)
-        
-        # Detectar automáticamente la IP real de la LAN (ej: 192.168.1.X)
-        # Si el usuario fuerza una IP con --bind, usamos esa.
+        # 1. Zeroconf para PUBLICAR
+        interfaces = InterfaceChoice.All
+        if bind_ip and bind_ip != "0.0.0.0":
+            interfaces = [bind_ip]
+
+        try:
+            self.aiozc = AsyncZeroconf(interfaces=interfaces, ip_version=IPVersion.V4Only)
+        except:
+            self.aiozc = AsyncZeroconf(interfaces=InterfaceChoice.All)
+
         local_ip = bind_ip if (bind_ip and bind_ip != "0.0.0.0") else self.get_local_ip()
-        
         service_name = f"{username}_{self.port}.{MDNS_TYPE}"
         
         desc = {'pub': self.pubkey_b64, 'user': username}
@@ -151,69 +242,48 @@ class DiscoveryService:
         )
         
         self.on_log(f"📢 Advertising: {service_name} @ {local_ip}")
-        
-        # Publicar servicio
         await self.aiozc.async_register_service(self.info)
         
-        # Buscar otros servicios
-        self.browser = AsyncServiceBrowser(
-            self.aiozc.zeroconf, 
-            MDNS_TYPE, 
-            handlers=[self.on_service_state_change]
-        )
+        # 2. Sniffer Manual (Receptor)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except AttributeError: pass
+            
+            sock.bind(('', 5353))
+            
+            group = socket.inet_aton('224.0.0.251')
+            mreq = struct.pack('4sL', group, socket.INADDR_ANY)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            
+            self.sniffer_transport, _ = await self.loop.create_datagram_endpoint(
+                lambda: RawSniffer(self),
+                sock=sock
+            )
+            self.on_log("👂 Raw Sniffer active")
+        except Exception as e:
+            self.on_log(f"⚠️ Sniffer bind failed: {e}")
 
     async def stop(self):
+        if self.sniffer_transport:
+            self.sniffer_transport.close()
         if self.info and self.aiozc:
             await self.aiozc.async_unregister_service(self.info)
         if self.aiozc:
             await self.aiozc.async_close()
 
     def refresh(self):
-        """Fuerza una consulta activa en la red"""
         if self.aiozc and self.aiozc.zeroconf:
              self.on_log("📡 Broadcasting query...")
              try:
                  self.aiozc.zeroconf.get_service_info(MDNS_TYPE, "placeholder", timeout=0.1)
              except: pass
 
-    def on_service_state_change(self, zeroconf, service_type, name, state_change):
-        if state_change.name == "ServiceAdded":
-            if self.loop and not self.loop.is_closed():
-                asyncio.run_coroutine_threadsafe(
-                    self._resolve_service(name), 
-                    self.loop
-                )
-
-    async def _resolve_service(self, name):
-        try:
-            # Resolvemos la información del servicio detectado
-            info = await self.aiozc.async_get_service_info(MDNS_TYPE, name, timeout=3000)
-            
-            if info:
-                addr = socket.inet_ntoa(info.addresses[0])
-                
-                props = {}
-                for k, v in info.properties.items():
-                    try:
-                        key = k.decode('utf-8') if isinstance(k, bytes) else k
-                        val = v.decode('utf-8') if isinstance(v, bytes) else v
-                        props[key] = val
-                    except: pass
-                
-                # Filtro estándar: Si la clave pública es la mía, me ignoro a mí mismo
-                if props.get('pub') == self.pubkey_b64:
-                    return
-
-                self.on_found(name, addr, info.port, props)
-        except Exception:
-            pass
-
     def get_local_ip(self):
-        """Obtiene la IP de la interfaz que tiene salida a Internet/LAN"""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            # Conectar a una IP pública (Google DNS) no envía paquetes,
-            # solo consulta la tabla de enrutamiento del Kernel.
             s.connect(('8.8.8.8', 80))
             IP = s.getsockname()[0]
         except Exception:
