@@ -5,17 +5,18 @@ import logging
 import json
 import time
 import re
+import netifaces
 from zeroconf import ServiceInfo, IPVersion, Zeroconf, InterfaceChoice, DNSIncoming
 from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
 from protocol import NoiseIKState
 
 MDNS_TYPE = "_dni-im._udp.local."
-
-# Constantes DNS
-_TYPE_A = 1
-_TYPE_PTR = 12
-_TYPE_TXT = 16
-_TYPE_SRV = 33
+RAW_MDNS_QUERY = (
+    b'\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+    b'\x07_dni-im\x04_udp\x05local\x00'
+    b'\x00\x0c'
+    b'\x00\x01'
+)
 
 class SessionManager:
     def __init__(self, local_static_key, db):
@@ -40,17 +41,19 @@ class SessionManager:
         return session
 
 class UDPProtocol(asyncio.DatagramProtocol):
-    def __init__(self, session_manager, on_message_received, on_log):
+    def __init__(self, session_manager, on_message_received, on_log, on_handshake_success=None):
         self.sessions = session_manager
         self.on_message = on_message_received
         self.on_log = on_log
+        self.on_handshake_success = on_handshake_success
         self.transport = None
+        self.pending_messages = {} # Cola de mensajes esperando handshake: addr -> [msg1, msg2]
 
     def connection_made(self, transport):
         self.transport = transport
         self.sessions.transport = transport
-        sock = transport.get_extra_info('socket')
         try:
+            sock = transport.get_extra_info('socket')
             addr = sock.getsockname()
             self.on_log(f"✅ UDP Bound to {addr[0]}:{addr[1]}")
         except: pass
@@ -77,7 +80,11 @@ class UDPProtocol(asyncio.DatagramProtocol):
             resp_data = session.create_handshake_response()
             self.transport.sendto(b'\x02' + resp_data, addr)
             self.on_log(f"🤝 Handshake Response sent to {addr}")
+            
             asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], remote_pub))
+            if self.on_handshake_success:
+                self.on_handshake_success(addr, remote_pub)
+                
         except Exception as e:
             self.on_log(f"❌ Handshake failed: {e}")
             if addr in self.sessions.sessions: del self.sessions.sessions[addr]
@@ -88,6 +95,15 @@ class UDPProtocol(asyncio.DatagramProtocol):
         try:
             session.consume_handshake_response(data)
             self.on_log(f"🔒 Secure Session established with {addr}")
+            
+            # REVISAR COLA: Si hay mensajes pendientes para este destino, enviarlos ahora
+            if addr in self.pending_messages:
+                count = len(self.pending_messages[addr])
+                self.on_log(f"📨 Flushing {count} queued messages to {addr}")
+                for content in self.pending_messages[addr]:
+                    self.send_message(addr, content)
+                del self.pending_messages[addr] # Limpiar cola
+
         except Exception as e:
             self.on_log(f"❌ Handshake completion failed: {e}")
 
@@ -101,19 +117,40 @@ class UDPProtocol(asyncio.DatagramProtocol):
         except Exception as e:
             self.on_log(f"❌ Decryption failed: {e}")
 
+    def _queue_message(self, addr, content):
+        """Guarda un mensaje para enviarlo cuando el handshake termine"""
+        if addr not in self.pending_messages:
+            self.pending_messages[addr] = []
+        self.pending_messages[addr].append(content)
+        self.on_log(f"⏳ Message queued (waiting for handshake)...")
+
     def send_message(self, addr, content):
         session = self.sessions.get_session(addr)
+        
+        # Caso 1: No existe sesión -> Iniciar Handshake y Encolar
         if not session:
             remote_pub = self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
                 self.on_log(f"❌ Cannot send: No public key for {addr}")
                 return
+            
+            # Crear sesión e iniciar handshake
             session = self.sessions.create_initiator_session(addr, remote_pub)
             hs_msg = session.create_handshake_message()
             self.transport.sendto(b'\x01' + hs_msg, addr)
             self.on_log(f"🔄 Initiating handshake with {addr}")
+            
+            # Encolar el mensaje para envío posterior
+            self._queue_message(addr, content)
             return
 
+        # Caso 2: Existe sesión pero el handshake no ha terminado (aún no tenemos claves de transporte)
+        # Si encryptor es None, es que estamos esperando el Msg 2
+        if session.encryptor is None:
+            self._queue_message(addr, content)
+            return
+
+        # Caso 3: Sesión lista -> Enviar
         try:
             msg_struct = {"timestamp": time.time(), "text": content}
             payload = json.dumps(msg_struct).encode('utf-8')
@@ -123,83 +160,78 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"❌ Send failed: {e}")
 
 class RawSniffer(asyncio.DatagramProtocol):
-    """
-    Sniffer robusto que imita check_mdns.py y usa extracción por Regex.
-    CORREGIDO: Eliminado filtro agresivo por puerto que bloqueaba peers reales.
-    """
     def __init__(self, service):
         self.service = service
 
     def connection_made(self, transport):
         self.transport = transport
-        # Socket ya configurado externamente
+        sock = transport.get_extra_info('socket')
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, 'SO_REUSEPORT'):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except: pass
 
-    def datagram_received(self, data, addr):
-        # Filtro básico
-        if b"_dni-im" not in data: return
-
-        # self.service.on_log(f"🔍 RAW PACKET from {addr} ({len(data)}b)")
+        group = socket.inet_aton('224.0.0.251')
+        try:
+            mreq = struct.pack('4sL', group, socket.INADDR_ANY)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except: pass
 
         try:
-            found_info = None
+            for iface in netifaces.interfaces():
+                addrs = netifaces.ifaddresses(iface)
+                if netifaces.AF_INET in addrs:
+                    for addr_info in addrs[netifaces.AF_INET]:
+                        ip = addr_info['addr']
+                        if ip == '127.0.0.1': continue
+                        try:
+                            local = socket.inet_aton(ip)
+                            mreq = struct.pack('4s4s', group, local)
+                            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                        except: pass
+        except Exception: pass
 
-            # A) Decodificación DNS
+    def datagram_received(self, data, addr):
+        if b"_dni-im" not in data: return
+        try:
+            found_info = None
             try:
-                msg = DNSIncoming(data)
-                for record in msg.answers + msg.additionals:
-                    if MDNS_TYPE in record.name and "User-" in record.name:
-                        found_info = self._parse_record_name(record.name)
-                        if found_info: break
+                match = re.search(rb'User-([^_\x00]+)_(\d+)', data)
+                if match:
+                    name = match.group(1).decode('utf-8', errors='ignore')
+                    port = int(match.group(2).decode('utf-8'))
+                    found_info = (name, port)
             except: pass
 
-            # B) Regex sobre bytes (Fuerza bruta)
             if not found_info:
                 try:
-                    raw_text = data.decode('utf-8', errors='ignore')
-                    match = re.search(r'User-([a-zA-Z0-9]+)_(\d+)', raw_text)
-                    if match:
-                        name = match.group(1)
-                        port = int(match.group(2))
-                        found_info = (name, port)
+                    msg = DNSIncoming(data)
+                    for record in msg.answers + msg.additionals:
+                        if MDNS_TYPE in record.name and "User-" in record.name:
+                            base = record.name.split(MDNS_TYPE)[0].replace("User-", "")
+                            if "_" in base:
+                                n = base.rsplit("_", 1)[0]
+                                p = int(base.rsplit("_", 1)[1].replace(".", ""))
+                                found_info = (n, p)
+                                break
                 except: pass
 
             if found_info:
                 name, port = found_info
-                
-                # CORRECCIÓN: Eliminado filtro 'if port == self.service.port: return'
-                # Ahora confiamos en el filtrado por clave pública o IP.
-                
+                if name == self.service.username: return
+
                 props = {'user': name}
-                
-                # Intentar extraer clave pública
                 try:
-                    raw_text = data.decode('utf-8', errors='ignore')
-                    pub_match = re.search(r'pub=([a-fA-F0-9]+)', raw_text)
+                    pub_match = re.search(rb'pub=([a-fA-F0-9]+)', data)
                     if pub_match:
-                        props['pub'] = pub_match.group(1)
-                        
-                        # FILTRO SEGURO: Solo descartar si la clave es IDÉNTICA a la mía
-                        if props['pub'] == self.service.pubkey_b64:
-                            return
+                        props['pub'] = pub_match.group(1).decode('utf-8')
+                        if props['pub'] == self.service.pubkey_b64: return
                 except: pass
 
                 self.service.on_found(name, addr[0], port, props)
-
-        except Exception as e:
-            self.service.on_log(f"⚠️ Sniffer exception: {e}")
-
-    def _parse_record_name(self, record_name):
-        try:
-            base = record_name.split(MDNS_TYPE)[0]
-            if base.startswith("User-"):
-                base = base[5:]
-            if "_" in base:
-                parts = base.split('_')
-                port_str = parts[-1].replace('.', '')
-                name = "_".join(parts[:-1])
-                return name, int(port_str)
-        except: pass
-        return None
+        except Exception:
+            pass
 
 class DiscoveryService:
     def __init__(self, port, pubkey_bytes, on_service_found, on_log=None):
@@ -212,16 +244,30 @@ class DiscoveryService:
         self.loop = None
         self.sniffer_transport = None
         self.bind_ip = None
+        self.username = None
+        self._polling_task = None
 
     async def start(self, username, bind_ip=None):
         self.loop = asyncio.get_running_loop()
         self.bind_ip = bind_ip
+        self.username = username.replace("User-", "")
         
-        # 1. Zeroconf para PUBLICAR
-        interfaces = InterfaceChoice.All
-        if bind_ip and bind_ip != "0.0.0.0":
-            interfaces = [bind_ip]
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try: sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except: pass
+            sock.bind(('', 5353))
+            
+            self.sniffer_transport, _ = await self.loop.create_datagram_endpoint(
+                lambda: RawSniffer(self), sock=sock
+            )
+            self.on_log("👂 Sniffer Active on all interfaces")
+        except Exception as e:
+            self.on_log(f"⚠️ Sniffer failed: {e}")
 
+        interfaces = InterfaceChoice.All
+        if bind_ip and bind_ip != "0.0.0.0": interfaces = [bind_ip]
         try:
             self.aiozc = AsyncZeroconf(interfaces=interfaces, ip_version=IPVersion.V4Only)
         except:
@@ -231,63 +277,32 @@ class DiscoveryService:
         service_name = f"{username}_{self.port}.{MDNS_TYPE}"
         
         desc = {'pub': self.pubkey_b64, 'user': username}
-        
         self.info = ServiceInfo(
-            MDNS_TYPE,
-            service_name,
-            addresses=[socket.inet_aton(local_ip)],
-            port=self.port,
-            properties=desc,
-            server=f"{socket.gethostname()}.local."
+            MDNS_TYPE, service_name, addresses=[socket.inet_aton(local_ip)],
+            port=self.port, properties=desc, server=f"{socket.gethostname()}.local."
         )
         
         self.on_log(f"📢 Advertising: {service_name} @ {local_ip}")
         await self.aiozc.async_register_service(self.info)
         
-        # 2. Sniffer Manual (Receptor)
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except AttributeError: pass
-            
-            sock.bind(('', 5353))
-            
-            group = socket.inet_aton('224.0.0.251')
-            mreq = struct.pack('4sL', group, socket.INADDR_ANY)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            
-            self.sniffer_transport, _ = await self.loop.create_datagram_endpoint(
-                lambda: RawSniffer(self),
-                sock=sock
-            )
-            self.on_log("👂 Raw Sniffer active")
-        except Exception as e:
-            self.on_log(f"⚠️ Sniffer bind failed: {e}")
+        self._polling_task = asyncio.create_task(self._active_polling_loop())
 
     async def stop(self):
-        if self.sniffer_transport:
-            self.sniffer_transport.close()
-        if self.info and self.aiozc:
-            await self.aiozc.async_unregister_service(self.info)
-        if self.aiozc:
-            await self.aiozc.async_close()
+        if self._polling_task: self._polling_task.cancel()
+        if self.sniffer_transport: self.sniffer_transport.close()
+        if self.info and self.aiozc: await self.aiozc.async_unregister_service(self.info)
+        if self.aiozc: await self.aiozc.async_close()
 
-    def refresh(self):
-        if self.aiozc and self.aiozc.zeroconf:
-             self.on_log("📡 Broadcasting query...")
-             try:
-                 self.aiozc.zeroconf.get_service_info(MDNS_TYPE, "placeholder", timeout=0.1)
-             except: pass
+    async def _active_polling_loop(self):
+        while True:
+            await asyncio.sleep(5)
+            if self.sniffer_transport:
+                 try: self.sniffer_transport.sendto(RAW_MDNS_QUERY, ('224.0.0.251', 5353))
+                 except: pass
 
     def get_local_ip(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(('8.8.8.8', 80))
-            IP = s.getsockname()[0]
-        except Exception:
-            IP = '127.0.0.1'
-        finally:
-            s.close()
+        try: s.connect(('8.8.8.8', 80)); IP = s.getsockname()[0]
+        except: IP = '127.0.0.1'
+        finally: s.close()
         return IP

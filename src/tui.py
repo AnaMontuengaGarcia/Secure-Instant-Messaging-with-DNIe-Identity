@@ -25,7 +25,6 @@ class QuitScreen(ModalScreen):
         else: self.app.pop_screen()
 
 class ChatItem(ListItem):
-    """Elemento de lista personalizado para contactos"""
     def __init__(self, name, ip, port):
         super().__init__()
         self.contact_name = name
@@ -34,7 +33,6 @@ class ChatItem(ListItem):
         self.display_label = f"{name} ({ip}:{port})"
 
     def compose(self) -> ComposeResult:
-        # CORRECCIÓN: Usamos compose en lugar de add_child en __init__
         yield Label(self.display_label)
 
 class MessengerTUI(App):
@@ -80,13 +78,18 @@ class MessengerTUI(App):
 
     async def on_mount(self):
         self.title = "🇪🇸 DNIe Secure Messenger"
+        
+        # Callbacks de red
         self.proto.on_log = self.add_log
         self.proto.on_message = self.receive_message
+        # Nuevo: Callback cuando se completa un handshake (alguien nos habla)
+        self.proto.on_handshake_success = self.on_new_peer_handshake
+        
         self.discovery.on_found = self.add_peer
         self.discovery.on_log = self.add_log 
         
         self.query_one("#chat_box", RichLog).write("Select a contact to chat")
-        self.add_log(f"System initializing for {self.user_id} on {self.bind_ip or 'ALL'}")
+        self.add_log(f"System initializing for {self.user_id}...")
 
         username = f"User-{self.user_id}"
         await self.discovery.start(username, bind_ip=self.bind_ip)
@@ -95,8 +98,10 @@ class MessengerTUI(App):
         self.push_screen(QuitScreen())
 
     def action_refresh_peers(self):
-        self.add_log("🔄 Triggering mDNS refresh...")
-        self.discovery.refresh()
+        self.add_log("🔄 Manual refresh...")
+        # No se usa método, se envía un paquete crudo en el loop,
+        # pero podemos forzar una consulta extra si implementamos refresh en discovery.
+        pass 
 
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "btn_refresh":
@@ -106,72 +111,60 @@ class MessengerTUI(App):
         if self.last_msg_content:
             try:
                 pyperclip.copy(self.last_msg_content)
-                self.notify("Last message copied!")
-            except Exception as e:
-                self.add_log(f"❌ Clipboard error: {e}")
-        else:
-            self.add_log("⚠️ No message to copy.")
+                self.notify("Copied!")
+            except: self.add_log("❌ Clipboard error")
 
     def action_copy_logs(self):
         if self.log_buffer:
             try:
-                full_log = "\n".join(self.log_buffer)
-                pyperclip.copy(full_log)
-                self.notify("System logs copied!")
-            except Exception as e:
-                self.add_log(f"❌ Log copy error: {e}")
+                pyperclip.copy("\n".join(self.log_buffer))
+                self.notify("Logs copied!")
+            except: pass
 
     def add_log(self, text):
         self.log_buffer.append(text)
         if len(self.log_buffer) > 1000: self.log_buffer.pop(0)
-        # Protección por si el widget no está listo
-        try:
-            self.query_one("#log_box", RichLog).write(text)
+        try: self.query_one("#log_box", RichLog).write(text)
         except: pass
 
     def add_peer(self, name, ip, port, props):
-        # Protección de hilo: Asegurar que corremos en el hilo principal
-        # (Aunque Textual suele manejar esto, el sniffer viene de un hilo crudo)
         try:
             self.call_from_thread(self._add_peer_thread_safe, name, ip, port, props)
         except:
-            # Si ya estamos en el hilo principal, llamar directo
             self._add_peer_thread_safe(name, ip, port, props)
 
     def _add_peer_thread_safe(self, name, ip, port, props):
         try:
             lst = self.query_one("#contact_list", ListView)
-            
-            # Guardar en DB
-            pub_hex = props.get('pub', '')
-            if pub_hex:
-                try:
-                    import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
-                    pub_bytes = bytes.fromhex(pub_hex)
-                    pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
-                    asyncio.create_task(self.storage.register_contact(ip, port, pub_key, props.get('user', name)))
-                except: pass
-
-            # Evitar duplicados visuales
+            # Evitar duplicados
             for child in lst.children:
                 if isinstance(child, ChatItem):
                     if child.contact_ip == ip and child.contact_port == port: return
             
             clean_name = name.split('.')[0]
-            item = ChatItem(props.get('user', clean_name), ip, port)
+            item = ChatItem(clean_name, ip, port)
             lst.append(item)
-            self.add_log(f"🔎 Found peer: {clean_name} at {ip}:{port}")
-        except Exception as e:
-            self.add_log(f"⚠️ UI Error adding peer: {e}")
+            self.add_log(f"🔎 Peer Found: {clean_name} ({ip})")
+        except: pass
+
+    def on_new_peer_handshake(self, addr, pub_key):
+        """Callback cuando alguien inicia conexión con nosotros"""
+        # Añadir como contacto aunque mDNS haya fallado
+        try:
+            # No sabemos el nombre, ponemos "Peer <IP>"
+            name = f"Peer_{addr[0]}"
+            props = {} # No tenemos props del handshake
+            self.add_peer(name, addr[0], addr[1], props)
+            self.add_log(f"🔗 Active connection from {addr[0]}")
+        except: pass
 
     def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
         if not isinstance(item, ChatItem): return
-        
         self.current_chat_addr = (item.contact_ip, item.contact_port)
         chat_box = self.query_one("#chat_box", RichLog)
         chat_box.clear()
-        chat_box.write(f"Chatting with {item.contact_name} ({item.contact_ip}:{item.contact_port})...\n")
+        chat_box.write(f"Chatting with {item.contact_name}...\n")
         
         key = f"{item.contact_ip}:{item.contact_port}"
         if key in self.message_history:
@@ -183,8 +176,8 @@ class MessengerTUI(App):
             return
         text = event.value
         if not text: return
-        
         event.input.value = ""
+        
         formatted_msg = f"[bold green][You]:[/] {text}"
         self.last_msg_content = text
         
@@ -194,7 +187,6 @@ class MessengerTUI(App):
         self.proto.send_message(self.current_chat_addr, text)
 
     def receive_message(self, addr, msg):
-        # Protección de hilo para mensajes entrantes
         try:
             self.call_from_thread(self._receive_message_thread_safe, addr, msg)
         except:
@@ -202,6 +194,17 @@ class MessengerTUI(App):
 
     def _receive_message_thread_safe(self, addr, msg):
         ip, port = addr
+        
+        # AUTO-ADD: Si recibimos mensaje de alguien que no está en lista, añadirlo
+        lst = self.query_one("#contact_list", ListView)
+        known = False
+        for child in lst.children:
+             if isinstance(child, ChatItem) and child.contact_ip == ip and child.contact_port == port:
+                 known = True
+                 break
+        if not known:
+             self._add_peer_thread_safe(f"Peer_{ip}", ip, port, {})
+
         text = msg.get('text', '')
         self.last_msg_content = text
         formatted_msg = f"[bold yellow][Peer]:[/] {text}"
@@ -209,11 +212,10 @@ class MessengerTUI(App):
         self._save_history(key, formatted_msg)
         
         curr_ip = self.current_chat_addr[0] if self.current_chat_addr else None
-        curr_port = self.current_chat_addr[1] if self.current_chat_addr else None
-        if curr_ip == ip and curr_port == port:
+        if curr_ip == ip:
             self.query_one("#chat_box", RichLog).write(formatted_msg)
         else:
-            self.add_log(f"📨 New message from {ip}:{port}")
+            self.add_log(f"📨 New message from {ip}")
 
     def _save_history(self, key, line):
         if key not in self.message_history: self.message_history[key] = []

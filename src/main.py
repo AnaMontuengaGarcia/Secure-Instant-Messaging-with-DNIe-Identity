@@ -26,6 +26,9 @@ async def main_async(dnie_user_id):
     
     loop = asyncio.get_running_loop()
     
+    transport = None
+    discovery = None
+
     try:
         print(f"🔌 Binding socket to {args.bind}:{args.port}...")
         transport, _ = await loop.create_datagram_endpoint(
@@ -39,19 +42,30 @@ async def main_async(dnie_user_id):
         print(f"❌ Error de red: {e}")
         return
 
-    pub_bytes = local_static_key.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
-    
-    discovery = DiscoveryService(args.port, pub_bytes, lambda n,i,p,pr: None)
+    # Bloque Try/Finally para asegurar limpieza
+    try:
+        pub_bytes = local_static_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+        
+        discovery = DiscoveryService(args.port, pub_bytes, lambda n,i,p,pr: None)
 
-    # Iniciar TUI
-    app = MessengerTUI(proto, discovery, storage, user_id=dnie_user_id, bind_ip=args.bind)
-    await app.run_async()
-    
-    await discovery.stop()
-    transport.close()
+        # Iniciar TUI
+        app = MessengerTUI(proto, discovery, storage, user_id=dnie_user_id, bind_ip=args.bind)
+        await app.run_async()
+        
+    except asyncio.CancelledError:
+        # Captura la cancelación limpia de asyncio
+        pass
+    finally:
+        # LIMPIEZA CRÍTICA: Detener threads antes de salir
+        print("\n🧹 Cleaning up network resources...")
+        if discovery:
+            await discovery.stop()
+        if transport:
+            transport.close()
+        print("👋 Bye!")
 
 def authenticate_dnie():
     if args.mock:
@@ -88,3 +102,12 @@ if __name__ == "__main__":
         asyncio.run(main_async(user_id))
     except KeyboardInterrupt:
         pass
+    finally:
+        # CORRECCIÓN: Forzar salida del sistema para evitar errores de threading 
+        # durante el shutdown del intérprete de Python.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except:
+            pass
+        os._exit(0)
