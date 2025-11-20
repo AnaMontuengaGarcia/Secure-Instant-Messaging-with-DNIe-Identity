@@ -6,9 +6,13 @@ import json
 import time
 import re
 import netifaces
+import secrets
 from zeroconf import ServiceInfo, IPVersion, Zeroconf, InterfaceChoice, DNSIncoming
 from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
 from protocol import NoiseIKState
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 
 MDNS_TYPE = "_dni-im._udp.local."
 RAW_MDNS_QUERY = (
@@ -18,9 +22,44 @@ RAW_MDNS_QUERY = (
     b'\x00\x01'
 )
 
+def verify_peer_identity(x25519_pub_key, proofs):
+    if not proofs or 'cert' not in proofs or 'sig' not in proofs:
+        raise Exception("No identity proofs provided by peer")
+
+    try:
+        cert_bytes = bytes.fromhex(proofs['cert'])
+        signature_bytes = bytes.fromhex(proofs['sig'])
+        cert = x509.load_der_x509_certificate(cert_bytes)
+        rsa_pub_key = cert.public_key()
+
+        data_to_verify = x25519_pub_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        rsa_pub_key.verify(
+            signature_bytes,
+            data_to_verify,
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
+
+        for attribute in cert.subject:
+            if attribute.oid == x509.NameOID.COMMON_NAME:
+                full_name = attribute.value
+                clean_name = full_name.replace("(AUTENTICACIÓN)", "").strip()
+                return clean_name
+        
+        return "Unknown DNIe Identity"
+
+    except Exception as e:
+        raise Exception(f"Identity Verification Failed: {e}")
+
+
 class SessionManager:
-    def __init__(self, local_static_key, db):
+    def __init__(self, local_static_key, db, local_proofs):
         self.local_static_key = local_static_key
+        self.local_proofs = local_proofs
         self.sessions = {}
         self.db = db
         self.transport = None
@@ -29,13 +68,22 @@ class SessionManager:
         return self.sessions.get(addr)
 
     def create_initiator_session(self, addr, remote_pub_key):
-        session = NoiseIKState(self.local_static_key, remote_pub_key, initiator=True)
+        session = NoiseIKState(
+            self.local_static_key, 
+            remote_pub_key, 
+            initiator=True,
+            local_proofs=self.local_proofs
+        )
         session.initialize()
         self.sessions[addr] = session
         return session
 
     def create_responder_session(self, addr):
-        session = NoiseIKState(self.local_static_key, initiator=False)
+        session = NoiseIKState(
+            self.local_static_key, 
+            initiator=False,
+            local_proofs=self.local_proofs
+        )
         session.initialize()
         self.sessions[addr] = session
         return session
@@ -47,7 +95,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.on_log = on_log
         self.on_handshake_success = on_handshake_success
         self.transport = None
-        self.pending_messages = {} # Cola de mensajes esperando handshake: addr -> [msg1, msg2]
+        self.pending_messages = {}
 
     def connection_made(self, transport):
         self.transport = transport
@@ -77,11 +125,18 @@ class UDPProtocol(asyncio.DatagramProtocol):
         session = self.sessions.create_responder_session(addr)
         try:
             remote_pub = session.consume_handshake_message(data)
+            try:
+                real_name = verify_peer_identity(remote_pub, session.remote_proofs)
+                self.on_log(f"✅ Verified Identity: {real_name}")
+            except Exception as e:
+                self.on_log(f"⛔ SECURITY ALERT: {e}")
+                return
+
             resp_data = session.create_handshake_response()
             self.transport.sendto(b'\x02' + resp_data, addr)
             self.on_log(f"🤝 Handshake Response sent to {addr}")
             
-            asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], remote_pub))
+            asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], remote_pub, name=real_name))
             if self.on_handshake_success:
                 self.on_handshake_success(addr, remote_pub)
                 
@@ -94,15 +149,21 @@ class UDPProtocol(asyncio.DatagramProtocol):
         if not session: return
         try:
             session.consume_handshake_response(data)
-            self.on_log(f"🔒 Secure Session established with {addr}")
+            try:
+                real_name = verify_peer_identity(session.rs_pub, session.remote_proofs)
+                self.on_log(f"✅ Verified Identity: {real_name}")
+                asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], session.rs_pub, name=real_name))
+            except Exception as e:
+                self.on_log(f"⛔ SECURITY ALERT: {e}")
+                del self.sessions.sessions[addr]
+                return
+
+            self.on_log(f"🔒 Secure Session established with {real_name}")
             
-            # REVISAR COLA: Si hay mensajes pendientes para este destino, enviarlos ahora
             if addr in self.pending_messages:
-                count = len(self.pending_messages[addr])
-                self.on_log(f"📨 Flushing {count} queued messages to {addr}")
                 for content in self.pending_messages[addr]:
                     self.send_message(addr, content)
-                del self.pending_messages[addr] # Limpiar cola
+                del self.pending_messages[addr]
 
         except Exception as e:
             self.on_log(f"❌ Handshake completion failed: {e}")
@@ -118,39 +179,30 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"❌ Decryption failed: {e}")
 
     def _queue_message(self, addr, content):
-        """Guarda un mensaje para enviarlo cuando el handshake termine"""
         if addr not in self.pending_messages:
             self.pending_messages[addr] = []
         self.pending_messages[addr].append(content)
-        self.on_log(f"⏳ Message queued (waiting for handshake)...")
+        self.on_log(f"⏳ Message queued...")
 
     def send_message(self, addr, content):
         session = self.sessions.get_session(addr)
-        
-        # Caso 1: No existe sesión -> Iniciar Handshake y Encolar
         if not session:
             remote_pub = self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
-                self.on_log(f"❌ Cannot send: No public key for {addr}")
+                self.on_log(f"❌ Cannot send: No public key")
                 return
             
-            # Crear sesión e iniciar handshake
             session = self.sessions.create_initiator_session(addr, remote_pub)
             hs_msg = session.create_handshake_message()
             self.transport.sendto(b'\x01' + hs_msg, addr)
             self.on_log(f"🔄 Initiating handshake with {addr}")
-            
-            # Encolar el mensaje para envío posterior
             self._queue_message(addr, content)
             return
 
-        # Caso 2: Existe sesión pero el handshake no ha terminado (aún no tenemos claves de transporte)
-        # Si encryptor es None, es que estamos esperando el Msg 2
         if session.encryptor is None:
             self._queue_message(addr, content)
             return
 
-        # Caso 3: Sesión lista -> Enviar
         try:
             msg_struct = {"timestamp": time.time(), "text": content}
             payload = json.dumps(msg_struct).encode('utf-8')
@@ -219,17 +271,34 @@ class RawSniffer(asyncio.DatagramProtocol):
 
             if found_info:
                 name, port = found_info
-                if name == self.service.username: return
+                
+                # --- CORRECCIÓN CLAVE ---
+                # Comparamos contra el nombre de instancia ÚNICO (que tiene el sufijo aleatorio)
+                # Si yo soy "User-Bob-A1", me ignoraré a mí mismo.
+                # Pero si veo a "User-Bob-B2", lo aceptaré.
+                if name == self.service.unique_instance_id:
+                    return
 
                 props = {'user': name}
+                # Intento de limpiar el nombre para visualización (quitar sufijo)
+                # Asumimos formato ID-SUFFIX. Si hay guión, nos quedamos con lo de antes.
+                display_name = name
+                if "-" in name:
+                     display_name = name.rsplit("-", 1)[0]
+                
+                props['user'] = display_name # "f2fd0120" en vez de "f2fd0120-e124"
+
                 try:
                     pub_match = re.search(rb'pub=([a-fA-F0-9]+)', data)
                     if pub_match:
                         props['pub'] = pub_match.group(1).decode('utf-8')
-                        if props['pub'] == self.service.pubkey_b64: return
+                        # Opcional: Si queremos filtrar por misma clave pública (mismo DNI)
+                        # lo descomentaríamos. Pero para permitir multi-device con mismo DNI,
+                        # LO DEJAMOS COMENTADO o lo quitamos.
+                        # if props['pub'] == self.service.pubkey_b64: return
                 except: pass
-
-                self.service.on_found(name, addr[0], port, props)
+                
+                self.service.on_found(display_name, addr[0], port, props)
         except Exception:
             pass
 
@@ -240,18 +309,23 @@ class DiscoveryService:
         self.pubkey_b64 = pubkey_bytes.hex()
         self.on_found = on_service_found
         self.on_log = on_log if on_log else lambda x: None
-        self.info = None
         self.loop = None
         self.sniffer_transport = None
         self.bind_ip = None
-        self.username = None
-        self._polling_task = None
+        self.unique_instance_id = None # ID único para esta sesión
 
     async def start(self, username, bind_ip=None):
         self.loop = asyncio.get_running_loop()
         self.bind_ip = bind_ip
-        self.username = username.replace("User-", "")
         
+        # Limpiar nombre base
+        clean_username = username.replace("User-", "")
+        
+        # Generar sufijo aleatorio para evitar colisiones de nombre en la red
+        suffix = secrets.token_hex(2)
+        self.unique_instance_id = f"{clean_username}-{suffix}"
+        
+        # Iniciar Sniffer
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -266,6 +340,7 @@ class DiscoveryService:
         except Exception as e:
             self.on_log(f"⚠️ Sniffer failed: {e}")
 
+        # Iniciar Zeroconf (Publicador)
         interfaces = InterfaceChoice.All
         if bind_ip and bind_ip != "0.0.0.0": interfaces = [bind_ip]
         try:
@@ -274,9 +349,11 @@ class DiscoveryService:
             self.aiozc = AsyncZeroconf(interfaces=InterfaceChoice.All)
 
         local_ip = bind_ip if (bind_ip and bind_ip != "0.0.0.0") else self.get_local_ip()
-        service_name = f"{username}_{self.port}.{MDNS_TYPE}"
         
-        desc = {'pub': self.pubkey_b64, 'user': username}
+        # Usamos el nombre ÚNICO con sufijo para el servicio mDNS
+        service_name = f"User-{self.unique_instance_id}_{self.port}.{MDNS_TYPE}"
+        
+        desc = {'pub': self.pubkey_b64, 'user': clean_username}
         self.info = ServiceInfo(
             MDNS_TYPE, service_name, addresses=[socket.inet_aton(local_ip)],
             port=self.port, properties=desc, server=f"{socket.gethostname()}.local."
@@ -288,10 +365,11 @@ class DiscoveryService:
         self._polling_task = asyncio.create_task(self._active_polling_loop())
 
     async def stop(self):
-        if self._polling_task: self._polling_task.cancel()
+        if hasattr(self, '_polling_task'): self._polling_task.cancel()
         if self.sniffer_transport: self.sniffer_transport.close()
-        if self.info and self.aiozc: await self.aiozc.async_unregister_service(self.info)
-        if self.aiozc: await self.aiozc.async_close()
+        if hasattr(self, 'info') and hasattr(self, 'aiozc'): 
+            await self.aiozc.async_unregister_service(self.info)
+        if hasattr(self, 'aiozc'): await self.aiozc.async_close()
 
     async def _active_polling_loop(self):
         while True:

@@ -10,22 +10,24 @@ from cryptography.hazmat.primitives import serialization
 # Configuración estándar
 parser = argparse.ArgumentParser(description="DNIe Secure Messenger")
 parser.add_argument('--port', type=int, default=443, help="Puerto UDP (Default: 443)")
-parser.add_argument('--bind', type=str, default="0.0.0.0", help="IP de escucha (Default: Todas)")
+parser.add_argument('--bind', type=str, default="0.0.0.0", help="IP de escucha")
 parser.add_argument('--data', type=str, default="data", help="Carpeta de datos")
-parser.add_argument('--mock', type=str, help="Simular DNIe (Solo para pruebas)")
+parser.add_argument('--mock', type=str, help="Simular DNIe")
 args = parser.parse_args()
 
-async def main_async(dnie_user_id):
-    # 1. Inicializar
+async def main_async(dnie_identity_data):
+    # dnie_identity_data es una tupla: (user_id, proofs_dict)
+    user_id, proofs = dnie_identity_data
+    
     storage = Storage(data_dir=args.data)
     await storage.init()
     local_static_key = await storage.get_static_key()
     
-    sessions = SessionManager(local_static_key, storage)
+    # Pasamos las pruebas (cert+firma) al SessionManager
+    sessions = SessionManager(local_static_key, storage, local_proofs=proofs)
     proto = UDPProtocol(sessions, lambda a,m: None, lambda t: print(f"LOG: {t}"))
     
     loop = asyncio.get_running_loop()
-    
     transport = None
     discovery = None
 
@@ -35,14 +37,10 @@ async def main_async(dnie_user_id):
             lambda: proto,
             local_addr=(args.bind, args.port)
         )
-    except PermissionError:
-        print(f"❌ Error: Permiso denegado en puerto {args.port}. Usa 'sudo'.")
-        return
-    except OSError as e:
-        print(f"❌ Error de red: {e}")
+    except Exception as e:
+        print(f"❌ Socket error: {e}")
         return
 
-    # Bloque Try/Finally para asegurar limpieza
     try:
         pub_bytes = local_static_key.public_key().public_bytes(
             encoding=serialization.Encoding.Raw,
@@ -50,64 +48,85 @@ async def main_async(dnie_user_id):
         )
         
         discovery = DiscoveryService(args.port, pub_bytes, lambda n,i,p,pr: None)
-
-        # Iniciar TUI
-        app = MessengerTUI(proto, discovery, storage, user_id=dnie_user_id, bind_ip=args.bind)
+        
+        # Pasamos los proofs (que incluyen el nombre real del DNIe) como ID si queremos
+        app = MessengerTUI(proto, discovery, storage, user_id=user_id, bind_ip=args.bind)
         await app.run_async()
         
-    except asyncio.CancelledError:
-        # Captura la cancelación limpia de asyncio
-        pass
     finally:
-        # LIMPIEZA CRÍTICA: Detener threads antes de salir
-        print("\n🧹 Cleaning up network resources...")
-        if discovery:
-            await discovery.stop()
-        if transport:
-            transport.close()
+        if discovery: await discovery.stop()
+        if transport: transport.close()
         print("👋 Bye!")
 
-def authenticate_dnie():
+def perform_dnie_binding():
     if args.mock:
-        return args.mock
+        return (args.mock, {'cert': '00', 'sig': '00'}) # Mock sin seguridad real
 
     from smartcard_dnie import DNIeCard
     from getpass import getpass
+    from storage import Storage
     
-    print("🔐 DNIe Authentication Required")
-    print("Insert DNIe and press Enter...")
-    input()
+    # Necesitamos la clave antes de arrancar la red para firmarla
+    # Esto es un poco "huevo y gallina", instanciamos storage temporalmente
+    temp_storage = Storage(data_dir=args.data)
+    # Nota: asyncio.run no se puede llamar aquí fácilmente si ya estamos en main.
+    # Hacemos una carga síncrona sucia o asumimos que identity.key existe/se crea.
+    # Para simplificar, asumimos que Storage.get_static_key puede correr síncrono o lo forzamos.
+    # Pero Storage es async. 
+    # Solución: Ejecutar un mini-loop solo para obtener la clave.
+    
+    async def get_key_bytes():
+        if not os.path.exists(temp_storage.data_dir): os.makedirs(temp_storage.data_dir)
+        return await temp_storage.get_static_key()
+
+    key_priv = asyncio.run(get_key_bytes())
+    key_pub_bytes = key_priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+
+    print("🔐 DNIe Binding Ceremony")
+    print("Insert DNIe to SIGN your network identity...")
+    input("Press Enter...")
     
     card = DNIeCard()
     try:
         card.connect()
-        serial = card.get_serial_hash()
-        print(f"✅ Card Detected: {serial[:8]}...")
-        
         pin = getpass("Enter DNIe PIN: ")
-        try:
-            card.authenticate(pin) 
-            print("✅ Authentication Successful...")
-            return serial[:8] 
-        finally:
-            card.disconnect()
-            
+        card.authenticate(pin)
+        
+        print("📜 Reading Certificate...")
+        cert_der = card.get_certificate()
+        
+        print("✍️  Signing Network Identity (X25519 Key)...")
+        signature = card.sign_data(key_pub_bytes)
+        
+        print("✅ Identity Bound Successfully!")
+        
+        proofs = {
+            'cert': cert_der.hex(),
+            'sig': signature.hex()
+        }
+        # Usamos parte del hash del certificado como ID visual temporal
+        user_id = card.get_serial_hash()[:8]
+        
+        return (user_id, proofs)
+        
     except Exception as e:
-        print(f"❌ Authentication Failed: {e}")
+        print(f"❌ Binding Failed: {e}")
         sys.exit(1)
+    finally:
+        card.disconnect()
 
 if __name__ == "__main__":
-    user_id = authenticate_dnie()
+    identity_data = perform_dnie_binding()
     try:
-        asyncio.run(main_async(user_id))
+        asyncio.run(main_async(identity_data))
     except KeyboardInterrupt:
         pass
     finally:
-        # CORRECCIÓN: Forzar salida del sistema para evitar errores de threading 
-        # durante el shutdown del intérprete de Python.
         try:
             sys.stdout.flush()
             sys.stderr.flush()
-        except:
-            pass
+        except: pass
         os._exit(0)
