@@ -4,7 +4,9 @@ from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, L
 from textual.screen import ModalScreen
 from textual.binding import Binding
 import asyncio
-import pyperclip 
+import pyperclip
+# Importación a nivel de módulo para evitar errores de importación tardíos
+import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
 
 class QuitScreen(ModalScreen):
     CSS = """
@@ -79,10 +81,8 @@ class MessengerTUI(App):
     async def on_mount(self):
         self.title = "🇪🇸 DNIe Secure Messenger"
         
-        # Callbacks de red
         self.proto.on_log = self.add_log
         self.proto.on_message = self.receive_message
-        # Nuevo: Callback cuando se completa un handshake (alguien nos habla)
         self.proto.on_handshake_success = self.on_new_peer_handshake
         
         self.discovery.on_found = self.add_peer
@@ -99,9 +99,7 @@ class MessengerTUI(App):
 
     def action_refresh_peers(self):
         self.add_log("🔄 Manual refresh...")
-        # No se usa método, se envía un paquete crudo en el loop,
-        # pero podemos forzar una consulta extra si implementamos refresh en discovery.
-        pass 
+        self.discovery.refresh()
 
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "btn_refresh":
@@ -136,24 +134,46 @@ class MessengerTUI(App):
     def _add_peer_thread_safe(self, name, ip, port, props):
         try:
             lst = self.query_one("#contact_list", ListView)
-            # Evitar duplicados
+            
+            # LÓGICA DE REGISTRO ROBUSTA Y LOGUEADA
+            pub_hex = props.get('pub', '')
+            if pub_hex:
+                try:
+                    pub_bytes = bytes.fromhex(pub_hex)
+                    pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
+                    
+                    # Usamos asyncio.create_task pero con manejo de excepciones si falla la corrutina
+                    task = asyncio.create_task(self.storage.register_contact(ip, port, pub_key, props.get('user', name)))
+                    
+                    # Callback opcional para loguear fallos de la tarea DB
+                    def handle_db_result(t):
+                        try: t.result()
+                        except Exception as db_err:
+                            # Esto se imprimirá en stdout porque no tenemos acceso fácil a add_log desde aquí
+                            # pero si ejecutas en terminal verás el error.
+                            print(f"DB ERROR: {db_err}")
+                            
+                    task.add_done_callback(handle_db_result)
+                    
+                except Exception as key_err:
+                    self.add_log(f"⚠️ Key Error for {name}: {key_err}")
+
+            # Evitar duplicados visuales
             for child in lst.children:
                 if isinstance(child, ChatItem):
                     if child.contact_ip == ip and child.contact_port == port: return
             
             clean_name = name.split('.')[0]
-            item = ChatItem(clean_name, ip, port)
+            item = ChatItem(props.get('user', clean_name), ip, port)
             lst.append(item)
             self.add_log(f"🔎 Peer Found: {clean_name} ({ip})")
-        except: pass
+        except Exception as e:
+            self.add_log(f"⚠️ UI Error adding peer: {e}")
 
     def on_new_peer_handshake(self, addr, pub_key):
-        """Callback cuando alguien inicia conexión con nosotros"""
-        # Añadir como contacto aunque mDNS haya fallado
         try:
-            # No sabemos el nombre, ponemos "Peer <IP>"
             name = f"Peer_{addr[0]}"
-            props = {} # No tenemos props del handshake
+            props = {} 
             self.add_peer(name, addr[0], addr[1], props)
             self.add_log(f"🔗 Active connection from {addr[0]}")
         except: pass
@@ -195,7 +215,6 @@ class MessengerTUI(App):
     def _receive_message_thread_safe(self, addr, msg):
         ip, port = addr
         
-        # AUTO-ADD: Si recibimos mensaje de alguien que no está en lista, añadirlo
         lst = self.query_one("#contact_list", ListView)
         known = False
         for child in lst.children:

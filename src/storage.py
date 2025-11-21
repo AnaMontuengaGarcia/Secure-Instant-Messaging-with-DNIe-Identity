@@ -12,8 +12,6 @@ class Storage:
             
     async def init(self):
         self.db = await aiosqlite.connect(self.db_path)
-        # Actualizamos la tabla contacts para incluir PORT como parte de la clave primaria
-        # (Necesario para pruebas locales donde la IP es idéntica)
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
                 ip TEXT,
@@ -37,7 +35,6 @@ class Storage:
         await self.db.commit()
 
     async def get_static_key(self):
-        """Carga o genera la clave de identidad X25519 del nodo local"""
         key_path = os.path.join(self.data_dir, "identity.key")
         if os.path.exists(key_path):
             with open(key_path, "rb") as f:
@@ -59,30 +56,45 @@ class Storage:
             format=serialization.PublicFormat.Raw
         ).hex()
         
-        async with self.db.execute("SELECT pubkey_hex FROM contacts WHERE ip = ? AND port = ?", (ip, port)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                if row[0] != pub_hex:
-                    print(f"🚨 SECURITY ALERT: Key changed for {ip}:{port}!")
-                    return
-            else:
-                await self.db.execute(
-                    "INSERT INTO contacts (ip, port, pubkey_hex, friendly_name, trusted) VALUES (?, ?, ?, ?, 1)",
-                    (ip, port, pub_hex, name)
-                )
-                await self.db.commit()
+        try:
+            # DEBUG LOG
+            print(f"DB: Registering contact {ip}:{port} name={name}")
+            
+            async with self.db.execute("SELECT pubkey_hex FROM contacts WHERE ip = ? AND port = ?", (ip, port)) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    if row[0] != pub_hex:
+                        print(f"🚨 SECURITY ALERT: Key changed for {ip}:{port}!")
+                        return
+                else:
+                    await self.db.execute(
+                        "INSERT INTO contacts (ip, port, pubkey_hex, friendly_name, trusted) VALUES (?, ?, ?, ?, 1)",
+                        (ip, port, pub_hex, name)
+                    )
+                    await self.db.commit()
+                    print(f"DB: Contact {ip}:{port} saved successfully.")
+        except Exception as e:
+            print(f"DB ERROR in register_contact: {e}")
+            raise
 
     def get_pubkey_by_addr(self, ip, port):
-        # Síncrono para uso rápido en callback de red (simulamos caché o lectura rápida)
-        import sqlite3
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute("SELECT pubkey_hex FROM contacts WHERE ip = ? AND port = ?", (ip, port))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            return x25519.X25519PublicKey.from_public_bytes(bytes.fromhex(row[0]))
-        return None
+        try:
+            # Síncrono para uso rápido
+            import sqlite3
+            print(f"DB: Querying key for {ip}:{port}...")
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("SELECT pubkey_hex FROM contacts WHERE ip = ? AND port = ?", (ip, port))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                print("DB: Key found!")
+                return x25519.X25519PublicKey.from_public_bytes(bytes.fromhex(row[0]))
+            print("DB: Key NOT found.")
+            return None
+        except Exception as e:
+            print(f"DB ERROR in get_pubkey_by_addr: {e}")
+            return None
 
     async def log_msg(self, ip, port, direction, text):
         import time

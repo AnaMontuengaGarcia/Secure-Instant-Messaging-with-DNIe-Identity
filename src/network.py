@@ -189,7 +189,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
         if not session:
             remote_pub = self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
-                self.on_log(f"❌ Cannot send: No public key")
+                self.on_log(f"❌ Cannot send: No public key for {addr}")
                 return
             
             session = self.sessions.create_initiator_session(addr, remote_pub)
@@ -271,33 +271,38 @@ class RawSniffer(asyncio.DatagramProtocol):
 
             if found_info:
                 name, port = found_info
-                
-                # --- CORRECCIÓN CLAVE ---
-                # Comparamos contra el nombre de instancia ÚNICO (que tiene el sufijo aleatorio)
-                # Si yo soy "User-Bob-A1", me ignoraré a mí mismo.
-                # Pero si veo a "User-Bob-B2", lo aceptaré.
                 if name == self.service.unique_instance_id:
                     return
 
                 props = {'user': name}
-                # Intento de limpiar el nombre para visualización (quitar sufijo)
-                # Asumimos formato ID-SUFFIX. Si hay guión, nos quedamos con lo de antes.
                 display_name = name
                 if "-" in name:
                      display_name = name.rsplit("-", 1)[0]
-                
-                props['user'] = display_name # "f2fd0120" en vez de "f2fd0120-e124"
+                props['user'] = display_name
 
+                # --- LÓGICA MEJORADA DE VALIDACIÓN ---
                 try:
                     pub_match = re.search(rb'pub=([a-fA-F0-9]+)', data)
                     if pub_match:
-                        props['pub'] = pub_match.group(1).decode('utf-8')
-                        # Opcional: Si queremos filtrar por misma clave pública (mismo DNI)
-                        # lo descomentaríamos. Pero para permitir multi-device con mismo DNI,
-                        # LO DEJAMOS COMENTADO o lo quitamos.
-                        # if props['pub'] == self.service.pubkey_b64: return
-                except: pass
+                        pub_str = pub_match.group(1).decode('utf-8')
+                        # Validar longitud estricta (32 bytes = 64 hex chars)
+                        if len(pub_str) != 64:
+                            return 
+                        
+                        props['pub'] = pub_str
+                        if props['pub'] == self.service.pubkey_b64: return
+                    else:
+                        return 
+                except: 
+                    return
                 
+                try:
+                    user_match = re.search(rb'user=([^\x00]+)', data)
+                    if user_match:
+                        clean_user = user_match.group(1).decode('utf-8')
+                        props['user'] = clean_user
+                except: pass
+
                 self.service.on_found(display_name, addr[0], port, props)
         except Exception:
             pass
@@ -312,20 +317,16 @@ class DiscoveryService:
         self.loop = None
         self.sniffer_transport = None
         self.bind_ip = None
-        self.unique_instance_id = None # ID único para esta sesión
+        self.unique_instance_id = None 
 
     async def start(self, username, bind_ip=None):
         self.loop = asyncio.get_running_loop()
         self.bind_ip = bind_ip
         
-        # Limpiar nombre base
         clean_username = username.replace("User-", "")
-        
-        # Generar sufijo aleatorio para evitar colisiones de nombre en la red
         suffix = secrets.token_hex(2)
         self.unique_instance_id = f"{clean_username}-{suffix}"
         
-        # Iniciar Sniffer
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -340,7 +341,6 @@ class DiscoveryService:
         except Exception as e:
             self.on_log(f"⚠️ Sniffer failed: {e}")
 
-        # Iniciar Zeroconf (Publicador)
         interfaces = InterfaceChoice.All
         if bind_ip and bind_ip != "0.0.0.0": interfaces = [bind_ip]
         try:
@@ -349,8 +349,6 @@ class DiscoveryService:
             self.aiozc = AsyncZeroconf(interfaces=InterfaceChoice.All)
 
         local_ip = bind_ip if (bind_ip and bind_ip != "0.0.0.0") else self.get_local_ip()
-        
-        # Usamos el nombre ÚNICO con sufijo para el servicio mDNS
         service_name = f"User-{self.unique_instance_id}_{self.port}.{MDNS_TYPE}"
         
         desc = {'pub': self.pubkey_b64, 'user': clean_username}
