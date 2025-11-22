@@ -1,8 +1,13 @@
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, Label, Button, RichLog
+from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, Label, Button, RichLog, TextArea
 from textual.screen import ModalScreen
 from textual.binding import Binding
+from textual import events
+from rich.panel import Panel
+from rich.text import Text
+from rich.align import Align
+from rich import box
 import asyncio
 import pyperclip
 import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
@@ -33,7 +38,6 @@ class ChatItem(ListItem):
         self.contact_ip = ip
         self.contact_port = port
         
-        # Lógica de visualización: Nombre Real (verificado) > UserID (técnico)
         if self.real_name:
             self.display_label = f"👤 {self.real_name} ({ip})"
         else:
@@ -43,12 +47,26 @@ class ChatItem(ListItem):
         self.real_name = new_real_name
         self.display_label = f"👤 {self.real_name} ({self.contact_ip})"
         try:
-            # Intentar refrescar la etiqueta si ya está montada
             self.query_one(Label).update(self.display_label)
         except: pass
 
     def compose(self) -> ComposeResult:
         yield Label(self.display_label)
+
+class ChatInput(TextArea):
+    """
+    Widget de entrada simplificado.
+    Solo intercepta Enter para enviar. 
+    Los saltos de línea se manejan vía botón de la interfaz.
+    """
+    BINDINGS = [
+        # Enter siempre envía. priority=True evita que TextArea inserte un salto de línea normal.
+        Binding("enter", "submit_message", "Send Message", show=True, priority=True),
+    ]
+
+    async def action_submit_message(self):
+        """Acción vinculada a la tecla Enter: Enviar mensaje"""
+        await self.app.submit_message()
 
 class MessengerTUI(App):
     CSS = """
@@ -57,7 +75,42 @@ class MessengerTUI(App):
     .chat-area { layout: vertical; }
     .logs { height: 30%; border-top: solid $secondary; background: $surface-darken-1; }
     .messages { height: 60%; padding: 1; }
-    Input { dock: bottom; }
+    
+    /* Contenedor inferior para input y controles */
+    .input-container { 
+        dock: bottom; 
+        height: 6; 
+        layout: horizontal;
+        padding: 0 1 1 1;
+    }
+    
+    ChatInput { 
+        width: 1fr; 
+        height: 100%; 
+        border: solid $accent;
+    } 
+    
+    /* Botón de enviar (a la derecha) */
+    #btn_send {
+        height: 100%;
+        width: 12;
+        margin-left: 1;
+        background: $primary;
+        color: $text;
+    }
+
+    /* Botón pequeño de salto de línea (a la izquierda) */
+    #btn_newline {
+        height: 100%;
+        width: 5;          /* Ancho aumentado a 5 */
+        min-width: 5;      
+        padding: 0;        
+        margin-right: 1;   /* Margen derecho para separar del input */
+        background: $secondary;
+        color: $text;
+        text-align: center;
+        content-align: center middle;
+    }
     """
     
     BINDINGS = [
@@ -85,9 +138,17 @@ class MessengerTUI(App):
             yield Label("  📡 Discovered Peers", id="lbl_peers")
             yield ListView(id="contact_list")
         with Vertical(classes="chat-area"):
-            yield RichLog(highlight=True, markup=True, id="chat_box", classes="messages")
+            yield RichLog(highlight=True, markup=True, id="chat_box", classes="messages", wrap=True)
             yield RichLog(highlight=True, markup=True, id="log_box", classes="logs")
-            yield Input(placeholder="Type secure message...", id="msg_input")
+            
+            with Horizontal(classes="input-container"):
+                # Botón pequeño para salto de línea (IZQUIERDA)
+                yield Button("↵", id="btn_newline", tooltip="Insert Line Break")
+                # Cuadro de texto (CENTRO)
+                yield ChatInput(show_line_numbers=False, id="msg_input")
+                # Botón grande para enviar (DERECHA)
+                yield Button("SEND", id="btn_send")
+                
         yield Footer()
 
     async def on_mount(self):
@@ -105,6 +166,17 @@ class MessengerTUI(App):
 
         username = f"User-{self.user_id}"
         await self.discovery.start(username, bind_ip=self.bind_ip)
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn_send":
+            await self.submit_message()
+        
+        elif event.button.id == "btn_newline":
+            # Lógica manual para insertar salto de línea
+            inp = self.query_one("#msg_input", ChatInput)
+            inp.insert("\n")
+            # Devolver el foco al input para seguir escribiendo
+            inp.focus()
 
     def action_request_quit(self):
         self.push_screen(QuitScreen())
@@ -143,14 +215,12 @@ class MessengerTUI(App):
         try:
             lst = self.query_one("#contact_list", ListView)
             
-            # REGISTRO DE USUARIO DESCUBIERTO (Aún sin nombre real confirmado)
             pub_hex = props.get('pub', '')
             if pub_hex:
                 try:
                     pub_bytes = bytes.fromhex(pub_hex)
                     pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
                     
-                    # Registramos con user_id (ID técnico), real_name=None de momento
                     task = asyncio.create_task(self.storage.register_contact(ip, port, pub_key, user_id=user_id, real_name=None))
                     
                     def handle_db_result(t):
@@ -162,14 +232,11 @@ class MessengerTUI(App):
                 except Exception as key_err:
                     self.add_log(f"⚠️ Key Error for {user_id}: {key_err}")
 
-            # Evitar duplicados visuales
             for child in lst.children:
                 if isinstance(child, ChatItem):
                     if child.contact_ip == ip and child.contact_port == port:
-                        # Si ya existe y ahora tenemos un ID mejor, podríamos actualizarlo, pero por simplicidad retornamos
                         return
             
-            # Crear item visual. user_id es el técnico, real_name es None inicialmente
             clean_id = user_id.split('.')[0]
             item = ChatItem(clean_id, None, ip, port)
             lst.append(item)
@@ -178,7 +245,6 @@ class MessengerTUI(App):
             self.add_log(f"⚠️ UI Error adding peer: {e}")
 
     def on_new_peer_handshake(self, addr, pub_key, real_name=None):
-        """Callback cuando se completa un handshake y verificamos identidad real"""
         try:
             self.call_from_thread(self._update_peer_identity_safe, addr, real_name)
         except:
@@ -198,9 +264,7 @@ class MessengerTUI(App):
                     break
         
         if not found:
-            # Si el peer hizo handshake pero no fue descubierto por mDNS antes
             self._add_peer_thread_safe(f"Unknown_{addr[0]}", addr[0], addr[1], {})
-            # Luego recursivamente actualizamos su nombre
             self._update_peer_identity_safe(addr, real_name)
 
     def on_list_view_selected(self, event: ListView.Selected):
@@ -215,22 +279,25 @@ class MessengerTUI(App):
         
         key = f"{item.contact_ip}:{item.contact_port}"
         if key in self.message_history:
-            for line in self.message_history[key]: chat_box.write(line)
+            for msg_renderable in self.message_history[key]: 
+                chat_box.write(msg_renderable)
 
-    async def on_input_submitted(self, event: Input.Submitted):
+    async def submit_message(self):
+        ta = self.query_one("#msg_input", ChatInput)
+        text = ta.text.strip()
+        if not text: return
+        
+        ta.text = "" 
+        
         if not self.current_chat_addr:
             self.add_log("⚠️ Select a contact first!")
             return
-        text = event.value
-        if not text: return
-        event.input.value = ""
-        
-        formatted_msg = f"[bold green][You]:[/] {text}"
+
         self.last_msg_content = text
-        
+        msg_panel = self._create_message_panel(text, "You", is_me=True)
         key = f"{self.current_chat_addr[0]}:{self.current_chat_addr[1]}"
-        self._save_history(key, formatted_msg)
-        self.query_one("#chat_box", RichLog).write(formatted_msg)
+        self._save_history(key, msg_panel)
+        self.query_one("#chat_box", RichLog).write(msg_panel)
         
         await self.proto.send_message(self.current_chat_addr, text)
 
@@ -243,7 +310,6 @@ class MessengerTUI(App):
     def _receive_message_thread_safe(self, addr, msg):
         ip, port = addr
         
-        # Asegurar que el peer existe en la lista
         lst = self.query_one("#contact_list", ListView)
         known = False
         peer_name = f"Peer_{ip}"
@@ -258,16 +324,35 @@ class MessengerTUI(App):
 
         text = msg.get('text', '')
         self.last_msg_content = text
-        formatted_msg = f"[bold yellow][{peer_name}]:[/] {text}"
+        
+        msg_panel = self._create_message_panel(text, peer_name, is_me=False)
+        
         key = f"{ip}:{port}"
-        self._save_history(key, formatted_msg)
+        self._save_history(key, msg_panel)
         
         curr_ip = self.current_chat_addr[0] if self.current_chat_addr else None
         if curr_ip == ip:
-            self.query_one("#chat_box", RichLog).write(formatted_msg)
+            self.query_one("#chat_box", RichLog).write(msg_panel)
         else:
             self.add_log(f"📨 New message from {peer_name}")
 
-    def _save_history(self, key, line):
+    def _create_message_panel(self, text, title, is_me):
+        color = "green" if is_me else "yellow"
+        align_side = "left" 
+        
+        return Align(
+            Panel(
+                Text(text),
+                title=title,
+                title_align="left",
+                border_style=color,
+                box=box.ROUNDED,
+                padding=(0, 1),
+                expand=False 
+            ),
+            align=align_side
+        )
+
+    def _save_history(self, key, item):
         if key not in self.message_history: self.message_history[key] = []
-        self.message_history[key].append(line)
+        self.message_history[key].append(item)
