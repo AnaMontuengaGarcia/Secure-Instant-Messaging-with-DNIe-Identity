@@ -44,10 +44,6 @@ class Storage:
 
     async def get_static_key(self):
         key_path = os.path.join(self.data_dir, "identity.key")
-        
-        # Esta operación de archivo es pequeña y se hace solo al inicio,
-        # pero para ser estrictos con async, la envolvemos también si se desea.
-        # Por compatibilidad con el código existente, la dejamos fluida.
         if os.path.exists(key_path):
             with open(key_path, "rb") as f:
                 private_bytes = f.read()
@@ -62,7 +58,12 @@ class Storage:
                 ))
             return priv
 
-    async def register_contact(self, ip, port, pubkey_obj, name="Unknown"):
+    async def register_contact(self, ip, port, pubkey_obj, user_id=None, real_name=None):
+        """
+        Registra o actualiza un contacto.
+        user_id: Identificador único (hash DNI / mDNS)
+        real_name: Nombre real extraído del certificado
+        """
         pub_hex = pubkey_obj.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw
@@ -79,10 +80,20 @@ class Storage:
                     if c['pubkey_hex'] != pub_hex:
                          print(f"🚨 SECURITY ALERT: Key changed for {ip}:{port}!")
                          return
-                    # Actualizar nombre si ha cambiado
-                    if name != "Unknown" and c.get('friendly_name') != name:
-                        c['friendly_name'] = name
-                        print(f"DB: Updated name for {ip}:{port}")
+                    
+                    updated = False
+                    # Actualizar userID si se proporciona
+                    if user_id and c.get('userID') != user_id:
+                        c['userID'] = user_id
+                        updated = True
+                    
+                    # Actualizar Real Name si se proporciona (prioridad sobre lo que hubiese)
+                    if real_name and c.get('real_name') != real_name:
+                        c['real_name'] = real_name
+                        print(f"DB: Identity Verified for {ip}:{port} -> {real_name}")
+                        updated = True
+                        
+                    if updated:
                         await self._write_json(self.contacts_file, contacts)
                     break
             
@@ -91,7 +102,8 @@ class Storage:
                     "ip": ip,
                     "port": port,
                     "pubkey_hex": pub_hex,
-                    "friendly_name": name,
+                    "userID": user_id if user_id else "UnknownID",
+                    "real_name": real_name if real_name else None, # Nombre visual
                     "trusted": 1
                 }
                 contacts.append(new_contact)
@@ -101,15 +113,10 @@ class Storage:
     async def get_pubkey_by_addr(self, ip, port):
         """Recupera la clave pública buscando en el JSON de contactos"""
         try:
-            # Usamos to_thread para leer sin bloquear el loop
             contacts = await asyncio.to_thread(self._read_sync, self.contacts_file)
-            
             for c in contacts:
                 if c['ip'] == ip and c['port'] == port:
-                    # print("DB: Key found in JSON!")
                     return x25519.X25519PublicKey.from_public_bytes(bytes.fromhex(c['pubkey_hex']))
-            
-            print("DB: Key NOT found in JSON.")
             return None
         except Exception as e:
             print(f"DB ERROR in get_pubkey_by_addr: {e}")
@@ -128,12 +135,10 @@ class Storage:
         async with self.lock:
             messages = await asyncio.to_thread(self._read_sync, self.messages_file)
             messages.append(msg_entry)
-            # Mantenemos solo los últimos 1000 mensajes para no saturar el JSON
             if len(messages) > 1000:
                 messages = messages[-1000:]
             await self._write_json(self.messages_file, messages)
 
-    # Helper síncrono para ser llamado dentro de to_thread
     def _read_sync(self, filepath):
         if not os.path.exists(filepath): return []
         try:

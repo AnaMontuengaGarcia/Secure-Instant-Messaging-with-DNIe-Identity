@@ -5,8 +5,10 @@ import logging
 import json
 import time
 import re
+import os
 import netifaces
 import secrets
+from datetime import datetime, timezone
 from zeroconf import ServiceInfo, IPVersion, Zeroconf, InterfaceChoice, DNSIncoming
 from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
 from protocol import NoiseIKState
@@ -21,17 +23,101 @@ RAW_MDNS_QUERY = (
     b'\x00\x0c'
     b'\x00\x01'
 )
+TRUSTED_CERTS_DIR = "certs"
+
+def load_trusted_cas():
+    """Carga certificados CA de confianza desde el disco."""
+    trusted_cas = []
+    if not os.path.exists(TRUSTED_CERTS_DIR):
+        print(f"⚠️ Warning: '{TRUSTED_CERTS_DIR}' directory not found. No Chain of Trust verification possible.")
+        return []
+    
+    for filename in os.listdir(TRUSTED_CERTS_DIR):
+        if filename.endswith(".pem") or filename.endswith(".crt") or filename.endswith(".cer"):
+            try:
+                with open(os.path.join(TRUSTED_CERTS_DIR, filename), "rb") as f:
+                    cert_data = f.read()
+                    # Intentar cargar como PEM
+                    try:
+                        cert = x509.load_pem_x509_certificate(cert_data)
+                    except:
+                        # Fallback a DER
+                        cert = x509.load_der_x509_certificate(cert_data)
+                    trusted_cas.append(cert)
+            except Exception as e:
+                print(f"⚠️ Failed to load CA {filename}: {e}")
+    return trusted_cas
+
+# Cache global de CAs para no leer disco en cada handshake
+GLOBAL_TRUST_STORE = load_trusted_cas()
+
+def get_common_name(cert):
+    """Helper para extraer Common Name de un certificado"""
+    for attribute in cert.subject:
+        if attribute.oid == x509.NameOID.COMMON_NAME:
+            return attribute.value
+    return "Unknown Common Name"
 
 def verify_peer_identity(x25519_pub_key, proofs):
+    """
+    Verifica estrictamente la identidad del peer usando DNIe.
+    Retorna: (real_name, issuer_name)
+    """
     if not proofs or 'cert' not in proofs or 'sig' not in proofs:
         raise Exception("No identity proofs provided by peer")
 
     try:
+        # --- 0. Carga de datos ---
         cert_bytes = bytes.fromhex(proofs['cert'])
         signature_bytes = bytes.fromhex(proofs['sig'])
-        cert = x509.load_der_x509_certificate(cert_bytes)
-        rsa_pub_key = cert.public_key()
+        peer_cert = x509.load_der_x509_certificate(cert_bytes)
+        rsa_pub_key = peer_cert.public_key()
 
+        # --- 1. Validación de Fechas (UTC) ---
+        now = datetime.now(timezone.utc)
+        if now < peer_cert.not_valid_before_utc:
+            raise Exception("Certificate is NOT YET valid")
+        if now > peer_cert.not_valid_after_utc:
+            raise Exception("Certificate has EXPIRED")
+
+        # --- 2. Validación de Key Usage ---
+        try:
+            key_usage_ext = peer_cert.extensions.get_extension_for_class(x509.KeyUsage)
+            usage = key_usage_ext.value
+            if not (usage.digital_signature or usage.content_commitment):
+                raise Exception("Certificate not allowed for Digital Signature/Authentication")
+        except x509.ExtensionNotFound:
+            pass
+
+        # --- 3. Validación de Cadena de Confianza (Chain of Trust) ---
+        issuer_name = "Unknown CA (No Verification)"
+        is_trusted = False
+        
+        if not GLOBAL_TRUST_STORE:
+             print("⚠️  SECURITY WARNING: No CA certificates found. Skipping Chain of Trust check.")
+             issuer_name = "UNTRUSTED/NO-STORE"
+             is_trusted = True 
+        else:
+            for ca_cert in GLOBAL_TRUST_STORE:
+                try:
+                    ca_public_key = ca_cert.public_key()
+                    ca_public_key.verify(
+                        peer_cert.signature,
+                        peer_cert.tbs_certificate_bytes,
+                        padding.PKCS1v15(),
+                        peer_cert.signature_hash_algorithm
+                    )
+                    is_trusted = True
+                    # Extraer el nombre de la autoridad que firmó exitosamente
+                    issuer_name = get_common_name(ca_cert)
+                    break 
+                except Exception:
+                    continue
+
+            if not is_trusted:
+                raise Exception("Certificate Issuer is NOT TRUSTED (No matching CA in ./certs)")
+
+        # --- 4. Prueba de Posesión (Proof of Possession) ---
         data_to_verify = x25519_pub_key.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw
@@ -44,13 +130,10 @@ def verify_peer_identity(x25519_pub_key, proofs):
             hashes.SHA256()
         )
 
-        for attribute in cert.subject:
-            if attribute.oid == x509.NameOID.COMMON_NAME:
-                full_name = attribute.value
-                clean_name = full_name.replace("(AUTENTICACIÓN)", "").strip()
-                return clean_name
+        # --- 5. Extracción de Identidad ---
+        real_name = get_common_name(peer_cert).replace("(AUTENTICACIÓN)", "").strip()
         
-        return "Unknown DNIe Identity"
+        return real_name, issuer_name
 
     except Exception as e:
         raise Exception(f"Identity Verification Failed: {e}")
@@ -126,8 +209,10 @@ class UDPProtocol(asyncio.DatagramProtocol):
         try:
             remote_pub = session.consume_handshake_message(data)
             try:
-                real_name = verify_peer_identity(remote_pub, session.remote_proofs)
+                # Obtenemos nombre y EMISOR
+                real_name, issuer = verify_peer_identity(remote_pub, session.remote_proofs)
                 self.on_log(f"✅ Verified Identity: {real_name}")
+                self.on_log(f"   ↳ Signed by: {issuer}")
             except Exception as e:
                 self.on_log(f"⛔ SECURITY ALERT: {e}")
                 return
@@ -136,9 +221,10 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.transport.sendto(b'\x02' + resp_data, addr)
             self.on_log(f"🤝 Handshake Response sent to {addr}")
             
-            asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], remote_pub, name=real_name))
+            asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], remote_pub, real_name=real_name))
+            
             if self.on_handshake_success:
-                self.on_handshake_success(addr, remote_pub)
+                self.on_handshake_success(addr, remote_pub, real_name)
                 
         except Exception as e:
             self.on_log(f"❌ Handshake failed: {e}")
@@ -150,9 +236,12 @@ class UDPProtocol(asyncio.DatagramProtocol):
         try:
             session.consume_handshake_response(data)
             try:
-                real_name = verify_peer_identity(session.rs_pub, session.remote_proofs)
+                # Obtenemos nombre y EMISOR
+                real_name, issuer = verify_peer_identity(session.rs_pub, session.remote_proofs)
                 self.on_log(f"✅ Verified Identity: {real_name}")
-                asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], session.rs_pub, name=real_name))
+                self.on_log(f"   ↳ Signed by: {issuer}")
+                
+                asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], session.rs_pub, real_name=real_name))
             except Exception as e:
                 self.on_log(f"⛔ SECURITY ALERT: {e}")
                 del self.sessions.sessions[addr]
@@ -160,8 +249,10 @@ class UDPProtocol(asyncio.DatagramProtocol):
 
             self.on_log(f"🔒 Secure Session established with {real_name}")
             
+            if self.on_handshake_success:
+                self.on_handshake_success(addr, session.rs_pub, real_name)
+
             if addr in self.pending_messages:
-                # Ahora send_message es async, así que debemos crear tareas para los pendientes
                 for content in self.pending_messages[addr]:
                     asyncio.create_task(self.send_message(addr, content))
                 del self.pending_messages[addr]
@@ -186,12 +277,8 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.on_log(f"⏳ Message queued...")
 
     async def send_message(self, addr, content):
-        """
-        Envía un mensaje. Ahora es ASYNC porque la búsqueda de claves en DB es asíncrona.
-        """
         session = self.sessions.get_session(addr)
         if not session:
-            # Aquí está el cambio crítico: AWAIT
             remote_pub = await self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
                 self.on_log(f"❌ Cannot send: No public key for {addr}")
@@ -275,29 +362,23 @@ class RawSniffer(asyncio.DatagramProtocol):
                 except: pass
 
             if found_info:
-                name, port = found_info
-                if name == self.service.unique_instance_id:
+                user_id_from_net, port = found_info
+                if user_id_from_net == self.service.unique_instance_id:
                     return
 
-                props = {'user': name}
-                display_name = name
-                if "-" in name:
-                     display_name = name.rsplit("-", 1)[0]
-                props['user'] = display_name
-
+                props = {'user': user_id_from_net}
+                
                 try:
                     pub_match = re.search(rb'pub=([a-fA-F0-9]+)', data)
                     if pub_match:
                         pub_str = pub_match.group(1).decode('utf-8')
-                        if len(pub_str) != 64:
-                            return 
+                        if len(pub_str) != 64: return 
                         
                         props['pub'] = pub_str
                         if props['pub'] == self.service.pubkey_b64: return
                     else:
                         return 
-                except: 
-                    return
+                except: return
                 
                 try:
                     user_match = re.search(rb'user=([^\x00]+)', data)
@@ -306,7 +387,7 @@ class RawSniffer(asyncio.DatagramProtocol):
                         props['user'] = clean_user
                 except: pass
 
-                self.service.on_found(display_name, addr[0], port, props)
+                self.service.on_found(user_id_from_net, addr[0], port, props)
         except Exception:
             pass
 

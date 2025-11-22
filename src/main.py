@@ -15,6 +15,14 @@ parser.add_argument('--data', type=str, default="data", help="Carpeta de datos")
 parser.add_argument('--mock', type=str, help="Simular DNIe")
 args = parser.parse_args()
 
+def ensure_cert_structure():
+    """Asegura que existen las carpetas para la CA"""
+    if not os.path.exists('certs'):
+        os.makedirs('certs')
+        with open('certs/README.txt', 'w') as f:
+            f.write("Coloca aqui los certificados CA (Root e Intermedios) del DNIe en formato .pem o .crt\n")
+            f.write("Ejemplo: AC_RAIZ_DNIE_2.pem, AC_DNIE_004.crt, etc.")
+
 async def main_async(dnie_identity_data):
     # dnie_identity_data es una tupla: (user_id, proofs_dict)
     user_id, proofs = dnie_identity_data
@@ -133,6 +141,7 @@ def perform_dnie_binding():
             card.disconnect()
 
 if __name__ == "__main__":
+    ensure_cert_structure()
     identity_data = perform_dnie_binding()
     try:
         asyncio.run(main_async(identity_data))

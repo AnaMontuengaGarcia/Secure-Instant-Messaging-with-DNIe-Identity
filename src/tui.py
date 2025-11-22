@@ -5,7 +5,6 @@ from textual.screen import ModalScreen
 from textual.binding import Binding
 import asyncio
 import pyperclip
-# Importación a nivel de módulo para evitar errores de importación tardíos
 import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
 
 class QuitScreen(ModalScreen):
@@ -27,12 +26,26 @@ class QuitScreen(ModalScreen):
         else: self.app.pop_screen()
 
 class ChatItem(ListItem):
-    def __init__(self, name, ip, port):
+    def __init__(self, user_id, real_name, ip, port):
         super().__init__()
-        self.contact_name = name
+        self.user_id = user_id
+        self.real_name = real_name
         self.contact_ip = ip
         self.contact_port = port
-        self.display_label = f"{name} ({ip}:{port})"
+        
+        # Lógica de visualización: Nombre Real (verificado) > UserID (técnico)
+        if self.real_name:
+            self.display_label = f"👤 {self.real_name} ({ip})"
+        else:
+            self.display_label = f"❓ {self.user_id} ({ip})"
+
+    def update_real_name(self, new_real_name):
+        self.real_name = new_real_name
+        self.display_label = f"👤 {self.real_name} ({self.contact_ip})"
+        try:
+            # Intentar refrescar la etiqueta si ya está montada
+            self.query_one(Label).update(self.display_label)
+        except: pass
 
     def compose(self) -> ComposeResult:
         yield Label(self.display_label)
@@ -71,7 +84,6 @@ class MessengerTUI(App):
         with Vertical(classes="sidebar"):
             yield Label("  📡 Discovered Peers", id="lbl_peers")
             yield ListView(id="contact_list")
-            # Botón eliminado como solicitaste
         with Vertical(classes="chat-area"):
             yield RichLog(highlight=True, markup=True, id="chat_box", classes="messages")
             yield RichLog(highlight=True, markup=True, id="log_box", classes="logs")
@@ -121,58 +133,75 @@ class MessengerTUI(App):
         try: self.query_one("#log_box", RichLog).write(text)
         except: pass
 
-    def add_peer(self, name, ip, port, props):
+    def add_peer(self, user_id, ip, port, props):
         try:
-            self.call_from_thread(self._add_peer_thread_safe, name, ip, port, props)
+            self.call_from_thread(self._add_peer_thread_safe, user_id, ip, port, props)
         except:
-            self._add_peer_thread_safe(name, ip, port, props)
+            self._add_peer_thread_safe(user_id, ip, port, props)
 
-    def _add_peer_thread_safe(self, name, ip, port, props):
+    def _add_peer_thread_safe(self, user_id, ip, port, props):
         try:
             lst = self.query_one("#contact_list", ListView)
             
-            # LÓGICA DE REGISTRO ROBUSTA Y LOGUEADA
+            # REGISTRO DE USUARIO DESCUBIERTO (Aún sin nombre real confirmado)
             pub_hex = props.get('pub', '')
             if pub_hex:
                 try:
                     pub_bytes = bytes.fromhex(pub_hex)
                     pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
                     
-                    # Usamos asyncio.create_task pero con manejo de excepciones si falla la corrutina
-                    task = asyncio.create_task(self.storage.register_contact(ip, port, pub_key, props.get('user', name)))
+                    # Registramos con user_id (ID técnico), real_name=None de momento
+                    task = asyncio.create_task(self.storage.register_contact(ip, port, pub_key, user_id=user_id, real_name=None))
                     
-                    # Callback opcional para loguear fallos de la tarea DB
                     def handle_db_result(t):
                         try: t.result()
                         except Exception as db_err:
-                            # Esto se imprimirá en stdout porque no tenemos acceso fácil a add_log desde aquí
-                            # pero si ejecutas en terminal verás el error.
-                            print(f"DB ERROR: {db_err}")
-                            
+                            print(f"DB ERROR: {db_err}")      
                     task.add_done_callback(handle_db_result)
                     
                 except Exception as key_err:
-                    self.add_log(f"⚠️ Key Error for {name}: {key_err}")
+                    self.add_log(f"⚠️ Key Error for {user_id}: {key_err}")
 
             # Evitar duplicados visuales
             for child in lst.children:
                 if isinstance(child, ChatItem):
-                    if child.contact_ip == ip and child.contact_port == port: return
+                    if child.contact_ip == ip and child.contact_port == port:
+                        # Si ya existe y ahora tenemos un ID mejor, podríamos actualizarlo, pero por simplicidad retornamos
+                        return
             
-            clean_name = name.split('.')[0]
-            item = ChatItem(props.get('user', clean_name), ip, port)
+            # Crear item visual. user_id es el técnico, real_name es None inicialmente
+            clean_id = user_id.split('.')[0]
+            item = ChatItem(clean_id, None, ip, port)
             lst.append(item)
-            self.add_log(f"🔎 Peer Found: {clean_name} ({ip})")
+            self.add_log(f"🔎 Peer Found: {clean_id} ({ip})")
         except Exception as e:
             self.add_log(f"⚠️ UI Error adding peer: {e}")
 
-    def on_new_peer_handshake(self, addr, pub_key):
+    def on_new_peer_handshake(self, addr, pub_key, real_name=None):
+        """Callback cuando se completa un handshake y verificamos identidad real"""
         try:
-            name = f"Peer_{addr[0]}"
-            props = {} 
-            self.add_peer(name, addr[0], addr[1], props)
-            self.add_log(f"🔗 Active connection from {addr[0]}")
-        except: pass
+            self.call_from_thread(self._update_peer_identity_safe, addr, real_name)
+        except:
+            self._update_peer_identity_safe(addr, real_name)
+
+    def _update_peer_identity_safe(self, addr, real_name):
+        if not real_name: return
+        
+        lst = self.query_one("#contact_list", ListView)
+        found = False
+        for child in lst.children:
+            if isinstance(child, ChatItem):
+                if child.contact_ip == addr[0] and child.contact_port == addr[1]:
+                    child.update_real_name(real_name)
+                    child.refresh()
+                    found = True
+                    break
+        
+        if not found:
+            # Si el peer hizo handshake pero no fue descubierto por mDNS antes
+            self._add_peer_thread_safe(f"Unknown_{addr[0]}", addr[0], addr[1], {})
+            # Luego recursivamente actualizamos su nombre
+            self._update_peer_identity_safe(addr, real_name)
 
     def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
@@ -180,7 +209,9 @@ class MessengerTUI(App):
         self.current_chat_addr = (item.contact_ip, item.contact_port)
         chat_box = self.query_one("#chat_box", RichLog)
         chat_box.clear()
-        chat_box.write(f"Chatting with {item.contact_name}...\n")
+        
+        name_display = item.real_name if item.real_name else item.user_id
+        chat_box.write(f"Chatting with {name_display}...\n")
         
         key = f"{item.contact_ip}:{item.contact_port}"
         if key in self.message_history:
@@ -201,7 +232,6 @@ class MessengerTUI(App):
         self._save_history(key, formatted_msg)
         self.query_one("#chat_box", RichLog).write(formatted_msg)
         
-        # AWAIT AÑADIDO AQUÍ
         await self.proto.send_message(self.current_chat_addr, text)
 
     def receive_message(self, addr, msg):
@@ -213,18 +243,22 @@ class MessengerTUI(App):
     def _receive_message_thread_safe(self, addr, msg):
         ip, port = addr
         
+        # Asegurar que el peer existe en la lista
         lst = self.query_one("#contact_list", ListView)
         known = False
+        peer_name = f"Peer_{ip}"
+        
         for child in lst.children:
              if isinstance(child, ChatItem) and child.contact_ip == ip and child.contact_port == port:
                  known = True
+                 peer_name = child.real_name if child.real_name else child.user_id
                  break
         if not known:
              self._add_peer_thread_safe(f"Peer_{ip}", ip, port, {})
 
         text = msg.get('text', '')
         self.last_msg_content = text
-        formatted_msg = f"[bold yellow][Peer]:[/] {text}"
+        formatted_msg = f"[bold yellow][{peer_name}]:[/] {text}"
         key = f"{ip}:{port}"
         self._save_history(key, formatted_msg)
         
@@ -232,7 +266,7 @@ class MessengerTUI(App):
         if curr_ip == ip:
             self.query_one("#chat_box", RichLog).write(formatted_msg)
         else:
-            self.add_log(f"📨 New message from {ip}")
+            self.add_log(f"📨 New message from {peer_name}")
 
     def _save_history(self, key, line):
         if key not in self.message_history: self.message_history[key] = []
