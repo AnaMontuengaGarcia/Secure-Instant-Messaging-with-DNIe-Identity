@@ -22,7 +22,7 @@ build/
 .env
 
 # Key
-identity.key
+*.key
 
 # Database
-messenger.db
+*.json

@@ -71,7 +71,7 @@ class MessengerTUI(App):
         with Vertical(classes="sidebar"):
             yield Label("  📡 Discovered Peers", id="lbl_peers")
             yield ListView(id="contact_list")
-            yield Button("Refresh Peers", id="btn_refresh", variant="primary")
+            # Botón eliminado como solicitaste
         with Vertical(classes="chat-area"):
             yield RichLog(highlight=True, markup=True, id="chat_box", classes="messages")
             yield RichLog(highlight=True, markup=True, id="log_box", classes="logs")
@@ -100,10 +100,6 @@ class MessengerTUI(App):
     def action_refresh_peers(self):
         self.add_log("🔄 Manual refresh...")
         self.discovery.refresh()
-
-    def on_button_pressed(self, event: Button.Pressed):
-        if event.button.id == "btn_refresh":
-            self.action_refresh_peers()
 
     def action_copy_last_message(self):
         if self.last_msg_content:
@@ -204,7 +200,9 @@ class MessengerTUI(App):
         key = f"{self.current_chat_addr[0]}:{self.current_chat_addr[1]}"
         self._save_history(key, formatted_msg)
         self.query_one("#chat_box", RichLog).write(formatted_msg)
-        self.proto.send_message(self.current_chat_addr, text)
+        
+        # AWAIT AÑADIDO AQUÍ
+        await self.proto.send_message(self.current_chat_addr, text)
 
     def receive_message(self, addr, msg):
         try:

@@ -161,8 +161,9 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"🔒 Secure Session established with {real_name}")
             
             if addr in self.pending_messages:
+                # Ahora send_message es async, así que debemos crear tareas para los pendientes
                 for content in self.pending_messages[addr]:
-                    self.send_message(addr, content)
+                    asyncio.create_task(self.send_message(addr, content))
                 del self.pending_messages[addr]
 
         except Exception as e:
@@ -184,10 +185,14 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.pending_messages[addr].append(content)
         self.on_log(f"⏳ Message queued...")
 
-    def send_message(self, addr, content):
+    async def send_message(self, addr, content):
+        """
+        Envía un mensaje. Ahora es ASYNC porque la búsqueda de claves en DB es asíncrona.
+        """
         session = self.sessions.get_session(addr)
         if not session:
-            remote_pub = self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
+            # Aquí está el cambio crítico: AWAIT
+            remote_pub = await self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
                 self.on_log(f"❌ Cannot send: No public key for {addr}")
                 return
@@ -280,12 +285,10 @@ class RawSniffer(asyncio.DatagramProtocol):
                      display_name = name.rsplit("-", 1)[0]
                 props['user'] = display_name
 
-                # --- LÓGICA MEJORADA DE VALIDACIÓN ---
                 try:
                     pub_match = re.search(rb'pub=([a-fA-F0-9]+)', data)
                     if pub_match:
                         pub_str = pub_match.group(1).decode('utf-8')
-                        # Validar longitud estricta (32 bytes = 64 hex chars)
                         if len(pub_str) != 64:
                             return 
                         
@@ -368,6 +371,12 @@ class DiscoveryService:
         if hasattr(self, 'info') and hasattr(self, 'aiozc'): 
             await self.aiozc.async_unregister_service(self.info)
         if hasattr(self, 'aiozc'): await self.aiozc.async_close()
+
+    def refresh(self):
+        """Envía una consulta mDNS manual para redescubrir peers."""
+        if self.sniffer_transport:
+             try: self.sniffer_transport.sendto(RAW_MDNS_QUERY, ('224.0.0.251', 5353))
+             except: pass
 
     async def _active_polling_loop(self):
         while True:

@@ -67,56 +67,70 @@ def perform_dnie_binding():
     from storage import Storage
     
     # Necesitamos la clave antes de arrancar la red para firmarla
-    # Esto es un poco "huevo y gallina", instanciamos storage temporalmente
     temp_storage = Storage(data_dir=args.data)
-    # Nota: asyncio.run no se puede llamar aquí fácilmente si ya estamos en main.
-    # Hacemos una carga síncrona sucia o asumimos que identity.key existe/se crea.
-    # Para simplificar, asumimos que Storage.get_static_key puede correr síncrono o lo forzamos.
-    # Pero Storage es async. 
-    # Solución: Ejecutar un mini-loop solo para obtener la clave.
     
     async def get_key_bytes():
         if not os.path.exists(temp_storage.data_dir): os.makedirs(temp_storage.data_dir)
         return await temp_storage.get_static_key()
 
-    key_priv = asyncio.run(get_key_bytes())
+    try:
+        key_priv = asyncio.run(get_key_bytes())
+    except Exception as e:
+        print(f"Error accessing storage: {e}")
+        sys.exit(1)
+
     key_pub_bytes = key_priv.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw
     )
 
     print("🔐 DNIe Binding Ceremony")
-    print("Insert DNIe to SIGN your network identity...")
-    input("Press Enter...")
     
-    card = DNIeCard()
-    try:
-        card.connect()
-        pin = getpass("Enter DNIe PIN: ")
-        card.authenticate(pin)
+    while True:
+        print("\n👉 Insert DNIe to SIGN your network identity.")
+        user_input = input("Press [Enter] to connect or type 'q' to quit... ").strip().lower()
         
-        print("📜 Reading Certificate...")
-        cert_der = card.get_certificate()
-        
-        print("✍️  Signing Network Identity (X25519 Key)...")
-        signature = card.sign_data(key_pub_bytes)
-        
-        print("✅ Identity Bound Successfully!")
-        
-        proofs = {
-            'cert': cert_der.hex(),
-            'sig': signature.hex()
-        }
-        # Usamos parte del hash del certificado como ID visual temporal
-        user_id = card.get_serial_hash()[:8]
-        
-        return (user_id, proofs)
-        
-    except Exception as e:
-        print(f"❌ Binding Failed: {e}")
-        sys.exit(1)
-    finally:
-        card.disconnect()
+        if user_input == 'q':
+            print("Exiting...")
+            sys.exit(0)
+
+        card = DNIeCard()
+        try:
+            print("⏳ Connecting to smart card...")
+            card.connect()
+            
+            # Si conecta, intentar autenticación
+            try:
+                pin = getpass("Enter DNIe PIN: ")
+                card.authenticate(pin)
+            except Exception as auth_err:
+                print(f"❌ Authentication Failed: {auth_err}")
+                print("⚠️  Please try again.")
+                continue # Volver al inicio del bucle
+
+            print("📜 Reading Certificate...")
+            cert_der = card.get_certificate()
+            
+            print("✍️  Signing Network Identity (X25519 Key)...")
+            signature = card.sign_data(key_pub_bytes)
+            
+            print("✅ Identity Bound Successfully!")
+            
+            proofs = {
+                'cert': cert_der.hex(),
+                'sig': signature.hex()
+            }
+            # Usamos parte del hash del certificado como ID visual temporal
+            user_id = card.get_serial_hash()[:8]
+            
+            return (user_id, proofs)
+            
+        except Exception as e:
+            print(f"⚠️ Card Error: {e}")
+            print("Make sure the reader is connected and the card is inserted correctly.")
+            # El bucle continúa automáticamente pidiendo "Press Enter"
+        finally:
+            card.disconnect()
 
 if __name__ == "__main__":
     identity_data = perform_dnie_binding()
