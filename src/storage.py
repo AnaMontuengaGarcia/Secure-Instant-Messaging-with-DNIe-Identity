@@ -65,7 +65,7 @@ class Storage:
     async def register_contact(self, ip, port, pubkey_obj, user_id=None, real_name=None):
         """
         Registra o actualiza un contacto.
-        user_id: Identificador único (hash DNI / mDNS)
+        user_id: Identificador único (hash DNI / mDNS) - PRIORITARIO PARA FILTRADO
         real_name: Nombre real extraído del certificado
         """
         pub_hex = pubkey_obj.public_bytes(
@@ -77,50 +77,72 @@ class Storage:
             contacts = await asyncio.to_thread(self._read_sync, self.contacts_file)
             
             # Buscar si ya existe
-            found = False
-            for c in contacts:
-                # Criterio de unicidad: IP:Port es volátil, pero útil para sesiones.
-                # Lo ideal sería buscar por pubkey o userID si lo tenemos, pero mantenemos IP:Port por simplicidad de red.
-                if c['ip'] == ip and c['port'] == port:
-                    found = True
-                    if c['pubkey_hex'] != pub_hex:
-                         print(f"🚨 SECURITY ALERT: Key changed for {ip}:{port}!")
-                         return
-                    
-                    updated = False
-                    # Actualizar userID si se proporciona
-                    if user_id and c.get('userID') != user_id:
-                        c['userID'] = user_id
-                        updated = True
-                    
-                    # Actualizar Real Name si se proporciona (prioridad sobre lo que hubiese)
-                    if real_name and c.get('real_name') != real_name:
-                        c['real_name'] = real_name
-                        print(f"DB: Identity Verified for {ip}:{port} -> {real_name}")
-                        updated = True
-                        
-                    if updated:
-                        await self._write_json(self.contacts_file, contacts)
+            found_idx = -1
+            for i, c in enumerate(contacts):
+                # CRITERIO MODIFICADO:
+                # 1. Si tenemos user_id, buscamos coincidencia exacta de ID (Permite cambio de IP)
+                # 2. Si no, fallback a IP:Port (legacy/anónimo)
+                
+                match_id = (user_id is not None) and (c.get('userID') == user_id)
+                match_ip = (c['ip'] == ip and c['port'] == port)
+                
+                if match_id:
+                    found_idx = i
                     break
+                elif match_ip and found_idx == -1: # Si encontramos por IP, guardamos índice pero seguimos buscando por ID por si acaso
+                    found_idx = i
             
-            if not found:
+            if found_idx != -1:
+                c = contacts[found_idx]
+                updated = False
+                
+                # Actualizar IP/Port si han cambiado (Solo si hemos matcheado por ID)
+                if c['ip'] != ip or c['port'] != port:
+                    c['ip'] = ip
+                    c['port'] = port
+                    updated = True
+                    # print(f"DB: Network info updated for {user_id} -> {ip}:{port}")
+                
+                # Actualizar PubKey si cambia (alerta seguridad, pero actualizamos)
+                if c.get('pubkey_hex') != pub_hex:
+                     print(f"🚨 SECURITY ALERT: Key changed for {user_id} ({ip}:{port})!")
+                     c['pubkey_hex'] = pub_hex
+                     updated = True
+                
+                # Actualizar userID si faltaba (caso de migración de contacto anónimo a identificado)
+                if user_id and c.get('userID') != user_id:
+                    c['userID'] = user_id
+                    updated = True
+                
+                # Actualizar Real Name si se proporciona (prioridad sobre lo que hubiese)
+                if real_name and c.get('real_name') != real_name:
+                    c['real_name'] = real_name
+                    print(f"DB: Identity Verified for {ip}:{port} -> {real_name}")
+                    updated = True
+                    
+                if updated:
+                    await self._write_json(self.contacts_file, contacts)
+            
+            else:
+                # No encontrado -> Crear nuevo
                 new_contact = {
                     "ip": ip,
                     "port": port,
                     "pubkey_hex": pub_hex,
                     "userID": user_id if user_id else "UnknownID",
-                    "real_name": real_name if real_name else None, # Nombre visual
+                    "real_name": real_name if real_name else None,
                     "trusted": 1
                 }
                 contacts.append(new_contact)
                 await self._write_json(self.contacts_file, contacts)
-                print(f"DB: Contact {ip}:{port} saved successfully (JSON).")
+                print(f"DB: New contact {ip}:{port} saved.")
 
     async def get_pubkey_by_addr(self, ip, port):
         """Recupera la clave pública buscando en el JSON de contactos"""
         try:
             contacts = await asyncio.to_thread(self._read_sync, self.contacts_file)
             for c in contacts:
+                # Intentamos buscar primero por IP/Port
                 if c['ip'] == ip and c['port'] == port:
                     return x25519.X25519PublicKey.from_public_bytes(bytes.fromhex(c['pubkey_hex']))
             return None

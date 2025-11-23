@@ -9,6 +9,7 @@ from rich.text import Text
 from rich.align import Align
 from rich import box
 import asyncio
+import time  # Necesario para controlar el tiempo (timestamp)
 import pyperclip
 import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
 
@@ -38,28 +39,56 @@ class QuitScreen(ModalScreen):
 # --- WIDGETS CHAT ---
 
 class ChatItem(ListItem):
-    def __init__(self, user_id, real_name, ip, port, verified=False):
+    def __init__(self, user_id, real_name, ip, port, verified=False, online=False):
         super().__init__()
         self.user_id = user_id
         self.real_name = real_name
         self.contact_ip = ip
         self.contact_port = port
         self.verified = verified
+        self.online = online  # Estado de conexión
         
         self.update_label()
 
+    def set_online_status(self, is_online):
+        """Actualiza el estado online/offline y refresca la etiqueta visualmente"""
+        if self.online != is_online:
+            self.online = is_online
+            self.update_label()
+
+    def update_address(self, new_ip, new_port):
+        """Actualiza la dirección IP/Puerto si cambia por DHCP"""
+        self.contact_ip = new_ip
+        self.contact_port = new_port
+        self.update_label()
+
     def update_label(self):
-        """Actualiza el texto mostrado basándose en el estado de verificación."""
+        """Actualiza el texto mostrado basándose en el estado de verificación y conexión."""
+        
+        # Determinar el color y símbolo del estado
+        if self.online:
+            status_icon = "[green]●[/]" # Círculo verde para online
+            status_text = "Online"
+        else:
+            status_icon = "[grey50]●[/]" # Círculo gris para offline
+            status_text = "Offline"
+
+        # Construcción del nombre a mostrar
         if self.real_name:
             if self.verified:
                 # Nombre verificado (Handshake completo)
-                self.display_label = f"👤 {self.real_name} ({self.contact_ip})"
+                display_name = f"{self.real_name}"
             else:
                 # Nombre conocido de DB pero no verificado en esta sesión
-                self.display_label = f"❓ {self.real_name} (?) ({self.contact_ip})"
+                display_name = f"{self.real_name} (?)"
         else:
             # Solo tenemos el ID (Hash)
-            self.display_label = f"👾 {self.user_id} ({self.contact_ip})"
+            display_name = f"{self.user_id}"
+
+        # Composición final usando Rich Text markup
+        # Formato: ● Nombre (IP)
+        # Mostramos siempre la IP actual conocida
+        self.display_label = f"{status_icon} {display_name} [dim]({self.contact_ip})[/]"
             
         try:
             self.query_one(Label).update(self.display_label)
@@ -127,11 +156,15 @@ class MessengerTUI(App):
         
         # Caché en memoria para nombres conocidos (ID -> Nombre Real)
         self.known_names = {} 
+        
+        # Diccionario para rastrear la última vez que vimos un paquete mDNS
+        # Key: user_id, Value: timestamp (time.time())
+        self.peer_last_seen = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(classes="sidebar"):
-            yield Label("  📡 Discovered Peers", id="lbl_peers")
+            yield Label("  📡 Contactos", id="lbl_peers")
             yield ListView(id="contact_list")
         with Vertical(classes="chat-area"):
             yield RichLog(highlight=True, markup=True, id="chat_box", classes="messages", wrap=True)
@@ -142,26 +175,72 @@ class MessengerTUI(App):
         yield Footer()
 
     async def on_mount(self):
-        self.title = "🇪🇸 DNIe Secure Messenger"
+        self.title = "DNIe Secure Messenger"
         
-        # Cargar contactos conocidos para reconocer IDs
-        contacts = await self.storage.get_all_contacts()
-        for c in contacts:
-            uid = c.get('userID')
-            name = c.get('real_name')
-            if uid and name:
-                self.known_names[uid] = name
+        # 1. Cargar contactos guardados desde disco
+        await self.load_saved_contacts()
         
+        # Configurar callbacks
         self.proto.on_log = self.add_log
         self.proto.on_message = self.receive_message
         self.proto.on_handshake_success = self.on_new_peer_handshake
         self.discovery.on_found = self.add_peer
         self.discovery.on_log = self.add_log 
-        self.query_one("#chat_box", RichLog).write("Select a contact to chat")
+        
+        self.query_one("#chat_box", RichLog).write("Selecciona un contacto para chatear.")
         self.add_log(f"System initializing for {self.user_id}...")
         
+        # Iniciar servicio de descubrimiento
         username = f"User-{self.user_id}"
         await self.discovery.start(username, bind_ip=self.bind_ip)
+        
+        # Iniciar temporizador para comprobar estado Online/Offline cada 5 segundos
+        self.set_interval(5.0, self.check_peer_status)
+
+    async def load_saved_contacts(self):
+        """Carga contactos del JSON y los añade a la lista como Offline inicialmente."""
+        contacts = await self.storage.get_all_contacts()
+        lst = self.query_one("#contact_list", ListView)
+        
+        loaded_count = 0
+        for c in contacts:
+            uid = c.get('userID')
+            name = c.get('real_name')
+            ip = c.get('ip')
+            port = c.get('port')
+            
+            # Filtro: Solo cargamos si existe un nombre real
+            if uid and name:
+                self.known_names[uid] = name
+                # Comprobar duplicados antes de añadir (por seguridad)
+                exists = False
+                for child in lst.children:
+                    if isinstance(child, ChatItem) and child.user_id == uid:
+                        exists = True
+                        break
+                
+                if not exists:
+                    # Offline por defecto
+                    item = ChatItem(uid, name, ip, port, verified=False, online=False)
+                    lst.append(item)
+                    loaded_count += 1
+        
+        self.add_log(f"📚 {loaded_count} Contactos verificados cargados.")
+
+    def check_peer_status(self):
+        """
+        Se ejecuta periódicamente.
+        Comprueba si han pasado más de 20 segundos desde el último mDNS de cada peer.
+        """
+        now = time.time()
+        lst = self.query_one("#contact_list", ListView)
+        
+        for child in lst.children:
+            if isinstance(child, ChatItem):
+                last_seen = self.peer_last_seen.get(child.user_id, 0)
+                # Si han pasado menos de 20s, está online. Si no, offline.
+                is_online = (now - last_seen) < 20.0
+                child.set_online_status(is_online)
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn_send":
@@ -191,6 +270,15 @@ class MessengerTUI(App):
         except: pass
 
     def add_peer(self, user_id, ip, port, props):
+        """
+        Llamado cuando el DiscoveryService recibe un mDNS packet.
+        """
+        # FILTRO: Ignorar paquetes mDNS que provienen de la loopback (127.0.0.1)
+        if ip == "127.0.0.1":
+            return
+
+        self.peer_last_seen[user_id] = time.time()
+        
         try: self.call_from_thread(self._add_peer_thread_safe, user_id, ip, port, props)
         except: self._add_peer_thread_safe(user_id, ip, port, props)
 
@@ -198,38 +286,91 @@ class MessengerTUI(App):
         try:
             lst = self.query_one("#contact_list", ListView)
             pub_hex = props.get('pub', '')
+            stable_id = user_id.strip()
             
-            # --- LIMPIEZA DE ID (SIMPLIFICADA) ---
-            # Como network.py ya no añade sufijo, usamos el user_id tal cual
-            stable_id = user_id
-            
-            # --- RESOLUCIÓN DE NOMBRE ---
-            display_name = None
-            verified_state = False
-            
-            if stable_id in self.known_names:
-                display_name = self.known_names[stable_id]
-            
+            # --- 1. LLAMADA A STORAGE UNIFICADA ---
+            # Llamamos a register_contact SIEMPRE que haya clave pública.
+            # Como arreglamos storage.py, esto actualizará la IP si el usuario existe,
+            # y NO sobrescribirá real_name con None.
             if pub_hex:
                 try:
                     pub_bytes = bytes.fromhex(pub_hex)
                     pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
-                    task = asyncio.create_task(self.storage.register_contact(ip, port, pub_key, user_id=stable_id, real_name=None))
+                    asyncio.create_task(self.storage.register_contact(ip, port, pub_key, user_id=stable_id, real_name=None))
                 except Exception: pass
-            
+
+            # --- 2. ACTUALIZACIÓN VISUAL (UI) ---
+            found_item = None
             for child in lst.children:
-                if isinstance(child, ChatItem) and child.contact_ip == ip and child.contact_port == port: return
+                if isinstance(child, ChatItem) and child.user_id == stable_id:
+                    found_item = child
+                    break
             
-            item = ChatItem(stable_id, display_name, ip, port, verified=verified_state)
-            lst.append(item)
+            if found_item:
+                # El usuario YA existe en la lista
+                
+                # --- DETECCIÓN DE RECONEXIÓN ---
+                # Detectamos si el usuario estaba OFFLINE justo antes de este mDNS.
+                # Si es así, significa que ha vuelto.
+                was_offline = not found_item.online
+
+                # Verificamos si la IP ha cambiado (DHCP)
+                if found_item.contact_ip != ip or found_item.contact_port != port:
+                    old_addr = f"{found_item.contact_ip}:{found_item.contact_port}"
+                    new_addr = f"{ip}:{port}"
+                    
+                    self.add_log(f"🔄 Network Change: {stable_id} moved {old_addr} -> {new_addr}")
+                    
+                    # 1. Actualizar visualmente y objeto en memoria
+                    found_item.update_address(ip, port)
+                    
+                    # 2. Redirigir sesión de chat si estaba activa
+                    if self.current_chat_addr and (self.current_chat_addr[0] == old_addr.split(':')[0]):
+                        self.current_chat_addr = (ip, port)
+                        self._refresh_chat_view(found_item)
+                        self.add_log("⚡ Active chat session rerouted to new IP.")
+                    
+                    # Si cambió de IP, consideramos que "volvió" y forzamos reset también
+                    was_offline = True
+
+                # Marcar como Online siempre que recibimos mDNS
+                found_item.set_online_status(True)
+                
+                # --- LÓGICA DE RESETEO DE SESIÓN ---
+                # Si el usuario vuelve tras haber estado Offline (o cambia IP), borramos
+                # la sesión criptográfica en memoria. Esto fuerza a que el próximo
+                # 'send_message' inicie un Handshake limpio (Packet 0x01).
+                if was_offline:
+                    try:
+                        addr_tuple = (ip, port)
+                        # Accedemos directamente al diccionario de sesiones de SessionManager
+                        if addr_tuple in self.proto.sessions.sessions:
+                            del self.proto.sessions.sessions[addr_tuple]
+                            self.add_log(f"🔄 Session reset for {found_item.real_name or stable_id} (Reconnected)")
+                    except Exception as e:
+                        print(f"Error resetting session: {e}")
+
+                # Actualizar nombre si tenemos información nueva en memoria
+                if not found_item.real_name:
+                     display_name = self.known_names.get(stable_id)
+                     if display_name:
+                         found_item.real_name = display_name
+                         found_item.update_label()
+
+            else:
+                # El usuario NO existe en la lista (Nuevo)
+                display_name = self.known_names.get(stable_id)
+                item = ChatItem(stable_id, display_name, ip, port, verified=False, online=True)
+                lst.append(item)
+                
+                log_msg = f"🔎 Peer Found: {stable_id}"
+                if display_name:
+                    log_msg += f" (Known as: {display_name})"
+                log_msg += f" @ {ip}"
+                self.add_log(log_msg)
             
-            log_msg = f"🔎 Peer Found: {stable_id}"
-            if display_name:
-                log_msg += f" (Known as: {display_name})"
-            log_msg += f" @ {ip}"
-            self.add_log(log_msg)
-            
-        except: pass
+        except Exception as e: 
+            self.add_log(f"Error updating UI peer: {e}")
 
     def on_new_peer_handshake(self, addr, pub_key, real_name=None):
         try: self.call_from_thread(self._update_peer_identity_safe, addr, real_name)
@@ -240,19 +381,19 @@ class MessengerTUI(App):
         lst = self.query_one("#contact_list", ListView)
         found = False
         
+        # Buscar por IP/Puerto para el handshake inicial
         for child in lst.children:
             if isinstance(child, ChatItem) and child.contact_ip == addr[0] and child.contact_port == addr[1]:
-                # Actualizar item a VERIFICADO
                 child.set_verified_identity(real_name)
                 self.known_names[child.user_id] = real_name
                 found = True
                 
-                # --- ACTUALIZACIÓN AUTOMÁTICA DEL HEADER ---
                 if self.current_chat_addr == (child.contact_ip, child.contact_port):
                     self._refresh_chat_view(child)
                 break
         
         if not found:
+            # Fallback raro si llega handshake de alguien no descubierto por mDNS
             self._add_peer_thread_safe(f"Unknown_{addr[0]}", addr[0], addr[1], {})
             self._update_peer_identity_safe(addr, real_name)
 
@@ -268,11 +409,12 @@ class MessengerTUI(App):
         chat_box.clear()
         
         target_name = item.real_name if item.real_name else item.user_id
-        # Aquí se decide si mostrar Verified o Unverified
         status = "(Verified)" if item.verified else "(Unverified)"
+        conn_status = "[green]ONLINE[/]" if item.online else "[grey]OFFLINE[/]"
         
-        chat_box.write(f"Chatting with {target_name} {status}...\n")
+        chat_box.write(f"Chatting with {target_name} {status} - {conn_status}\n")
         
+        # Recuperamos historial usando la combinación IP:Port actual
         key = f"{item.contact_ip}:{item.contact_port}"
         if key in self.message_history:
             for msg in self.message_history[key]: chat_box.write(msg)
@@ -281,10 +423,30 @@ class MessengerTUI(App):
         ta = self.query_one("#msg_input", ChatInput)
         text = ta.text.strip()
         if not text: return
-        ta.text = "" 
+        
         if not self.current_chat_addr:
             self.add_log("⚠️ Select a contact first!")
             return
+            
+        # --- VERIFICACIÓN DE ESTADO ONLINE ---
+        target_item = None
+        lst = self.query_one("#contact_list", ListView)
+        # Buscar el item seleccionado actualmente
+        for child in lst.children:
+            if isinstance(child, ChatItem) and child.contact_ip == self.current_chat_addr[0] and child.contact_port == self.current_chat_addr[1]:
+                target_item = child
+                break
+        
+        if target_item:
+            if not target_item.online:
+                self.add_log(f"⛔ Cannot send message: {target_item.real_name or target_item.user_id} is OFFLINE.")
+                return
+        else:
+             self.add_log("❌ Error: Contact not found in list context.")
+             return
+        # --------------------------------------
+
+        ta.text = "" 
         self.last_msg_content = text
         msg_panel = self._create_message_panel(text, "You", is_me=True)
         key = f"{self.current_chat_addr[0]}:{self.current_chat_addr[1]}"
@@ -306,6 +468,8 @@ class MessengerTUI(App):
              if isinstance(child, ChatItem) and child.contact_ip == ip and child.contact_port == port:
                  known = True
                  peer_name = child.real_name if child.real_name else child.user_id
+                 self.peer_last_seen[child.user_id] = time.time()
+                 child.set_online_status(True)
                  break
         
         if not known: self._add_peer_thread_safe(f"Peer_{ip}", ip, port, {})
