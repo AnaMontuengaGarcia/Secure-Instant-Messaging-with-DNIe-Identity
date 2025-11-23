@@ -4,15 +4,16 @@ import argparse
 import os
 from network import UDPProtocol, SessionManager, DiscoveryService
 from storage import Storage
-from tui import MessengerTUI
+from tui import MessengerTUI, DNIeLoginApp
 from cryptography.hazmat.primitives import serialization
 
-# Configuración estándar
+# Configuración estándar de argumentos
+# Se han añadido alias cortos (-p, -b, -d) para mayor comodidad
 parser = argparse.ArgumentParser(description="DNIe Secure Messenger")
-parser.add_argument('--port', type=int, default=443, help="Puerto UDP (Default: 443)")
-parser.add_argument('--bind', type=str, default="0.0.0.0", help="IP de escucha")
-parser.add_argument('--data', type=str, default="data", help="Carpeta de datos")
-parser.add_argument('--mock', type=str, help="Simular DNIe")
+parser.add_argument('-p', '--port', type=int, default=443, help="Puerto UDP (Default: 443)")
+parser.add_argument('-b', '--bind', type=str, default="0.0.0.0", help="IP de escucha (Default: 0.0.0.0)")
+parser.add_argument('-d', '--data', type=str, default="data", help="Carpeta de datos (Default: 'data')")
+parser.add_argument('--mock', type=str, help="Simular DNIe para pruebas (Ej: --mock User1)")
 args = parser.parse_args()
 
 def ensure_cert_structure():
@@ -21,18 +22,17 @@ def ensure_cert_structure():
         os.makedirs('certs')
         with open('certs/README.txt', 'w') as f:
             f.write("Coloca aqui los certificados CA (Root e Intermedios) del DNIe en formato .pem o .crt\n")
-            f.write("Ejemplo: AC_RAIZ_DNIE_2.pem, AC_DNIE_004.crt, etc.")
 
 async def main_async(dnie_identity_data):
-    # dnie_identity_data es una tupla: (user_id, proofs_dict)
     user_id, proofs = dnie_identity_data
     
+    # Inicializamos el storage usando la carpeta definida en los argumentos
     storage = Storage(data_dir=args.data)
     await storage.init()
     local_static_key = await storage.get_static_key()
     
-    # Pasamos las pruebas (cert+firma) al SessionManager
     sessions = SessionManager(local_static_key, storage, local_proofs=proofs)
+    # Callback de log simple para la consola
     proto = UDPProtocol(sessions, lambda a,m: None, lambda t: print(f"LOG: {t}"))
     
     loop = asyncio.get_running_loop()
@@ -47,6 +47,7 @@ async def main_async(dnie_identity_data):
         )
     except Exception as e:
         print(f"❌ Socket error: {e}")
+        print("💡 Consejo: Si el puerto 443 requiere permisos de root, prueba con un puerto alto: -p 5000")
         return
 
     try:
@@ -55,9 +56,10 @@ async def main_async(dnie_identity_data):
             format=serialization.PublicFormat.Raw
         )
         
+        # Iniciamos el servicio de descubrimiento (mDNS) en el puerto correcto
         discovery = DiscoveryService(args.port, pub_bytes, lambda n,i,p,pr: None)
         
-        # Pasamos los proofs (que incluyen el nombre real del DNIe) como ID si queremos
+        # Lanzamos la interfaz de Chat (TUI)
         app = MessengerTUI(proto, discovery, storage, user_id=user_id, bind_ip=args.bind)
         await app.run_async()
         
@@ -66,15 +68,14 @@ async def main_async(dnie_identity_data):
         if transport: transport.close()
         print("👋 Bye!")
 
-def perform_dnie_binding():
-    if args.mock:
-        return (args.mock, {'cert': '00', 'sig': '00'}) # Mock sin seguridad real
-
-    from smartcard_dnie import DNIeCard
-    from getpass import getpass
-    from storage import Storage
+def perform_dnie_binding_gui():
+    """Realiza el binding usando la interfaz gráfica Textual (Login)"""
     
-    # Necesitamos la clave antes de arrancar la red para firmarla
+    # Si se usa el modo --mock, saltamos la pantalla de login real
+    if args.mock:
+        return (args.mock, {'cert': '00', 'sig': '00'})
+
+    # 1. Preparar clave estática (necesaria para que el DNIe la firme)
     temp_storage = Storage(data_dir=args.data)
     
     async def get_key_bytes():
@@ -92,57 +93,24 @@ def perform_dnie_binding():
         format=serialization.PublicFormat.Raw
     )
 
-    print("🔐 DNIe Binding Ceremony")
+    # 2. Lanzar la App de Login dedicada
+    login_app = DNIeLoginApp(key_to_sign_bytes=key_pub_bytes)
+    result = login_app.run() # Bloquea hasta que la App se cierra (exit)
     
-    while True:
-        print("\n👉 Insert DNIe to SIGN your network identity.")
-        user_input = input("Press [Enter] to connect or type 'q' to quit... ").strip().lower()
-        
-        if user_input == 'q':
-            print("Exiting...")
-            sys.exit(0)
-
-        card = DNIeCard()
-        try:
-            print("⏳ Connecting to smart card...")
-            card.connect()
-            
-            # Si conecta, intentar autenticación
-            try:
-                pin = getpass("Enter DNIe PIN: ")
-                card.authenticate(pin)
-            except Exception as auth_err:
-                print(f"❌ Authentication Failed: {auth_err}")
-                print("⚠️  Please try again.")
-                continue # Volver al inicio del bucle
-
-            print("📜 Reading Certificate...")
-            cert_der = card.get_certificate()
-            
-            print("✍️  Signing Network Identity (X25519 Key)...")
-            signature = card.sign_data(key_pub_bytes)
-            
-            print("✅ Identity Bound Successfully!")
-            
-            proofs = {
-                'cert': cert_der.hex(),
-                'sig': signature.hex()
-            }
-            # Usamos parte del hash del certificado como ID visual temporal
-            user_id = card.get_serial_hash()[:8]
-            
-            return (user_id, proofs)
-            
-        except Exception as e:
-            print(f"⚠️ Card Error: {e}")
-            print("Make sure the reader is connected and the card is inserted correctly.")
-            # El bucle continúa automáticamente pidiendo "Press Enter"
-        finally:
-            card.disconnect()
+    # 3. Procesar resultado del login
+    if result:
+        return result
+    else:
+        # Si el usuario cerró la ventana o canceló
+        print("Login cancelado por el usuario.")
+        sys.exit(0)
 
 if __name__ == "__main__":
     ensure_cert_structure()
-    identity_data = perform_dnie_binding()
+    # Fase 1: Identidad (Login Gráfico)
+    identity_data = perform_dnie_binding_gui()
+    
+    # Fase 2: Chat (App Principal)
     try:
         asyncio.run(main_async(identity_data))
     except KeyboardInterrupt:

@@ -37,50 +37,39 @@ def load_trusted_cas():
             try:
                 with open(os.path.join(TRUSTED_CERTS_DIR, filename), "rb") as f:
                     cert_data = f.read()
-                    # Intentar cargar como PEM
                     try:
                         cert = x509.load_pem_x509_certificate(cert_data)
                     except:
-                        # Fallback a DER
                         cert = x509.load_der_x509_certificate(cert_data)
                     trusted_cas.append(cert)
             except Exception as e:
                 print(f"⚠️ Failed to load CA {filename}: {e}")
     return trusted_cas
 
-# Cache global de CAs para no leer disco en cada handshake
 GLOBAL_TRUST_STORE = load_trusted_cas()
 
 def get_common_name(cert):
-    """Helper para extraer Common Name de un certificado"""
     for attribute in cert.subject:
         if attribute.oid == x509.NameOID.COMMON_NAME:
             return attribute.value
     return "Unknown Common Name"
 
 def verify_peer_identity(x25519_pub_key, proofs):
-    """
-    Verifica estrictamente la identidad del peer usando DNIe.
-    Retorna: (real_name, issuer_name)
-    """
     if not proofs or 'cert' not in proofs or 'sig' not in proofs:
         raise Exception("No identity proofs provided by peer")
 
     try:
-        # --- 0. Carga de datos ---
         cert_bytes = bytes.fromhex(proofs['cert'])
         signature_bytes = bytes.fromhex(proofs['sig'])
         peer_cert = x509.load_der_x509_certificate(cert_bytes)
         rsa_pub_key = peer_cert.public_key()
 
-        # --- 1. Validación de Fechas (UTC) ---
         now = datetime.now(timezone.utc)
         if now < peer_cert.not_valid_before_utc:
             raise Exception("Certificate is NOT YET valid")
         if now > peer_cert.not_valid_after_utc:
             raise Exception("Certificate has EXPIRED")
 
-        # --- 2. Validación de Key Usage ---
         try:
             key_usage_ext = peer_cert.extensions.get_extension_for_class(x509.KeyUsage)
             usage = key_usage_ext.value
@@ -89,7 +78,6 @@ def verify_peer_identity(x25519_pub_key, proofs):
         except x509.ExtensionNotFound:
             pass
 
-        # --- 3. Validación de Cadena de Confianza (Chain of Trust) ---
         issuer_name = "Unknown CA (No Verification)"
         is_trusted = False
         
@@ -108,7 +96,6 @@ def verify_peer_identity(x25519_pub_key, proofs):
                         peer_cert.signature_hash_algorithm
                     )
                     is_trusted = True
-                    # Extraer el nombre de la autoridad que firmó exitosamente
                     issuer_name = get_common_name(ca_cert)
                     break 
                 except Exception:
@@ -117,7 +104,6 @@ def verify_peer_identity(x25519_pub_key, proofs):
             if not is_trusted:
                 raise Exception("Certificate Issuer is NOT TRUSTED (No matching CA in ./certs)")
 
-        # --- 4. Prueba de Posesión (Proof of Possession) ---
         data_to_verify = x25519_pub_key.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw
@@ -130,9 +116,7 @@ def verify_peer_identity(x25519_pub_key, proofs):
             hashes.SHA256()
         )
 
-        # --- 5. Extracción de Identidad ---
         real_name = get_common_name(peer_cert).replace("(AUTENTICACIÓN)", "").strip()
-        
         return real_name, issuer_name
 
     except Exception as e:
@@ -209,7 +193,6 @@ class UDPProtocol(asyncio.DatagramProtocol):
         try:
             remote_pub = session.consume_handshake_message(data)
             try:
-                # Obtenemos nombre y EMISOR
                 real_name, issuer = verify_peer_identity(remote_pub, session.remote_proofs)
                 self.on_log(f"✅ Verified Identity: {real_name}")
                 self.on_log(f"   ↳ Signed by: {issuer}")
@@ -236,7 +219,6 @@ class UDPProtocol(asyncio.DatagramProtocol):
         try:
             session.consume_handshake_response(data)
             try:
-                # Obtenemos nombre y EMISOR
                 real_name, issuer = verify_peer_identity(session.rs_pub, session.remote_proofs)
                 self.on_log(f"✅ Verified Identity: {real_name}")
                 self.on_log(f"   ↳ Signed by: {issuer}")
@@ -363,7 +345,11 @@ class RawSniffer(asyncio.DatagramProtocol):
 
             if found_info:
                 user_id_from_net, port = found_info
-                if user_id_from_net == self.service.unique_instance_id:
+                
+                # MODIFICACIÓN: Filtramos solo si coincide ID *Y* PUERTO.
+                # Esto permite ejecutar múltiples instancias locales con el mismo DNI
+                # (mismo ID) pero diferentes puertos.
+                if user_id_from_net == self.service.unique_instance_id and port == self.service.port:
                     return
 
                 props = {'user': user_id_from_net}
@@ -375,7 +361,12 @@ class RawSniffer(asyncio.DatagramProtocol):
                         if len(pub_str) != 64: return 
                         
                         props['pub'] = pub_str
-                        if props['pub'] == self.service.pubkey_b64: return
+                        # Si es nuestra misma clave pública (misma identidad criptográfica),
+                        # técnicamente somos nosotros mismos. Pero si el puerto es distinto,
+                        # queremos permitir la conexión para pruebas.
+                        # Así que quitamos el filtro estricto por pubkey aquí si permitimos
+                        # el mismo ID en diferente puerto.
+                        # if props['pub'] == self.service.pubkey_b64: return
                     else:
                         return 
                 except: return
@@ -408,8 +399,8 @@ class DiscoveryService:
         self.bind_ip = bind_ip
         
         clean_username = username.replace("User-", "")
-        suffix = secrets.token_hex(2)
-        self.unique_instance_id = f"{clean_username}-{suffix}"
+        # MODIFICACIÓN: Ya no añadimos el sufijo aleatorio
+        self.unique_instance_id = clean_username
         
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)

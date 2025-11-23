@@ -58,6 +58,10 @@ class Storage:
                 ))
             return priv
 
+    async def get_all_contacts(self):
+        """Devuelve la lista completa de contactos conocidos."""
+        return await self._read_json(self.contacts_file)
+
     async def register_contact(self, ip, port, pubkey_obj, user_id=None, real_name=None):
         """
         Registra o actualiza un contacto.
@@ -75,6 +79,8 @@ class Storage:
             # Buscar si ya existe
             found = False
             for c in contacts:
+                # Criterio de unicidad: IP:Port es volátil, pero útil para sesiones.
+                # Lo ideal sería buscar por pubkey o userID si lo tenemos, pero mantenemos IP:Port por simplicidad de red.
                 if c['ip'] == ip and c['port'] == port:
                     found = True
                     if c['pubkey_hex'] != pub_hex:
