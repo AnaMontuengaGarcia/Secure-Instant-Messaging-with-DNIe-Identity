@@ -258,8 +258,26 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.pending_messages[addr].append(content)
         self.on_log(f"⏳ Message queued...")
 
-    async def send_message(self, addr, content):
+    async def broadcast_disconnect(self):
+        """Envía un mensaje de desconexión a todas las sesiones activas."""
+        self.on_log("📡 Broadcasting disconnect signal to active sessions...")
+        # Copia de las claves para iteración segura
+        active_addresses = list(self.sessions.sessions.keys())
+        
+        tasks = []
+        for addr in active_addresses:
+            tasks.append(self.send_message(addr, content=None, is_disconnect=True))
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def send_message(self, addr, content, is_disconnect=False):
         session = self.sessions.get_session(addr)
+        
+        # Si nos estamos desconectando y no hay sesión, no la creamos ahora
+        if not session and is_disconnect:
+            return
+
         if not session:
             remote_pub = await self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
@@ -270,15 +288,28 @@ class UDPProtocol(asyncio.DatagramProtocol):
             hs_msg = session.create_handshake_message()
             self.transport.sendto(b'\x01' + hs_msg, addr)
             self.on_log(f"🔄 Initiating handshake with {addr}")
-            self._queue_message(addr, content)
+            if content:
+                self._queue_message(addr, content)
             return
 
         if session.encryptor is None:
-            self._queue_message(addr, content)
+            if content:
+                self._queue_message(addr, content)
             return
 
         try:
-            msg_struct = {"timestamp": time.time(), "text": content}
+            # Construcción del payload: Texto normal o señal de desconexión
+            if is_disconnect:
+                msg_struct = {
+                    "timestamp": time.time(),
+                    "disconnect": True
+                }
+            else:
+                msg_struct = {
+                    "timestamp": time.time(), 
+                    "text": content
+                }
+            
             payload = json.dumps(msg_struct).encode('utf-8')
             ciphertext = session.encrypt_message(payload)
             self.transport.sendto(b'\x03' + ciphertext, addr)

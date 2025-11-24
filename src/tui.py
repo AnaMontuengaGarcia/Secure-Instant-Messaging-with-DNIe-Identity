@@ -464,17 +464,55 @@ class MessengerTUI(App):
         known = False
         peer_name = f"Peer_{ip}"
         
+        target_child = None
+
         for child in lst.children:
              if isinstance(child, ChatItem) and child.contact_ip == ip and child.contact_port == port:
                  known = True
                  peer_name = child.real_name if child.real_name else child.user_id
-                 self.peer_last_seen[child.user_id] = time.time()
-                 child.set_online_status(True)
+                 target_child = child
                  break
         
-        if not known: self._add_peer_thread_safe(f"Peer_{ip}", ip, port, {})
+        # Si no lo conocemos y es solo un mensaje de desconexión, ignoramos.
+        if not known and msg.get('disconnect'):
+            return
+
+        if not known: 
+            self._add_peer_thread_safe(f"Peer_{ip}", ip, port, {})
+            # Recuperamos el child recién creado
+            if lst.children:
+                target_child = lst.children[-1]
+
+        # --- LÓGICA DE DESCONEXIÓN ---
+        if msg.get('disconnect') is True:
+            if target_child:
+                # IMPORTANTE: Forzamos el "last_seen" a 0 para que el check periódico (check_peer_status)
+                # no vuelva a marcarlo como Online inmediatamente si aún no ha pasado el timeout de 20s.
+                self.peer_last_seen[target_child.user_id] = 0
+
+                # 1. Actualizamos el estado del usuario en la lista (Círculo Gris)
+                target_child.set_online_status(False)
+                self.add_log(f"💤 {peer_name} has disconnected (Graceful exit).")
+                
+                # 2. Mensaje en el chat alineado a la izquierda
+                disconnect_panel = Align(Panel(Text(f"{peer_name} se ha desconectado."), style="dim white"), align="left")
+                key = f"{ip}:{port}"
+                self._save_history(key, disconnect_panel)
+                
+                # Si estamos viendo ese chat ahora mismo, mostrarlo
+                if self.current_chat_addr == (ip, port):
+                    self.query_one("#chat_box", RichLog).write(disconnect_panel)
+            return
+        # -----------------------------
+        
+        # Solo actualizamos "visto por última vez" si NO es un mensaje de adiós
+        if target_child:
+            self.peer_last_seen[target_child.user_id] = time.time()
+            target_child.set_online_status(True)
         
         text = msg.get('text', '')
+        if not text: return # Protección extra
+
         msg_panel = self._create_message_panel(text, peer_name, is_me=False)
         key = f"{ip}:{port}"
         self._save_history(key, msg_panel)

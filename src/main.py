@@ -67,6 +67,11 @@ async def main_async(dnie_identity_data):
         await app.run_async()
         
     finally:
+        print("\n🛑 Closing application...")
+        if proto:
+            # Enviamos el "Adiós" a todos antes de cerrar el socket
+            await proto.broadcast_disconnect()
+
         if discovery: await discovery.stop()
         if transport: transport.close()
         print("👋 Bye!")
