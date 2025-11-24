@@ -6,9 +6,10 @@ from network import UDPProtocol, SessionManager, DiscoveryService
 from storage import Storage
 from tui import MessengerTUI, DNIeLoginApp
 from cryptography.hazmat.primitives import serialization
+# Importamos librería para generación de claves en memoria
+from cryptography.hazmat.primitives.asymmetric import x25519
 
 # Configuración estándar de argumentos
-# Se han añadido alias cortos (-p, -b, -d) para mayor comodidad
 parser = argparse.ArgumentParser(description="DNIe Secure Messenger")
 parser.add_argument('-p', '--port', type=int, default=443, help="Puerto UDP (Default: 443)")
 parser.add_argument('-b', '--bind', type=str, default="0.0.0.0", help="IP de escucha (Default: 0.0.0.0)")
@@ -24,12 +25,14 @@ def ensure_cert_structure():
             f.write("Coloca aqui los certificados CA (Root e Intermedios) del DNIe en formato .pem o .crt\n")
 
 async def main_async(dnie_identity_data):
-    user_id, proofs = dnie_identity_data
+    # Desempaquetamos los 3 elementos: ID, Pruebas y la Clave Privada en memoria
+    user_id, proofs, local_static_key = dnie_identity_data
     
-    # Inicializamos el storage usando la carpeta definida en los argumentos
+    # Inicializamos el storage para contactos y mensajes
     storage = Storage(data_dir=args.data)
     await storage.init()
-    local_static_key = await storage.get_static_key()
+    
+    # Ya no cargamos la clave del disco. Usamos la que viene de memoria.
     
     sessions = SessionManager(local_static_key, storage, local_proofs=proofs)
     # Callback de log simple para la consola
@@ -71,22 +74,14 @@ async def main_async(dnie_identity_data):
 def perform_dnie_binding_gui():
     """Realiza el binding usando la interfaz gráfica Textual (Login)"""
     
-    # Si se usa el modo --mock, saltamos la pantalla de login real
+    # 1. Generamos la clave estática EN MEMORIA (Efímera, solo dura lo que el proceso)
+    # No se guarda en disco en ningún momento.
+    print("✨ Generating ephemeral identity key in memory...")
+    key_priv = x25519.X25519PrivateKey.generate()
+
+    # Si se usa el modo --mock
     if args.mock:
-        return (args.mock, {'cert': '00', 'sig': '00'})
-
-    # 1. Preparar clave estática (necesaria para que el DNIe la firme)
-    temp_storage = Storage(data_dir=args.data)
-    
-    async def get_key_bytes():
-        if not os.path.exists(temp_storage.data_dir): os.makedirs(temp_storage.data_dir)
-        return await temp_storage.get_static_key()
-
-    try:
-        key_priv = asyncio.run(get_key_bytes())
-    except Exception as e:
-        print(f"Error accessing storage: {e}")
-        sys.exit(1)
+        return (args.mock, {'cert': '00', 'sig': '00'}, key_priv)
 
     key_pub_bytes = key_priv.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -99,15 +94,17 @@ def perform_dnie_binding_gui():
     
     # 3. Procesar resultado del login
     if result:
-        return result
+        # result es (user_id, proofs)
+        # Devolvemos también la clave privada en memoria para que la use main_async
+        return (result[0], result[1], key_priv)
     else:
-        # Si el usuario cerró la ventana o canceló
         print("Login cancelado por el usuario.")
         sys.exit(0)
 
 if __name__ == "__main__":
     ensure_cert_structure()
-    # Fase 1: Identidad (Login Gráfico)
+    
+    # Fase 1: Identidad (Login Gráfico y Generación de Claves RAM)
     identity_data = perform_dnie_binding_gui()
     
     # Fase 2: Chat (App Principal)
