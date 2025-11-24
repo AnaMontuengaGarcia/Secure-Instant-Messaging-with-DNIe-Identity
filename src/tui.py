@@ -161,6 +161,10 @@ class MessengerTUI(App):
         # Key: user_id, Value: timestamp (time.time())
         self.peer_last_seen = {}
 
+        # Diccionario para ignorar paquetes mDNS temporales tras desconexión explícita
+        # Key: user_id, Value: timestamp de desconexión
+        self.recently_disconnected = {}
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(classes="sidebar"):
@@ -276,6 +280,16 @@ class MessengerTUI(App):
         # FILTRO: Ignorar paquetes mDNS que provienen de la loopback (127.0.0.1)
         if ip == "127.0.0.1":
             return
+
+        # FILTRO DE REBOTE DE DESCONEXIÓN:
+        # Si el usuario se desconectó hace menos de 5 segundos, ignoramos este paquete mDNS
+        # ya que probablemente sea un paquete rezagado o "eco" en la red.
+        if user_id in self.recently_disconnected:
+            if time.time() - self.recently_disconnected[user_id] < 5.0:
+                return
+            else:
+                # Ya pasó el tiempo de gracia, limpiamos la entrada
+                del self.recently_disconnected[user_id]
 
         self.peer_last_seen[user_id] = time.time()
         
@@ -489,6 +503,9 @@ class MessengerTUI(App):
                 # IMPORTANTE: Forzamos el "last_seen" a 0 para que el check periódico (check_peer_status)
                 # no vuelva a marcarlo como Online inmediatamente si aún no ha pasado el timeout de 20s.
                 self.peer_last_seen[target_child.user_id] = 0
+                
+                # REGISTRAMOS LA DESCONEXIÓN PARA EVITAR REBOTE DE MDNS
+                self.recently_disconnected[target_child.user_id] = time.time()
 
                 # 1. Actualizamos el estado del usuario en la lista (Círculo Gris)
                 target_child.set_online_status(False)
