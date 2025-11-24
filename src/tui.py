@@ -280,104 +280,111 @@ class MessengerTUI(App):
         # FILTRO: Ignorar paquetes mDNS que provienen de la loopback (127.0.0.1)
         if ip == "127.0.0.1":
             return
+        
+        stable_id = user_id.strip()
 
         # FILTRO DE REBOTE DE DESCONEXIÓN:
-        # Si el usuario se desconectó hace menos de 5 segundos, ignoramos este paquete mDNS
-        # ya que probablemente sea un paquete rezagado o "eco" en la red.
-        if user_id in self.recently_disconnected:
-            if time.time() - self.recently_disconnected[user_id] < 5.0:
+        if stable_id in self.recently_disconnected:
+            if time.time() - self.recently_disconnected[stable_id] < 5.0:
                 return
             else:
-                # Ya pasó el tiempo de gracia, limpiamos la entrada
-                del self.recently_disconnected[user_id]
+                del self.recently_disconnected[stable_id]
 
-        self.peer_last_seen[user_id] = time.time()
+        self.peer_last_seen[stable_id] = time.time()
         
-        try: self.call_from_thread(self._add_peer_thread_safe, user_id, ip, port, props)
-        except: self._add_peer_thread_safe(user_id, ip, port, props)
+        try: self.call_from_thread(self._add_peer_thread_safe, stable_id, ip, port, props)
+        except: self._add_peer_thread_safe(stable_id, ip, port, props)
 
     def _add_peer_thread_safe(self, user_id, ip, port, props):
         try:
             lst = self.query_one("#contact_list", ListView)
+            
+            # --- MANEJO DE DESCONEXIÓN EXPLÍCITA (CUSTOM MDNS GOODBYE) ---
+            # Si el paquete mDNS trae 'stat=exit', es nuestra implementación custom de desconexión.
+            if props.get('stat') == 'exit':
+                self.add_log(f"💤 Recibida señal de salida de {user_id} (Multicast)")
+                
+                # Buscar al usuario y ponerlo offline
+                target_child = None
+                for child in lst.children:
+                    if isinstance(child, ChatItem) and child.user_id == user_id:
+                        target_child = child
+                        break
+                
+                if target_child:
+                    # Registrar desconexión para evitar rebotes
+                    self.recently_disconnected[user_id] = time.time()
+                    self.peer_last_seen[user_id] = 0 # Forzar timeout inmediato
+                    target_child.set_online_status(False)
+                    
+                    # Log en el chat si está activo
+                    disconnect_panel = Align(Panel(Text(f"{target_child.real_name or user_id} se ha desconectado (Global)."), style="dim white"), align="left")
+                    key = f"{ip}:{port}"
+                    self._save_history(key, disconnect_panel)
+                    if self.current_chat_addr == (ip, port):
+                        self.query_one("#chat_box", RichLog).write(disconnect_panel)
+                
+                # Detenemos el procesamiento, no registramos nada.
+                return
+            # -------------------------------------------------------------
+
             pub_hex = props.get('pub', '')
-            stable_id = user_id.strip()
             
             # --- 1. LLAMADA A STORAGE UNIFICADA ---
-            # Llamamos a register_contact SIEMPRE que haya clave pública.
-            # Como arreglamos storage.py, esto actualizará la IP si el usuario existe,
-            # y NO sobrescribirá real_name con None.
+            # Solo registramos si NO es una señal de salida
             if pub_hex:
                 try:
                     pub_bytes = bytes.fromhex(pub_hex)
                     pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
-                    asyncio.create_task(self.storage.register_contact(ip, port, pub_key, user_id=stable_id, real_name=None))
+                    asyncio.create_task(self.storage.register_contact(ip, port, pub_key, user_id=user_id, real_name=None))
                 except Exception: pass
 
             # --- 2. ACTUALIZACIÓN VISUAL (UI) ---
             found_item = None
             for child in lst.children:
-                if isinstance(child, ChatItem) and child.user_id == stable_id:
+                if isinstance(child, ChatItem) and child.user_id == user_id:
                     found_item = child
                     break
             
             if found_item:
                 # El usuario YA existe en la lista
-                
-                # --- DETECCIÓN DE RECONEXIÓN ---
-                # Detectamos si el usuario estaba OFFLINE justo antes de este mDNS.
-                # Si es así, significa que ha vuelto.
                 was_offline = not found_item.online
 
-                # Verificamos si la IP ha cambiado (DHCP)
                 if found_item.contact_ip != ip or found_item.contact_port != port:
                     old_addr = f"{found_item.contact_ip}:{found_item.contact_port}"
                     new_addr = f"{ip}:{port}"
-                    
-                    self.add_log(f"🔄 Network Change: {stable_id} moved {old_addr} -> {new_addr}")
-                    
-                    # 1. Actualizar visualmente y objeto en memoria
+                    self.add_log(f"🔄 Network Change: {user_id} moved {old_addr} -> {new_addr}")
                     found_item.update_address(ip, port)
                     
-                    # 2. Redirigir sesión de chat si estaba activa
                     if self.current_chat_addr and (self.current_chat_addr[0] == old_addr.split(':')[0]):
                         self.current_chat_addr = (ip, port)
                         self._refresh_chat_view(found_item)
                         self.add_log("⚡ Active chat session rerouted to new IP.")
-                    
-                    # Si cambió de IP, consideramos que "volvió" y forzamos reset también
                     was_offline = True
 
-                # Marcar como Online siempre que recibimos mDNS
                 found_item.set_online_status(True)
                 
-                # --- LÓGICA DE RESETEO DE SESIÓN ---
-                # Si el usuario vuelve tras haber estado Offline (o cambia IP), borramos
-                # la sesión criptográfica en memoria. Esto fuerza a que el próximo
-                # 'send_message' inicie un Handshake limpio (Packet 0x01).
                 if was_offline:
                     try:
                         addr_tuple = (ip, port)
-                        # Accedemos directamente al diccionario de sesiones de SessionManager
                         if addr_tuple in self.proto.sessions.sessions:
                             del self.proto.sessions.sessions[addr_tuple]
-                            self.add_log(f"🔄 Session reset for {found_item.real_name or stable_id} (Reconnected)")
+                            self.add_log(f"🔄 Session reset for {found_item.real_name or user_id} (Reconnected)")
                     except Exception as e:
                         print(f"Error resetting session: {e}")
 
-                # Actualizar nombre si tenemos información nueva en memoria
                 if not found_item.real_name:
-                     display_name = self.known_names.get(stable_id)
+                     display_name = self.known_names.get(user_id)
                      if display_name:
                          found_item.real_name = display_name
                          found_item.update_label()
 
             else:
-                # El usuario NO existe en la lista (Nuevo)
-                display_name = self.known_names.get(stable_id)
-                item = ChatItem(stable_id, display_name, ip, port, verified=False, online=True)
+                display_name = self.known_names.get(user_id)
+                item = ChatItem(user_id, display_name, ip, port, verified=False, online=True)
                 lst.append(item)
                 
-                log_msg = f"🔎 Peer Found: {stable_id}"
+                log_msg = f"🔎 Peer Found: {user_id}"
                 if display_name:
                     log_msg += f" (Known as: {display_name})"
                 log_msg += f" @ {ip}"
@@ -407,7 +414,6 @@ class MessengerTUI(App):
                 break
         
         if not found:
-            # Fallback raro si llega handshake de alguien no descubierto por mDNS
             self._add_peer_thread_safe(f"Unknown_{addr[0]}", addr[0], addr[1], {})
             self._update_peer_identity_safe(addr, real_name)
 
@@ -497,32 +503,23 @@ class MessengerTUI(App):
             if lst.children:
                 target_child = lst.children[-1]
 
-        # --- LÓGICA DE DESCONEXIÓN ---
+        # --- LÓGICA DE DESCONEXIÓN (Mensaje cifrado UDP) ---
         if msg.get('disconnect') is True:
             if target_child:
-                # IMPORTANTE: Forzamos el "last_seen" a 0 para que el check periódico (check_peer_status)
-                # no vuelva a marcarlo como Online inmediatamente si aún no ha pasado el timeout de 20s.
                 self.peer_last_seen[target_child.user_id] = 0
-                
-                # REGISTRAMOS LA DESCONEXIÓN PARA EVITAR REBOTE DE MDNS
                 self.recently_disconnected[target_child.user_id] = time.time()
-
-                # 1. Actualizamos el estado del usuario en la lista (Círculo Gris)
                 target_child.set_online_status(False)
                 self.add_log(f"💤 {peer_name} has disconnected (Graceful exit).")
                 
-                # 2. Mensaje en el chat alineado a la izquierda
                 disconnect_panel = Align(Panel(Text(f"{peer_name} se ha desconectado."), style="dim white"), align="left")
                 key = f"{ip}:{port}"
                 self._save_history(key, disconnect_panel)
                 
-                # Si estamos viendo ese chat ahora mismo, mostrarlo
                 if self.current_chat_addr == (ip, port):
                     self.query_one("#chat_box", RichLog).write(disconnect_panel)
             return
         # -----------------------------
         
-        # Solo actualizamos "visto por última vez" si NO es un mensaje de adiós
         if target_child:
             self.peer_last_seen[target_child.user_id] = time.time()
             target_child.set_online_status(True)

@@ -69,10 +69,13 @@ async def main_async(dnie_identity_data):
     finally:
         print("\n🛑 Closing application...")
         if proto:
-            # Enviamos el "Adiós" a todos antes de cerrar el socket
+            # 1. Enviamos el "Adiós" cifrado a las sesiones activas
             await proto.broadcast_disconnect()
 
-        if discovery: await discovery.stop()
+        if discovery:
+            # 2. Enviamos el "Adiós" mDNS global (implementación custom)
+            await discovery.stop()
+            
         if transport: transport.close()
         print("👋 Bye!")
 

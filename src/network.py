@@ -259,8 +259,8 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.on_log(f"⏳ Message queued...")
 
     async def broadcast_disconnect(self):
-        """Envía un mensaje de desconexión a todas las sesiones activas."""
-        self.on_log("📡 Broadcasting disconnect signal to active sessions...")
+        """Envía un mensaje de desconexión cifrado a todas las sesiones activas."""
+        self.on_log("📡 Sending encrypted disconnect to active chats...")
         # Copia de las claves para iteración segura
         active_addresses = list(self.sessions.sessions.keys())
         
@@ -350,9 +350,12 @@ class RawSniffer(asyncio.DatagramProtocol):
         except Exception: pass
 
     def datagram_received(self, data, addr):
+        # Filtro básico: Debe contener el identificador del protocolo
         if b"_dni-im" not in data: return
+        
         try:
             found_info = None
+            # 1. Intentar Regex simple para User-ID_Port
             try:
                 match = re.search(rb'User-([^_\x00]+)_(\d+)', data)
                 if match:
@@ -361,6 +364,7 @@ class RawSniffer(asyncio.DatagramProtocol):
                     found_info = (name, port)
             except: pass
 
+            # 2. Intentar parsing completo DNS si regex falla
             if not found_info:
                 try:
                     msg = DNSIncoming(data)
@@ -377,31 +381,35 @@ class RawSniffer(asyncio.DatagramProtocol):
             if found_info:
                 user_id_from_net, port = found_info
                 
-                # MODIFICACIÓN: Filtramos solo si coincide ID *Y* PUERTO.
-                # Esto permite ejecutar múltiples instancias locales con el mismo DNI
-                # (mismo ID) pero diferentes puertos.
+                # Ignorar paquetes propios
                 if user_id_from_net == self.service.unique_instance_id and port == self.service.port:
                     return
 
                 props = {'user': user_id_from_net}
                 
+                # --- DETECCIÓN DE MENSAJE DE SALIDA CUSTOM (stat=exit) ---
+                # Esta es nuestra "propia implementación" de mDNS goodbye.
+                # Si encontramos 'stat=exit' en los bytes crudos, es una desconexión explícita.
+                is_exit_msg = re.search(rb'stat=exit', data)
+                if is_exit_msg:
+                    props['stat'] = 'exit'
+                    # Pasamos directamente al callback, no necesitamos la clave pública para desconectar
+                    self.service.on_found(user_id_from_net, addr[0], port, props)
+                    return
+                # ---------------------------------------------------------
+
+                # Si NO es un mensaje de salida, exigimos la clave pública
                 try:
                     pub_match = re.search(rb'pub=([a-fA-F0-9]+)', data)
                     if pub_match:
                         pub_str = pub_match.group(1).decode('utf-8')
                         if len(pub_str) != 64: return 
-                        
                         props['pub'] = pub_str
-                        # Si es nuestra misma clave pública (misma identidad criptográfica),
-                        # técnicamente somos nosotros mismos. Pero si el puerto es distinto,
-                        # queremos permitir la conexión para pruebas.
-                        # Así que quitamos el filtro estricto por pubkey aquí si permitimos
-                        # el mismo ID en diferente puerto.
-                        # if props['pub'] == self.service.pubkey_b64: return
                     else:
-                        return 
+                        return # Sin clave pública y sin stat=exit, ignoramos.
                 except: return
                 
+                # Intentar sacar usuario del TXT si existe
                 try:
                     user_match = re.search(rb'user=([^\x00]+)', data)
                     if user_match:
@@ -430,7 +438,6 @@ class DiscoveryService:
         self.bind_ip = bind_ip
         
         clean_username = username.replace("User-", "")
-        # MODIFICACIÓN: Ya no añadimos el sufijo aleatorio
         self.unique_instance_id = clean_username
         
         try:
@@ -468,7 +475,39 @@ class DiscoveryService:
         
         self._polling_task = asyncio.create_task(self._active_polling_loop())
 
+    def broadcast_exit(self):
+        """
+        Envía un paquete UDP crudo al grupo multicast mDNS (224.0.0.251:5353)
+        que contiene una estructura reconocible por nuestro sniffer con la flag 'stat=exit'.
+        Esto fuerza a todos los clientes (incluso los que no tienen sesión activa)
+        a marcarnos como Offline inmediatamente.
+        """
+        if not self.sniffer_transport: return
+        
+        try:
+            # Construimos un paquete "Fake mDNS" que satisface las regex del RawSniffer
+            # Contiene: _dni-im, User-{id}_{port} y el payload personalizado stat=exit
+            # Rellenamos con nulos al principio para simular cabecera DNS
+            
+            fake_payload = (
+                b'\x00' * 12 +     # Cabecera DNS falsa
+                b'_dni-im' +       # Protocolo
+                f'User-{self.unique_instance_id}_{self.port}'.encode('utf-8') + # Identificador
+                b'\x00fake\x00' +  # Relleno
+                b'stat=exit'       # Nuestra flag personalizada de desconexión
+            )
+            
+            # Enviar al grupo multicast
+            self.sniffer_transport.sendto(fake_payload, ('224.0.0.251', 5353))
+            self.on_log("📡 Broadcasted custom 'stat=exit' mDNS packet.")
+            
+        except Exception as e:
+            print(f"Error broadcasting exit: {e}")
+
     async def stop(self):
+        # 1. Enviar nuestra señal de desconexión personalizada
+        self.broadcast_exit()
+        
         if hasattr(self, '_polling_task'): self._polling_task.cancel()
         if self.sniffer_transport: self.sniffer_transport.close()
         if hasattr(self, 'info') and hasattr(self, 'aiozc'): 
