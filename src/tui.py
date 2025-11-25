@@ -10,6 +10,7 @@ from rich.align import Align
 from rich import box
 import asyncio
 import time  # Necesario para controlar el tiempo (timestamp)
+from datetime import datetime
 import pyperclip
 import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
 
@@ -468,7 +469,8 @@ class MessengerTUI(App):
 
         ta.text = "" 
         self.last_msg_content = text
-        msg_panel = self._create_message_panel(text, "You", is_me=True)
+        now_ts = time.time()
+        msg_panel = self._create_message_panel(text, "You", is_me=True, timestamp=now_ts)
         key = f"{self.current_chat_addr[0]}:{self.current_chat_addr[1]}"
         self._save_history(key, msg_panel)
         self.query_one("#chat_box", RichLog).write(msg_panel)
@@ -527,17 +529,25 @@ class MessengerTUI(App):
         text = msg.get('text', '')
         if not text: return # Protección extra
 
-        msg_panel = self._create_message_panel(text, peer_name, is_me=False)
+        ts = msg.get('timestamp') 
+        msg_panel = self._create_message_panel(text, peer_name, is_me=False, timestamp=ts)
         key = f"{ip}:{port}"
         self._save_history(key, msg_panel)
         curr_ip = self.current_chat_addr[0] if self.current_chat_addr else None
         if curr_ip == ip: self.query_one("#chat_box", RichLog).write(msg_panel)
         else: self.add_log(f"📨 New message from {peer_name}")
 
-    def _create_message_panel(self, text, title, is_me):
+    def _create_message_panel(self, text, title, is_me, timestamp=None):
         color = "green" if is_me else "yellow"
+        
+        # Si recibimos un timestamp, lo formateamos y añadimos al título
+        if timestamp:
+            # Formato: 14:30 (si quieres fecha completa usa "%d/%m/%Y %H:%M")
+            ts_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
+            title = f"{title} [{ts_str}]"
+            
         return Align(Panel(Text(text), title=title, title_align="left", border_style=color, box=box.ROUNDED, padding=(0, 1), expand=False), align="left")
-
+    
     def _save_history(self, key, item):
         if key not in self.message_history: self.message_history[key] = []
         self.message_history[key].append(item)
