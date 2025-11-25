@@ -16,7 +16,12 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
-MDNS_TYPE = "_dni-im._udp.local."
+
+# =============================================================================
+# CONSTANTES Y CONFIGURACIÓN GLOBAL
+# =============================================================================
+MDNS_TYPE = "_dni-im._udp.local."   # Identificador del servicio en la red local
+# Paquete mDNS crudo para solicitar servicios (Query ANY)
 RAW_MDNS_QUERY = (
     b'\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
     b'\x07_dni-im\x04_udp\x05local\x00'
@@ -26,7 +31,10 @@ RAW_MDNS_QUERY = (
 TRUSTED_CERTS_DIR = "certs"
 
 def load_trusted_cas():
-    """Carga certificados CA de confianza desde el disco."""
+    """
+    Carga los certificados CA (Autoridades de Certificación) desde el disco.
+    Estos son necesarios para validar que un DNIe es legítimo (emitido por la Policía).
+    """
     trusted_cas = []
     if not os.path.exists(TRUSTED_CERTS_DIR):
         print(f"⚠️ Warning: '{TRUSTED_CERTS_DIR}' directory not found. No Chain of Trust verification possible.")
@@ -48,8 +56,12 @@ def load_trusted_cas():
                 print(f"⚠️ Failed to load CA {filename}: {e}")
     return trusted_cas
 
-# Cache global de CAs para no leer disco en cada handshake
+# Cache global para evitar lectura de disco en cada handshake
 GLOBAL_TRUST_STORE = load_trusted_cas()
+
+# =============================================================================
+# LÓGICA DE VERIFICACIÓN DE IDENTIDAD (DNIe)
+# =============================================================================
 
 def get_common_name(cert):
     """Helper para extraer Common Name de un certificado"""
@@ -60,20 +72,27 @@ def get_common_name(cert):
 
 def verify_peer_identity(x25519_pub_key, proofs):
     """
-    Verifica estrictamente la identidad del peer usando DNIe.
-    Retorna: (real_name, issuer_name)
+    Verifica criptográficamente la identidad de un peer remoto.
+    
+    Args:
+        x25519_pub_key: La clave pública efímera de chat del usuario.
+        proofs: Diccionario con 'cert' (DNIe público) y 'sig' (firma de la clave efímera).
+        
+    Retorna:
+        (real_name, issuer_name) si es válido. Lanza excepción si no.
     """
     if not proofs or 'cert' not in proofs or 'sig' not in proofs:
         raise Exception("No identity proofs provided by peer")
 
     try:
-        # --- 0. Carga de datos ---
+        # --- 0. Carga de datos, decodificación ---
         cert_bytes = bytes.fromhex(proofs['cert'])
         signature_bytes = bytes.fromhex(proofs['sig'])
         peer_cert = x509.load_der_x509_certificate(cert_bytes)
-        rsa_pub_key = peer_cert.public_key()
+        rsa_pub_key = peer_cert.public_key()    # Clave pública RSA del DNIe
 
-        # --- 1. Validación de Fechas (UTC) ---
+
+        # --- 1. Validación de Fechas (UTC) (Vigencia del DNIe) ---
         now = datetime.now(timezone.utc)
         if now < peer_cert.not_valid_before_utc:
             raise Exception("Certificate is NOT YET valid")
@@ -81,6 +100,7 @@ def verify_peer_identity(x25519_pub_key, proofs):
             raise Exception("Certificate has EXPIRED")
 
         # --- 2. Validación de Key Usage ---
+        # Verificamos que el cert sirva para firmar o no repudio (autenticación)
         try:
             key_usage_ext = peer_cert.extensions.get_extension_for_class(x509.KeyUsage)
             usage = key_usage_ext.value
@@ -90,17 +110,19 @@ def verify_peer_identity(x25519_pub_key, proofs):
             pass
 
         # --- 3. Validación de Cadena de Confianza (Chain of Trust) ---
+        # Verificamos si el certificado fue firmado por una CA en nuestra carpeta 'certs'
         issuer_name = "Unknown CA (No Verification)"
         is_trusted = False
         
         if not GLOBAL_TRUST_STORE:
              print("⚠️  SECURITY WARNING: No CA certificates found. Skipping Chain of Trust check.")
              issuer_name = "UNTRUSTED/NO-STORE"
-             is_trusted = True 
+             is_trusted = True  # Permitimos continuar inseguro si no hay CAs cargadas
         else:
             for ca_cert in GLOBAL_TRUST_STORE:
                 try:
                     ca_public_key = ca_cert.public_key()
+                    # Verificación matemática de la firma del certificado
                     ca_public_key.verify(
                         peer_cert.signature,
                         peer_cert.tbs_certificate_bytes,
@@ -118,6 +140,8 @@ def verify_peer_identity(x25519_pub_key, proofs):
                 raise Exception("Certificate Issuer is NOT TRUSTED (No matching CA in ./certs)")
 
         # --- 4. Prueba de Posesión (Proof of Possession) ---
+        # CRUCIAL: Verificamos que la firma enviada ('sig') coincide con la clave de chat ('x25519').
+        # Esto prueba que quien envió la clave de chat POSEE la tarjeta DNIe correspondiente.
         data_to_verify = x25519_pub_key.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw
@@ -138,11 +162,13 @@ def verify_peer_identity(x25519_pub_key, proofs):
     except Exception as e:
         raise Exception(f"Identity Verification Failed: {e}")
 
-
+# =============================================================================
+# GESTIÓN DE SESIONES (Noise Protocol)
+# =============================================================================
 class SessionManager:
     def __init__(self, local_static_key, db, local_proofs):
-        self.local_static_key = local_static_key
-        self.local_proofs = local_proofs
+        self.local_static_key = local_static_key    # Nuestras credenciales (Cert + Firma)
+        self.local_proofs = local_proofs    # Diccionario {addr: SessionObject}
         self.sessions = {}
         self.db = db
         self.transport = None
@@ -151,6 +177,7 @@ class SessionManager:
         return self.sessions.get(addr)
 
     def create_initiator_session(self, addr, remote_pub_key):
+        """Crea una sesión cuando NOSOTROS iniciamos la conversación."""
         session = NoiseIKState(
             self.local_static_key, 
             remote_pub_key, 
@@ -162,6 +189,7 @@ class SessionManager:
         return session
 
     def create_responder_session(self, addr):
+        """Crea una sesión cuando OTRO inicia la conversación con nosotros."""
         session = NoiseIKState(
             self.local_static_key, 
             initiator=False,
@@ -171,14 +199,24 @@ class SessionManager:
         self.sessions[addr] = session
         return session
 
+# =============================================================================
+# PROTOCOLO UDP (Capa de transporte)
+# =============================================================================
 class UDPProtocol(asyncio.DatagramProtocol):
+    """
+    Maneja el envío y recepción de paquetes UDP.
+    Tipos de paquete:
+    - 0x01: Handshake Init
+    - 0x02: Handshake Response
+    - 0x03: Mensaje de Datos (Cifrado)
+    """
     def __init__(self, session_manager, on_message_received, on_log, on_handshake_success=None):
         self.sessions = session_manager
-        self.on_message = on_message_received
+        self.on_message = on_message_received   # Callback para entregar mensaje a la UI
         self.on_log = on_log
         self.on_handshake_success = on_handshake_success
         self.transport = None
-        self.pending_messages = {}
+        self.pending_messages = {}  # Cola de mensajes esperando handshake
 
     def connection_made(self, transport):
         self.transport = transport
@@ -190,6 +228,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
         except: pass
 
     def datagram_received(self, data, addr):
+        """Enrutador principal de paquetes entrantes."""
         if len(data) < 1: return
         try:
             packet_type = data[0]
@@ -204,6 +243,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"❌ Error packet {addr}: {e}")
 
     def handle_handshake_init(self, data, addr):
+        """Recibimos solicitud de conexión. Verificamos identidad y respondemos."""
         self.on_log(f"🔄 Handshake Init from {addr}")
         session = self.sessions.create_responder_session(addr)
         try:
@@ -216,11 +256,13 @@ class UDPProtocol(asyncio.DatagramProtocol):
             except Exception as e:
                 self.on_log(f"⛔ SECURITY ALERT: {e}")
                 return
-
+            
+            # Generar y enviar respuesta
             resp_data = session.create_handshake_response()
             self.transport.sendto(b'\x02' + resp_data, addr)
             self.on_log(f"🤝 Handshake Response sent to {addr}")
             
+            # Registrar contacto en DB
             asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], remote_pub, real_name=real_name))
             
             if self.on_handshake_success:
@@ -231,6 +273,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
             if addr in self.sessions.sessions: del self.sessions.sessions[addr]
 
     def handle_handshake_resp(self, data, addr):
+        """Recibimos respuesta al handshake que iniciamos nosotros."""
         session = self.sessions.get_session(addr)
         if not session: return
         try:
@@ -252,6 +295,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
             if self.on_handshake_success:
                 self.on_handshake_success(addr, session.rs_pub, real_name)
 
+            # Enviar mensajes que estaban en cola
             if addr in self.pending_messages:
                 for content in self.pending_messages[addr]:
                     asyncio.create_task(self.send_message(addr, content))
@@ -261,6 +305,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"❌ Handshake completion failed: {e}")
 
     def handle_data(self, data, addr):
+        """Recibimos mensaje cifrado de chat."""
         session = self.sessions.get_session(addr)
         if not session: return
         try:
@@ -271,13 +316,17 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"❌ Decryption failed: {e}")
 
     def _queue_message(self, addr, content):
+        """Encola mensajes si no hay sesión activa."""
         if addr not in self.pending_messages:
             self.pending_messages[addr] = []
         self.pending_messages[addr].append(content)
         self.on_log(f"⏳ Message queued...")
 
     async def send_message(self, addr, content):
+        """Intenta enviar un mensaje. Inicia handshake si es necesario."""
         session = self.sessions.get_session(addr)
+
+        # Si no hay sesión, buscar clave pública e iniciar handshake
         if not session:
             remote_pub = await self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
@@ -290,11 +339,13 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"🔄 Initiating handshake with {addr}")
             self._queue_message(addr, content)
             return
-
+        
+        # Si el handshake no ha terminado (encryptor no listo)
         if session.encryptor is None:
             self._queue_message(addr, content)
             return
 
+        # Enviar mensaje cifrado
         try:
             msg_struct = {"timestamp": time.time(), "text": content}
             payload = json.dumps(msg_struct).encode('utf-8')
@@ -303,11 +354,20 @@ class UDPProtocol(asyncio.DatagramProtocol):
         except Exception as e:
             self.on_log(f"❌ Send failed: {e}")
 
+# =============================================================================
+# DESCUBRIMIENTO DE SERVICIOS (mDNS / Zeroconf)
+# =============================================================================
 class RawSniffer(asyncio.DatagramProtocol):
+    """
+    Escucha paquetes mDNS crudos (Multicast UDP 5353).
+    Necesario porque a veces las librerías de alto nivel omiten ciertos campos
+    o para detectar anuncios en tiempo real de forma más agresiva.
+    """
     def __init__(self, service):
         self.service = service
 
     def connection_made(self, transport):
+        # Configuración de bajo nivel del socket Multicast
         self.transport = transport
         sock = transport.get_extra_info('socket')
         try:
@@ -316,12 +376,14 @@ class RawSniffer(asyncio.DatagramProtocol):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except: pass
 
+        # Unirse al grupo Multicast 224.0.0.251
         group = socket.inet_aton('224.0.0.251')
         try:
             mreq = struct.pack('4sL', group, socket.INADDR_ANY)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         except: pass
 
+        # Escuchar en todas las interfaces de red
         try:
             for iface in netifaces.interfaces():
                 addrs = netifaces.ifaddresses(iface)
@@ -337,9 +399,11 @@ class RawSniffer(asyncio.DatagramProtocol):
         except Exception: pass
 
     def datagram_received(self, data, addr):
+        """Analiza paquetes mDNS entrantes buscando nuestro servicio '_dni-im'."""
         if b"_dni-im" not in data: return
         try:
             found_info = None
+            # Intenta parseo por Regex (rápido y sucio)
             try:
                 match = re.search(rb'User-([^_\x00]+)_(\d+)', data)
                 if match:
@@ -348,6 +412,7 @@ class RawSniffer(asyncio.DatagramProtocol):
                     found_info = (name, port)
             except: pass
 
+            # Si regex falla, intenta parseo DNS real
             if not found_info:
                 try:
                     msg = DNSIncoming(data)
@@ -363,11 +428,13 @@ class RawSniffer(asyncio.DatagramProtocol):
 
             if found_info:
                 user_id_from_net, port = found_info
+                # Ignorarnos a nosotros mismos
                 if user_id_from_net == self.service.unique_instance_id:
                     return
 
                 props = {'user': user_id_from_net}
-                
+
+                # Extraer clave pública del peer del paquete TXT
                 try:
                     pub_match = re.search(rb'pub=([a-fA-F0-9]+)', data)
                     if pub_match:
@@ -387,6 +454,7 @@ class RawSniffer(asyncio.DatagramProtocol):
                         props['user'] = clean_user
                 except: pass
 
+                # Notificar al DiscoveryService
                 self.service.on_found(user_id_from_net, addr[0], port, props)
         except Exception:
             pass
@@ -407,10 +475,12 @@ class DiscoveryService:
         self.loop = asyncio.get_running_loop()
         self.bind_ip = bind_ip
         
+        # Generar ID único para esta sesión de mDNS
         clean_username = username.replace("User-", "")
         suffix = secrets.token_hex(2)
         self.unique_instance_id = f"{clean_username}-{suffix}"
         
+        # Iniciar Sniffer (Escucha pasiva)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -425,6 +495,7 @@ class DiscoveryService:
         except Exception as e:
             self.on_log(f"⚠️ Sniffer failed: {e}")
 
+        # Iniciar Zeroconf (Anuncio activo)
         interfaces = InterfaceChoice.All
         if bind_ip and bind_ip != "0.0.0.0": interfaces = [bind_ip]
         try:
@@ -435,6 +506,7 @@ class DiscoveryService:
         local_ip = bind_ip if (bind_ip and bind_ip != "0.0.0.0") else self.get_local_ip()
         service_name = f"User-{self.unique_instance_id}_{self.port}.{MDNS_TYPE}"
         
+        # Propiedades TXT del registro mDNS (Clave pública + Usuario)
         desc = {'pub': self.pubkey_b64, 'user': clean_username}
         self.info = ServiceInfo(
             MDNS_TYPE, service_name, addresses=[socket.inet_aton(local_ip)],
@@ -444,6 +516,7 @@ class DiscoveryService:
         self.on_log(f"📢 Advertising: {service_name} @ {local_ip}")
         await self.aiozc.async_register_service(self.info)
         
+        # Tarea de fondo para sondear la red periódicamente
         self._polling_task = asyncio.create_task(self._active_polling_loop())
 
     async def stop(self):
@@ -460,6 +533,7 @@ class DiscoveryService:
              except: pass
 
     async def _active_polling_loop(self):
+        """Envía paquetes de query cada 5s para mantener la lista de vecinos actualizada."""
         while True:
             await asyncio.sleep(5)
             if self.sniffer_transport:
@@ -467,6 +541,7 @@ class DiscoveryService:
                  except: pass
 
     def get_local_ip(self):
+        """Intenta determinar la IP local principal conectándose a Google DNS."""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try: s.connect(('8.8.8.8', 80)); IP = s.getsockname()[0]
         except: IP = '127.0.0.1'
