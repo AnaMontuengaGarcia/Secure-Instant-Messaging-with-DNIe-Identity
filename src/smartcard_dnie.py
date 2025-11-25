@@ -25,7 +25,7 @@ class DNIeCard:
         
         system = platform.system()
         if system == "Windows":
-            self.lib_path = r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll"
+            self.lib_path = r"C:\Program Files\OpenSC Project\PKCS11-Spy\pkcs11-spy.dll"
         elif system == "Linux":
             self.lib_path = "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"
         elif system == "Darwin":
