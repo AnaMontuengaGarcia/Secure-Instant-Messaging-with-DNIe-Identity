@@ -1,4 +1,3 @@
-
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, Center, Middle
 from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, Label, Button, RichLog, TextArea, LoadingIndicator
