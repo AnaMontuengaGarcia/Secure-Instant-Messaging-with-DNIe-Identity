@@ -15,6 +15,11 @@ class Storage:
         
         # Lock para evitar conflictos de escritura concurrente en los JSON
         self.lock = asyncio.Lock()
+        
+        # ALMACÉN EN MEMORIA PARA CLAVES PÚBLICAS EFÍMERAS
+        # Diccionario: (ip, port) -> Objeto X25519PublicKey
+        # Estas claves se pierden al cerrar el programa, que es lo deseado.
+        self.ephemeral_keys = {}
 
     async def init(self):
         """Inicializa los ficheros JSON si no existen"""
@@ -42,85 +47,75 @@ class Storage:
         
         await asyncio.to_thread(write)
 
-    async def get_static_key(self):
-        key_path = os.path.join(self.data_dir, "identity.key")
-        if os.path.exists(key_path):
-            with open(key_path, "rb") as f:
-                private_bytes = f.read()
-                return x25519.X25519PrivateKey.from_private_bytes(private_bytes)
-        else:
-            priv = x25519.X25519PrivateKey.generate()
-            with open(key_path, "wb") as f:
-                f.write(priv.private_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PrivateFormat.Raw,
-                    encryption_algorithm=serialization.NoEncryption()
-                ))
-            return priv
+    async def get_all_contacts(self):
+        """Devuelve la lista completa de contactos conocidos (solo metadatos)."""
+        return await self._read_json(self.contacts_file)
 
     async def register_contact(self, ip, port, pubkey_obj, user_id=None, real_name=None):
         """
-        Registra o actualiza un contacto.
-        user_id: Identificador único (hash DNI / mDNS)
-        real_name: Nombre real extraído del certificado
+        Registra un contacto.
+        - La Clave Pública se guarda SOLO EN MEMORIA.
+        - Metadatos (IP, Nombre, ID) se guardan en DISCO (JSON).
         """
-        pub_hex = pubkey_obj.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        ).hex()
         
+        # 1. Guardar clave en memoria (RAM)
+        self.ephemeral_keys[(ip, port)] = pubkey_obj
+        
+        # 2. Guardar metadatos en disco
         async with self.lock:
             contacts = await asyncio.to_thread(self._read_sync, self.contacts_file)
             
             # Buscar si ya existe
-            found = False
-            for c in contacts:
-                if c['ip'] == ip and c['port'] == port:
-                    found = True
-                    if c['pubkey_hex'] != pub_hex:
-                         print(f"🚨 SECURITY ALERT: Key changed for {ip}:{port}!")
-                         return
-                    
-                    updated = False
-                    # Actualizar userID si se proporciona
-                    if user_id and c.get('userID') != user_id:
-                        c['userID'] = user_id
-                        updated = True
-                    
-                    # Actualizar Real Name si se proporciona (prioridad sobre lo que hubiese)
-                    if real_name and c.get('real_name') != real_name:
-                        c['real_name'] = real_name
-                        print(f"DB: Identity Verified for {ip}:{port} -> {real_name}")
-                        updated = True
-                        
-                    if updated:
-                        await self._write_json(self.contacts_file, contacts)
+            found_idx = -1
+            for i, c in enumerate(contacts):
+                match_id = (user_id is not None) and (c.get('userID') == user_id)
+                match_ip = (c['ip'] == ip and c['port'] == port)
+                
+                if match_id:
+                    found_idx = i
                     break
+                elif match_ip and found_idx == -1: 
+                    found_idx = i
             
-            if not found:
+            if found_idx != -1:
+                c = contacts[found_idx]
+                updated = False
+                
+                if c['ip'] != ip or c['port'] != port:
+                    c['ip'] = ip
+                    c['port'] = port
+                    updated = True
+                
+                if user_id and c.get('userID') != user_id:
+                    c['userID'] = user_id
+                    updated = True
+                
+                if real_name and c.get('real_name') != real_name:
+                    c['real_name'] = real_name
+                    print(f"DB: Identity Verified for {ip}:{port} -> {real_name}")
+                    updated = True
+                    
+                if updated:
+                    await self._write_json(self.contacts_file, contacts)
+            
+            else:
                 new_contact = {
                     "ip": ip,
                     "port": port,
-                    "pubkey_hex": pub_hex,
                     "userID": user_id if user_id else "UnknownID",
-                    "real_name": real_name if real_name else None, # Nombre visual
+                    "real_name": real_name if real_name else None,
                     "trusted": 1
                 }
                 contacts.append(new_contact)
                 await self._write_json(self.contacts_file, contacts)
-                print(f"DB: Contact {ip}:{port} saved successfully (JSON).")
+                print(f"DB: New contact {ip}:{port} metadata saved.")
 
     async def get_pubkey_by_addr(self, ip, port):
-        """Recupera la clave pública buscando en el JSON de contactos"""
-        try:
-            contacts = await asyncio.to_thread(self._read_sync, self.contacts_file)
-            for c in contacts:
-                if c['ip'] == ip and c['port'] == port:
-                    return x25519.X25519PublicKey.from_public_bytes(bytes.fromhex(c['pubkey_hex']))
-            return None
-        except Exception as e:
-            print(f"DB ERROR in get_pubkey_by_addr: {e}")
-            return None
+        """
+        Recupera la clave pública desde la MEMORIA RAM.
+        Si se reinició el programa, esto devolverá None hasta que se redescubra al usuario (mDNS).
+        """
+        return self.ephemeral_keys.get((ip, port))
 
     async def log_msg(self, ip, port, direction, text):
         import time

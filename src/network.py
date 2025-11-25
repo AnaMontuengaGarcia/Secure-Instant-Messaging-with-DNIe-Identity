@@ -45,18 +45,19 @@ def load_trusted_cas():
             try:
                 with open(os.path.join(TRUSTED_CERTS_DIR, filename), "rb") as f:
                     cert_data = f.read()
-                    # Intentar cargar como PEM
                     try:
                         cert = x509.load_pem_x509_certificate(cert_data)
                     except:
-                        # Fallback a DER
                         cert = x509.load_der_x509_certificate(cert_data)
                     trusted_cas.append(cert)
             except Exception as e:
                 print(f"⚠️ Failed to load CA {filename}: {e}")
     return trusted_cas
 
+<<<<<<< HEAD
 # Cache global para evitar lectura de disco en cada handshake
+=======
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
 GLOBAL_TRUST_STORE = load_trusted_cas()
 
 # =============================================================================
@@ -64,13 +65,13 @@ GLOBAL_TRUST_STORE = load_trusted_cas()
 # =============================================================================
 
 def get_common_name(cert):
-    """Helper para extraer Common Name de un certificado"""
     for attribute in cert.subject:
         if attribute.oid == x509.NameOID.COMMON_NAME:
             return attribute.value
     return "Unknown Common Name"
 
 def verify_peer_identity(x25519_pub_key, proofs):
+<<<<<<< HEAD
     """
     Verifica criptográficamente la identidad de un peer remoto.
     
@@ -81,26 +82,37 @@ def verify_peer_identity(x25519_pub_key, proofs):
     Retorna:
         (real_name, issuer_name) si es válido. Lanza excepción si no.
     """
+=======
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
     if not proofs or 'cert' not in proofs or 'sig' not in proofs:
         raise Exception("No identity proofs provided by peer")
 
     try:
+<<<<<<< HEAD
         # --- 0. Carga de datos, decodificación ---
+=======
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
         cert_bytes = bytes.fromhex(proofs['cert'])
         signature_bytes = bytes.fromhex(proofs['sig'])
         peer_cert = x509.load_der_x509_certificate(cert_bytes)
         rsa_pub_key = peer_cert.public_key()    # Clave pública RSA del DNIe
 
+<<<<<<< HEAD
 
         # --- 1. Validación de Fechas (UTC) (Vigencia del DNIe) ---
+=======
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
         now = datetime.now(timezone.utc)
         if now < peer_cert.not_valid_before_utc:
             raise Exception("Certificate is NOT YET valid")
         if now > peer_cert.not_valid_after_utc:
             raise Exception("Certificate has EXPIRED")
 
+<<<<<<< HEAD
         # --- 2. Validación de Key Usage ---
         # Verificamos que el cert sirva para firmar o no repudio (autenticación)
+=======
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
         try:
             key_usage_ext = peer_cert.extensions.get_extension_for_class(x509.KeyUsage)
             usage = key_usage_ext.value
@@ -109,8 +121,11 @@ def verify_peer_identity(x25519_pub_key, proofs):
         except x509.ExtensionNotFound:
             pass
 
+<<<<<<< HEAD
         # --- 3. Validación de Cadena de Confianza (Chain of Trust) ---
         # Verificamos si el certificado fue firmado por una CA en nuestra carpeta 'certs'
+=======
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
         issuer_name = "Unknown CA (No Verification)"
         is_trusted = False
         
@@ -130,7 +145,6 @@ def verify_peer_identity(x25519_pub_key, proofs):
                         peer_cert.signature_hash_algorithm
                     )
                     is_trusted = True
-                    # Extraer el nombre de la autoridad que firmó exitosamente
                     issuer_name = get_common_name(ca_cert)
                     break 
                 except Exception:
@@ -139,9 +153,12 @@ def verify_peer_identity(x25519_pub_key, proofs):
             if not is_trusted:
                 raise Exception("Certificate Issuer is NOT TRUSTED (No matching CA in ./certs)")
 
+<<<<<<< HEAD
         # --- 4. Prueba de Posesión (Proof of Possession) ---
         # CRUCIAL: Verificamos que la firma enviada ('sig') coincide con la clave de chat ('x25519').
         # Esto prueba que quien envió la clave de chat POSEE la tarjeta DNIe correspondiente.
+=======
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
         data_to_verify = x25519_pub_key.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw
@@ -154,9 +171,7 @@ def verify_peer_identity(x25519_pub_key, proofs):
             hashes.SHA256()
         )
 
-        # --- 5. Extracción de Identidad ---
         real_name = get_common_name(peer_cert).replace("(AUTENTICACIÓN)", "").strip()
-        
         return real_name, issuer_name
 
     except Exception as e:
@@ -249,7 +264,6 @@ class UDPProtocol(asyncio.DatagramProtocol):
         try:
             remote_pub = session.consume_handshake_message(data)
             try:
-                # Obtenemos nombre y EMISOR
                 real_name, issuer = verify_peer_identity(remote_pub, session.remote_proofs)
                 self.on_log(f"✅ Verified Identity: {real_name}")
                 self.on_log(f"   ↳ Signed by: {issuer}")
@@ -279,7 +293,6 @@ class UDPProtocol(asyncio.DatagramProtocol):
         try:
             session.consume_handshake_response(data)
             try:
-                # Obtenemos nombre y EMISOR
                 real_name, issuer = verify_peer_identity(session.rs_pub, session.remote_proofs)
                 self.on_log(f"✅ Verified Identity: {real_name}")
                 self.on_log(f"   ↳ Signed by: {issuer}")
@@ -322,11 +335,34 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.pending_messages[addr].append(content)
         self.on_log(f"⏳ Message queued...")
 
+<<<<<<< HEAD
     async def send_message(self, addr, content):
         """Intenta enviar un mensaje. Inicia handshake si es necesario."""
         session = self.sessions.get_session(addr)
 
         # Si no hay sesión, buscar clave pública e iniciar handshake
+=======
+    async def broadcast_disconnect(self):
+        """Envía un mensaje de desconexión cifrado a todas las sesiones activas."""
+        self.on_log("📡 Sending encrypted disconnect to active chats...")
+        # Copia de las claves para iteración segura
+        active_addresses = list(self.sessions.sessions.keys())
+        
+        tasks = []
+        for addr in active_addresses:
+            tasks.append(self.send_message(addr, content=None, is_disconnect=True))
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def send_message(self, addr, content, is_disconnect=False):
+        session = self.sessions.get_session(addr)
+        
+        # Si nos estamos desconectando y no hay sesión, no la creamos ahora
+        if not session and is_disconnect:
+            return
+
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
         if not session:
             remote_pub = await self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
@@ -337,17 +373,30 @@ class UDPProtocol(asyncio.DatagramProtocol):
             hs_msg = session.create_handshake_message()
             self.transport.sendto(b'\x01' + hs_msg, addr)
             self.on_log(f"🔄 Initiating handshake with {addr}")
-            self._queue_message(addr, content)
+            if content:
+                self._queue_message(addr, content)
             return
         
         # Si el handshake no ha terminado (encryptor no listo)
         if session.encryptor is None:
-            self._queue_message(addr, content)
+            if content:
+                self._queue_message(addr, content)
             return
 
         # Enviar mensaje cifrado
         try:
-            msg_struct = {"timestamp": time.time(), "text": content}
+            # Construcción del payload: Texto normal o señal de desconexión
+            if is_disconnect:
+                msg_struct = {
+                    "timestamp": time.time(),
+                    "disconnect": True
+                }
+            else:
+                msg_struct = {
+                    "timestamp": time.time(), 
+                    "text": content
+                }
+            
             payload = json.dumps(msg_struct).encode('utf-8')
             ciphertext = session.encrypt_message(payload)
             self.transport.sendto(b'\x03' + ciphertext, addr)
@@ -399,11 +448,20 @@ class RawSniffer(asyncio.DatagramProtocol):
         except Exception: pass
 
     def datagram_received(self, data, addr):
+<<<<<<< HEAD
         """Analiza paquetes mDNS entrantes buscando nuestro servicio '_dni-im'."""
+=======
+        # Filtro básico: Debe contener el identificador del protocolo
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
         if b"_dni-im" not in data: return
+        
         try:
             found_info = None
+<<<<<<< HEAD
             # Intenta parseo por Regex (rápido y sucio)
+=======
+            # 1. Intentar Regex simple para User-ID_Port
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
             try:
                 match = re.search(rb'User-([^_\x00]+)_(\d+)', data)
                 if match:
@@ -412,7 +470,11 @@ class RawSniffer(asyncio.DatagramProtocol):
                     found_info = (name, port)
             except: pass
 
+<<<<<<< HEAD
             # Si regex falla, intenta parseo DNS real
+=======
+            # 2. Intentar parsing completo DNS si regex falla
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
             if not found_info:
                 try:
                     msg = DNSIncoming(data)
@@ -428,6 +490,7 @@ class RawSniffer(asyncio.DatagramProtocol):
 
             if found_info:
                 user_id_from_net, port = found_info
+<<<<<<< HEAD
                 # Ignorarnos a nosotros mismos
                 if user_id_from_net == self.service.unique_instance_id:
                     return
@@ -435,18 +498,38 @@ class RawSniffer(asyncio.DatagramProtocol):
                 props = {'user': user_id_from_net}
 
                 # Extraer clave pública del peer del paquete TXT
+=======
+                
+                # Ignorar paquetes propios
+                if user_id_from_net == self.service.unique_instance_id and port == self.service.port:
+                    return
+
+                props = {'user': user_id_from_net}
+                
+                # --- DETECCIÓN DE MENSAJE DE SALIDA CUSTOM (stat=exit) ---
+                # Esta es nuestra "propia implementación" de mDNS goodbye.
+                # Si encontramos 'stat=exit' en los bytes crudos, es una desconexión explícita.
+                is_exit_msg = re.search(rb'stat=exit', data)
+                if is_exit_msg:
+                    props['stat'] = 'exit'
+                    # Pasamos directamente al callback, no necesitamos la clave pública para desconectar
+                    self.service.on_found(user_id_from_net, addr[0], port, props)
+                    return
+                # ---------------------------------------------------------
+
+                # Si NO es un mensaje de salida, exigimos la clave pública
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
                 try:
                     pub_match = re.search(rb'pub=([a-fA-F0-9]+)', data)
                     if pub_match:
                         pub_str = pub_match.group(1).decode('utf-8')
                         if len(pub_str) != 64: return 
-                        
                         props['pub'] = pub_str
-                        if props['pub'] == self.service.pubkey_b64: return
                     else:
-                        return 
+                        return # Sin clave pública y sin stat=exit, ignoramos.
                 except: return
                 
+                # Intentar sacar usuario del TXT si existe
                 try:
                     user_match = re.search(rb'user=([^\x00]+)', data)
                     if user_match:
@@ -477,8 +560,7 @@ class DiscoveryService:
         
         # Generar ID único para esta sesión de mDNS
         clean_username = username.replace("User-", "")
-        suffix = secrets.token_hex(2)
-        self.unique_instance_id = f"{clean_username}-{suffix}"
+        self.unique_instance_id = clean_username
         
         # Iniciar Sniffer (Escucha pasiva)
         try:
@@ -519,7 +601,39 @@ class DiscoveryService:
         # Tarea de fondo para sondear la red periódicamente
         self._polling_task = asyncio.create_task(self._active_polling_loop())
 
+    def broadcast_exit(self):
+        """
+        Envía un paquete UDP crudo al grupo multicast mDNS (224.0.0.251:5353)
+        que contiene una estructura reconocible por nuestro sniffer con la flag 'stat=exit'.
+        Esto fuerza a todos los clientes (incluso los que no tienen sesión activa)
+        a marcarnos como Offline inmediatamente.
+        """
+        if not self.sniffer_transport: return
+        
+        try:
+            # Construimos un paquete "Fake mDNS" que satisface las regex del RawSniffer
+            # Contiene: _dni-im, User-{id}_{port} y el payload personalizado stat=exit
+            # Rellenamos con nulos al principio para simular cabecera DNS
+            
+            fake_payload = (
+                b'\x00' * 12 +     # Cabecera DNS falsa
+                b'_dni-im' +       # Protocolo
+                f'User-{self.unique_instance_id}_{self.port}'.encode('utf-8') + # Identificador
+                b'\x00fake\x00' +  # Relleno
+                b'stat=exit'       # Nuestra flag personalizada de desconexión
+            )
+            
+            # Enviar al grupo multicast
+            self.sniffer_transport.sendto(fake_payload, ('224.0.0.251', 5353))
+            self.on_log("📡 Broadcasted custom 'stat=exit' mDNS packet.")
+            
+        except Exception as e:
+            print(f"Error broadcasting exit: {e}")
+
     async def stop(self):
+        # 1. Enviar nuestra señal de desconexión personalizada
+        self.broadcast_exit()
+        
         if hasattr(self, '_polling_task'): self._polling_task.cancel()
         if self.sniffer_transport: self.sniffer_transport.close()
         if hasattr(self, 'info') and hasattr(self, 'aiozc'): 

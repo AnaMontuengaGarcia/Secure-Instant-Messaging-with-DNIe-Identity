@@ -4,17 +4,23 @@ import argparse
 import os
 from network import UDPProtocol, SessionManager, DiscoveryService
 from storage import Storage
-from tui import MessengerTUI
+from tui import MessengerTUI, DNIeLoginApp
 from cryptography.hazmat.primitives import serialization
+# Importamos librería para generación de claves en memoria
+from cryptography.hazmat.primitives.asymmetric import x25519
 
+<<<<<<< HEAD
 # =============================================================================
 # Configuración de Argumentos de Línea de Comandos
 # =============================================================================
+=======
+# Configuración estándar de argumentos
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
 parser = argparse.ArgumentParser(description="DNIe Secure Messenger")
-parser.add_argument('--port', type=int, default=443, help="Puerto UDP (Default: 443)")
-parser.add_argument('--bind', type=str, default="0.0.0.0", help="IP de escucha")
-parser.add_argument('--data', type=str, default="data", help="Carpeta de datos")
-parser.add_argument('--mock', type=str, help="Simular DNIe")
+parser.add_argument('-p', '--port', type=int, default=443, help="Puerto UDP (Default: 443)")
+parser.add_argument('-b', '--bind', type=str, default="0.0.0.0", help="IP de escucha (Default: 0.0.0.0)")
+parser.add_argument('-d', '--data', type=str, default="data", help="Carpeta de datos (Default: 'data')")
+parser.add_argument('--mock', type=str, help="Simular DNIe para pruebas (Ej: --mock User1)")
 args = parser.parse_args()
 
 def ensure_cert_structure():
@@ -28,9 +34,9 @@ def ensure_cert_structure():
         os.makedirs('certs')
         with open('certs/README.txt', 'w') as f:
             f.write("Coloca aqui los certificados CA (Root e Intermedios) del DNIe en formato .pem o .crt\n")
-            f.write("Ejemplo: AC_RAIZ_DNIE_2.pem, AC_DNIE_004.crt, etc.")
 
 async def main_async(dnie_identity_data):
+<<<<<<< HEAD
     """
     Bucle principal asíncrono. Inicia la red, el almacenamiento y la interfaz (TUI).
     
@@ -41,16 +47,28 @@ async def main_async(dnie_identity_data):
     user_id, proofs = dnie_identity_data
     
     # 1. Inicialización del Almacenamiento (claves de cifrado persistentes)
+=======
+    # Desempaquetamos los 3 elementos: ID, Pruebas y la Clave Privada en memoria
+    user_id, proofs, local_static_key = dnie_identity_data
+    
+    # Inicializamos el storage para contactos y mensajes
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
     storage = Storage(data_dir=args.data)
     await storage.init()
-    local_static_key = await storage.get_static_key()
     
+<<<<<<< HEAD
     # 2. Inicialización del Gestor de Sesiones
     # Pasamos las pruebas (cert+firma) al SessionManager
     sessions = SessionManager(local_static_key, storage, local_proofs=proofs)
 
     # 3. Configuración del Protocolo UDP
     # Define callbacks simples para mensajes recibidos (actualmente placeholder lambda)
+=======
+    # Ya no cargamos la clave del disco. Usamos la que viene de memoria.
+    
+    sessions = SessionManager(local_static_key, storage, local_proofs=proofs)
+    # Callback de log simple para la consola
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
     proto = UDPProtocol(sessions, lambda a,m: None, lambda t: print(f"LOG: {t}"))
     
     loop = asyncio.get_running_loop()
@@ -66,6 +84,7 @@ async def main_async(dnie_identity_data):
         )
     except Exception as e:
         print(f"❌ Socket error: {e}")
+        print("💡 Consejo: Si el puerto 443 requiere permisos de root, prueba con un puerto alto: -p 5000")
         return
 
     try:
@@ -76,15 +95,21 @@ async def main_async(dnie_identity_data):
             format=serialization.PublicFormat.Raw
         )
         
+        # Iniciamos el servicio de descubrimiento (mDNS) en el puerto correcto
         discovery = DiscoveryService(args.port, pub_bytes, lambda n,i,p,pr: None)
         
+<<<<<<< HEAD
         # 6. Lanzamiento de la Interfaz de Usuario (TUI)
         # MessengerTUI tomará el control del bucle principal hasta que el usuario salga
         # Pasamos los proofs (que incluyen el nombre real del DNIe) como ID si queremos
+=======
+        # Lanzamos la interfaz de Chat (TUI)
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
         app = MessengerTUI(proto, discovery, storage, user_id=user_id, bind_ip=args.bind)
         await app.run_async()
         
     finally:
+<<<<<<< HEAD
         # Limpieza ordenada de recursos al cerrar
         if discovery: await discovery.stop()
         if transport: transport.close()
@@ -125,6 +150,31 @@ def perform_dnie_binding():
     except Exception as e:
         print(f"Error accessing storage: {e}")
         sys.exit(1)
+=======
+        print("\n🛑 Closing application...")
+        if proto:
+            # 1. Enviamos el "Adiós" cifrado a las sesiones activas
+            await proto.broadcast_disconnect()
+
+        if discovery:
+            # 2. Enviamos el "Adiós" mDNS global (implementación custom)
+            await discovery.stop()
+            
+        if transport: transport.close()
+        print("👋 Bye!")
+
+def perform_dnie_binding_gui():
+    """Realiza el binding usando la interfaz gráfica Textual (Login)"""
+    
+    # 1. Generamos la clave estática EN MEMORIA (Efímera, solo dura lo que el proceso)
+    # No se guarda en disco en ningún momento.
+    print("✨ Generating ephemeral identity key in memory...")
+    key_priv = x25519.X25519PrivateKey.generate()
+
+    # Si se usa el modo --mock
+    if args.mock:
+        return (args.mock, {'cert': '00', 'sig': '00'}, key_priv)
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
 
     # Extraemos la parte pública para que sea firmada por el DNIe
     key_pub_bytes = key_priv.public_key().public_bytes(
@@ -132,8 +182,11 @@ def perform_dnie_binding():
         format=serialization.PublicFormat.Raw
     )
 
-    print("🔐 DNIe Binding Ceremony")
+    # 2. Lanzar la App de Login dedicada
+    login_app = DNIeLoginApp(key_to_sign_bytes=key_pub_bytes)
+    result = login_app.run() # Bloquea hasta que la App se cierra (exit)
     
+<<<<<<< HEAD
     # Bucle de reintento para conexión con la tarjeta
     while True:
         print("\n👉 Insert DNIe to SIGN your network identity.")
@@ -184,14 +237,32 @@ def perform_dnie_binding():
             # El bucle continúa automáticamente pidiendo "Press Enter"
         finally:
             card.disconnect()
+=======
+    # 3. Procesar resultado del login
+    if result:
+        # result es (user_id, proofs)
+        # Devolvemos también la clave privada en memoria para que la use main_async
+        return (result[0], result[1], key_priv)
+    else:
+        print("Login cancelado por el usuario.")
+        sys.exit(0)
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
 
 if __name__ == "__main__":
     # 1. Asegurar carpetas
     ensure_cert_structure()
+<<<<<<< HEAD
 
     # 2. Realizar autenticación hardware (Bloqueante)
     # El programa no arranca la red hasta que el usuario demuestre posesión del DNIe
     identity_data = perform_dnie_binding()
+=======
+    
+    # Fase 1: Identidad (Login Gráfico y Generación de Claves RAM)
+    identity_data = perform_dnie_binding_gui()
+    
+    # Fase 2: Chat (App Principal)
+>>>>>>> daf96701fab225e13f2f706fd8896b1a6bf7c6af
     try:
         # 3. Iniciar el bucle asíncrono de la aplicación
         asyncio.run(main_async(identity_data))
