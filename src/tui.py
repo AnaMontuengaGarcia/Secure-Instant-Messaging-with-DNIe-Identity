@@ -7,6 +7,7 @@ from textual import work
 from rich.panel import Panel
 from rich.text import Text
 from rich.align import Align
+from rich.rule import Rule
 from rich import box
 import asyncio
 import time 
@@ -139,6 +140,9 @@ class MessengerTUI(App):
         self.recently_disconnected = {}
         
         self.pending_acks = {}
+        # Diccionario para controlar la última vez que leímos el chat de un usuario
+        # Key: user_id, Value: timestamp
+        self.peer_last_read = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -179,6 +183,7 @@ class MessengerTUI(App):
         lst = self.query_one("#contact_list", ListView)
         
         loaded_count = 0
+        now = time.time()
         for c in contacts:
             uid = c.get('userID')
             name = c.get('real_name')
@@ -187,6 +192,9 @@ class MessengerTUI(App):
             
             if uid and name:
                 self.known_names[uid] = name
+                # Asumimos que el historial antiguo ya está leído al iniciar la app
+                self.peer_last_read[uid] = now
+                
                 exists = False
                 for child in lst.children:
                     if isinstance(child, ChatItem) and child.user_id == uid:
@@ -250,6 +258,11 @@ class MessengerTUI(App):
         try:
             lst = self.query_one("#contact_list", ListView)
             
+            # Nuevos pares descubiertos en caliente (no en DB): Marcamos last_read en 0
+            # para que cualquier mensaje entrante se marque como Nuevo
+            if user_id not in self.peer_last_read:
+                self.peer_last_read[user_id] = 0
+
             if props.get('stat') == 'exit':
                 self.add_log(f"💤 Recibida señal de salida de {user_id} (Multicast)")
                 target_child = None
@@ -349,19 +362,34 @@ class MessengerTUI(App):
         chat_box.write(f"Chatting with {target_name} {status} - {conn_status}\n")
         chat_box.write(f"[dim]History from {item.user_id}[/]\n")
         
+        # 1. Recuperamos umbral de lectura
+        last_read_ts = self.peer_last_read.get(item.user_id, 0)
+        rule_drawn = False
+
+        # 2. Cargar e imprimir Historial
         history = await self.storage.get_chat_history(item.user_id)
+        
         for msg in history:
+            ts = msg.get('timestamp', 0)
+            
+            # Si el mensaje es más nuevo que lo último que leímos, pintamos la raya
+            # y solo una vez.
+            if not rule_drawn and ts > last_read_ts:
+                chat_box.write(Rule(style="red", title="Nuevos Mensajes"))
+                rule_drawn = True
+
             text = msg.get('content')
-            ts = msg.get('timestamp')
             direction = msg.get('direction')
             is_me = (direction == "out")
             sender_name = "You" if is_me else target_name
             panel = self._create_message_panel(text, sender_name, is_me, timestamp=ts)
             chat_box.write(panel)
+
+        # Si no se pintó raya de nuevos (todos leídos), pintamos raya final gris
+        if not rule_drawn:
+            chat_box.write(Rule(style="dim"))
             
-        # --- FIX: Mostrar también mensajes pendientes de ACK ---
-        # Si se refresca la vista (ej. al completarse el handshake), estos mensajes
-        # aún no están en DB, así que debemos pintarlos manualmente para que no desaparezcan.
+        # 3. Imprimir Mensajes Pendientes (Memoria temporal)
         pending_list = [v for k, v in self.pending_acks.items() if v['user_id'] == item.user_id]
         pending_list.sort(key=lambda x: x['timestamp'])
 
@@ -373,8 +401,11 @@ class MessengerTUI(App):
                 timestamp=p_data['timestamp']
             )
             chat_box.write(panel)
-            
+        
         chat_box.write("\n")
+        
+        # 4. Actualizamos lectura AHORA (después de mostrar)
+        self.peer_last_read[item.user_id] = time.time()
 
     async def submit_message(self):
         ta = self.query_one("#msg_input", ChatInput)
@@ -395,6 +426,8 @@ class MessengerTUI(App):
             if not target_item.online:
                 self.add_log(f"⛔ Cannot send message: {target_item.real_name or target_item.user_id} is OFFLINE.")
                 return
+            # Si enviamos mensaje, consideramos el chat leído
+            self.peer_last_read[target_item.user_id] = time.time()
         else:
              self.add_log("❌ Error: Contact not found in list context.")
              return
@@ -473,6 +506,10 @@ class MessengerTUI(App):
         if target_child:
             self.peer_last_seen[target_child.user_id] = time.time()
             target_child.set_online_status(True)
+            
+            # Actualizamos lectura SI estamos en ese chat
+            if self.current_chat_addr == (ip, port):
+                self.peer_last_read[target_child.user_id] = time.time()
         
         text = msg.get('text', '')
         if not text: return 
