@@ -5,8 +5,9 @@ import os
 from network import UDPProtocol, SessionManager, DiscoveryService
 from storage import Storage
 from tui import MessengerTUI, DNIeLoginApp
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 # Configuración estándar de argumentos
 parser = argparse.ArgumentParser(description="DNIe Secure Messenger")
@@ -23,17 +24,35 @@ def ensure_cert_structure():
         with open('certs/README.txt', 'w') as f:
             f.write("Coloca aqui los certificados CA (Root e Intermedios) del DNIe en formato .pem o .crt\n")
 
-async def main_async(dnie_identity_data):
-    # Desempaquetamos los 3 elementos: ID, Pruebas y la Clave Privada en memoria
-    user_id, proofs, local_static_key = dnie_identity_data
+def derive_storage_key(signature_bytes):
+    """
+    Deriva una clave simétrica de 32 bytes (para AES/Fernet) usando HKDF
+    sobre la firma RSA generada por el DNIe.
+    """
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None, # Sal vacía está permitida, o podríamos usar el Serial Hash como sal
+        info=b'DNIe-Storage-Encryption-Key',
+    )
+    return hkdf.derive(signature_bytes)
+
+async def main_async(identity_data):
+    # Desempaquetamos los 4 elementos: ID, Pruebas, Firma de Almacenamiento y Clave Privada
+    # Nota: storage_signature viene del nuevo TUI
+    user_id, proofs, storage_signature, local_static_key = identity_data
     
-    # Inicializamos el storage para contactos y mensajes
-    storage = Storage(data_dir=args.data)
+    # Derivamos la clave de cifrado para el disco
+    print("🔐 Deriving storage key from DNIe signature...")
+    storage_key = derive_storage_key(storage_signature)
+    
+    # Inicializamos el storage con la clave derivada
+    storage = Storage(key_bytes=storage_key, data_dir=args.data)
     await storage.init()
     
     sessions = SessionManager(local_static_key, storage, local_proofs=proofs)
     
-    # Callback de log simple para la consola (La TUI sobrescribirá el on_ack_received)
+    # Callback de log simple para la consola
     proto = UDPProtocol(sessions, lambda a,m: None, lambda t: print(f"LOG: {t}"), on_ack_received=None)
     
     loop = asyncio.get_running_loop()
@@ -57,7 +76,7 @@ async def main_async(dnie_identity_data):
             format=serialization.PublicFormat.Raw
         )
         
-        # Iniciamos el servicio de descubrimiento (mDNS) en el puerto correcto
+        # Iniciamos el servicio de descubrimiento (mDNS)
         discovery = DiscoveryService(args.port, pub_bytes, lambda n,i,p,pr: None)
         
         # Lanzamos la interfaz de Chat (TUI)
@@ -66,12 +85,15 @@ async def main_async(dnie_identity_data):
         
     finally:
         print("\n🛑 Closing application...")
+        # 0. Guardamos datos cifrados finales
+        await storage.close()
+
         if proto:
-            # 1. Enviamos el "Adiós" cifrado a las sesiones activas
+            # 1. Enviamos el "Adiós" cifrado
             await proto.broadcast_disconnect()
 
         if discovery:
-            # 2. Enviamos el "Adiós" mDNS global (implementación custom)
+            # 2. Enviamos el "Adiós" mDNS global
             await discovery.stop()
             
         if transport: transport.close()
@@ -80,13 +102,14 @@ async def main_async(dnie_identity_data):
 def perform_dnie_binding_gui():
     """Realiza el binding usando la interfaz gráfica Textual (Login)"""
     
-    # 1. Generamos la clave estática EN MEMORIA (Efímera, solo dura lo que el proceso)
     print("✨ Generating ephemeral identity key in memory...")
     key_priv = x25519.X25519PrivateKey.generate()
 
     # Si se usa el modo --mock
     if args.mock:
-        return (args.mock, {'cert': '00', 'sig': '00'}, key_priv)
+        # Mock signature for storage
+        mock_sig = b'\x00' * 256 
+        return (args.mock, {'cert': '00', 'sig': '00'}, mock_sig, key_priv)
 
     key_pub_bytes = key_priv.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -98,7 +121,8 @@ def perform_dnie_binding_gui():
     result = login_app.run() 
     
     if result:
-        return (result[0], result[1], key_priv)
+        # result es (user_id, proofs, storage_signature)
+        return (result[0], result[1], result[2], key_priv)
     else:
         print("Login cancelado por el usuario.")
         sys.exit(0)

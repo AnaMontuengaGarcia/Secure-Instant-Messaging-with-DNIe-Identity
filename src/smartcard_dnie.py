@@ -45,8 +45,13 @@ class DNIeCard:
         except Exception as e:
             raise DNIeCardError(f"Connection failed: {e}")
 
+    def get_serial(self):
+        """Devuelve el número de serie en crudo (string o bytes)"""
+        if not self.token: raise DNIeCardError("Not connected")
+        return self.token.serial
+
     def get_serial_hash(self):
-        """Obtiene identificador único de la tarjeta"""
+        """Obtiene identificador único de la tarjeta (Hash SHA256)"""
         if not self.token: raise DNIeCardError("Not connected")
         digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
         ser = self.token.serial

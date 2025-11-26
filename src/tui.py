@@ -11,6 +11,7 @@ from rich.rule import Rule
 from rich import box
 import asyncio
 import time 
+import hashlib
 from datetime import datetime
 import pyperclip
 import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
@@ -160,6 +161,7 @@ class MessengerTUI(App):
     async def on_mount(self):
         self.title = "DNIe Secure Messenger"
         
+        # Carga inicial desde memoria (que ya fue descifrada en storage.init())
         await self.load_saved_contacts()
         
         self.proto.on_log = self.add_log
@@ -206,7 +208,7 @@ class MessengerTUI(App):
                     lst.append(item)
                     loaded_count += 1
         
-        self.add_log(f"📚 {loaded_count} Contactos verificados cargados.")
+        self.add_log(f"📚 {loaded_count} Contactos cargados (Base de Datos Cifrada).")
 
     def check_peer_status(self):
         now = time.time()
@@ -366,7 +368,7 @@ class MessengerTUI(App):
         last_read_ts = self.peer_last_read.get(item.user_id, 0)
         rule_drawn = False
 
-        # 2. Cargar e imprimir Historial
+        # 2. Cargar e imprimir Historial (desde memoria descifrada)
         history = await self.storage.get_chat_history(item.user_id)
         
         for msg in history:
@@ -467,7 +469,7 @@ class MessengerTUI(App):
             )
             if self.current_chat_addr == addr:
                 self.query_one("#chat_box", RichLog).write(
-                    Align(Text("✓ Entregado (Saved to DB)", style="bold green italic", justify="left"), align="left")
+                    Align(Text("✓ Entregado (Saved to Encrypted Memory)", style="bold green italic", justify="left"), align="left")
                 )
 
     def receive_message(self, addr, msg):
@@ -568,6 +570,8 @@ class DNIeLoginApp(App):
     LoadingIndicator { height: 1; margin: 1 0; display: none; }
     """
 
+    DOMAIN_SEPARATOR = "DNIe-Secure-Storage-Domain-Separator-v1"
+
     def __init__(self, key_to_sign_bytes):
         super().__init__()
         self.key_to_sign_bytes = key_to_sign_bytes
@@ -653,15 +657,31 @@ class DNIeLoginApp(App):
             self.call_from_thread(lambda: self.query_one("#status", Label).update("Autenticando PIN..."))
             card.connect()
             card.authenticate(pin)
-            self.call_from_thread(lambda: self.query_one("#status", Label).update("Leyendo certificado..."))
-            cert_der = card.get_certificate()
+            
+            # 1. Obtener certificado y firmar identidad de red (Proceso original)
             self.call_from_thread(lambda: self.query_one("#status", Label).update("Firmando identidad de red..."))
-            signature = card.sign_data(self.key_to_sign_bytes)
-            
-            proofs = {'cert': cert_der.hex(), 'sig': signature.hex()}
+            cert_der = card.get_certificate()
+            network_signature = card.sign_data(self.key_to_sign_bytes)
             user_id = card.get_serial_hash()[:8]
+            proofs = {'cert': cert_der.hex(), 'sig': network_signature.hex()}
+
+            # 2. NUEVO: Derivación de clave de cifrado para almacenamiento
+            # Calculamos Hash(Serial_DNI + DomainSeparator)
+            self.call_from_thread(lambda: self.query_one("#status", Label).update("Generando clave de cifrado..."))
             
-            self.return_data = (user_id, proofs)
+            serial_raw = card.get_serial()
+            # Aseguramos bytes
+            serial_bytes = serial_raw.encode('utf-8') if isinstance(serial_raw, str) else serial_raw
+            separator_bytes = self.DOMAIN_SEPARATOR.encode('utf-8')
+            
+            data_to_hash_for_key = serial_bytes + separator_bytes
+            digest = hashlib.sha256(data_to_hash_for_key).digest()
+            
+            # Firmamos ese hash con la clave privada del DNIe
+            storage_signature = card.sign_data(digest)
+
+            # Retornamos todo
+            self.return_data = (user_id, proofs, storage_signature)
             self.call_from_thread(self.exit_success)
             
         except Exception as e:
