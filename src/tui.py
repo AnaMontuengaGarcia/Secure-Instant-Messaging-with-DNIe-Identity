@@ -427,7 +427,7 @@ class MessengerTUI(App):
         # Si estamos en el chat de la persona que nos confirma, mostramos un tick
         if self.current_chat_addr == addr:
             self.query_one("#chat_box", RichLog).write(
-                Align(Text("✓ Entregado", style="bold green italic", justify="right"), align="right")
+                Align(Text("✓ Entregado", style="bold green italic", justify="left"), align="left")
             )
         else:
             self.add_log(f"✅ Message delivered to {addr} (ACK)")
