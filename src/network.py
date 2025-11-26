@@ -9,6 +9,7 @@ import os
 import netifaces
 import secrets
 import uuid
+import hashlib  # Importamos hashlib para el cálculo del hash
 from datetime import datetime, timezone
 from zeroconf import ServiceInfo, IPVersion, Zeroconf, InterfaceChoice, DNSIncoming
 from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
@@ -260,6 +261,21 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 return # No procesamos como mensaje de texto
 
             # 2. Si recibimos un mensaje normal
+            # --- INTEGRITY CHECK ---
+            if 'text' in msg_struct and 'hash' in msg_struct:
+                content = msg_struct['text']
+                received_hash = msg_struct['hash']
+                # Recalcular hash localmente
+                local_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+                
+                if local_hash == received_hash:
+                    msg_struct['integrity'] = True
+                    # Optional logging to avoid spam
+                    # self.on_log(f"🛡️ Hash verified: {received_hash[:8]}...")
+                else:
+                    msg_struct['integrity'] = False
+                    self.on_log(f"🚨 INTEGRITY FAILURE: Recv Hash {received_hash[:8]}... != Calc {local_hash[:8]}...")
+            
             # Enviamos ACK automáticamente si tiene ID
             if 'id' in msg_struct and not msg_struct.get('disconnect'):
                 asyncio.create_task(self.send_ack(addr, msg_struct['id']))
@@ -340,10 +356,14 @@ class UDPProtocol(asyncio.DatagramProtocol):
                     "disconnect": True
                 }
             else:
+                # Calcular Hash del mensaje
+                text_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+                
                 msg_struct = {
                     "id": msg_id, # ID para ACK
                     "timestamp": time.time(), 
-                    "text": content
+                    "text": content,
+                    "hash": text_hash # Enviamos el hash para verificación
                 }
             
             payload = json.dumps(msg_struct).encode('utf-8')

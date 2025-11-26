@@ -26,3 +26,5 @@ build/
 
 # Database
 *.json
+
+networkcorrupted.py

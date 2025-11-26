@@ -481,6 +481,12 @@ class MessengerTUI(App):
         text = msg.get('text', '')
         if not text: return 
 
+        # --- VALIDACIÓN VISUAL DE INTEGRIDAD ---
+        integrity = msg.get('integrity', None)
+        if integrity is False:
+             text = f"[bold red blink]⚠️ MENSAJE CORRUPTO (HASH MISMATCH):[/]\n{text}"
+        # ---------------------------------------
+
         ts = msg.get('timestamp')
         msg_panel = self._create_message_panel(text, peer_name, is_me=False, timestamp=ts)
         key = f"{ip}:{port}"
