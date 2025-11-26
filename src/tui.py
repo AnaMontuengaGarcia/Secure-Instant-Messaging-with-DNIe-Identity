@@ -9,13 +9,10 @@ from rich.text import Text
 from rich.align import Align
 from rich import box
 import asyncio
-import time  # Necesario para controlar el tiempo (timestamp)
+import time 
 from datetime import datetime
 import pyperclip
 import cryptography.hazmat.primitives.asymmetric.x25519 as x25519
-
-
-# Importamos la tarjeta para usarla en la pantalla de login
 from smartcard_dnie import DNIeCard
 
 # --- PANTALLAS MODALES ---
@@ -48,48 +45,35 @@ class ChatItem(ListItem):
         self.contact_ip = ip
         self.contact_port = port
         self.verified = verified
-        self.online = online  # Estado de conexión
-        
+        self.online = online  
         self.update_label()
 
     def set_online_status(self, is_online):
-        """Actualiza el estado online/offline y refresca la etiqueta visualmente"""
         if self.online != is_online:
             self.online = is_online
             self.update_label()
 
     def update_address(self, new_ip, new_port):
-        """Actualiza la dirección IP/Puerto si cambia por DHCP"""
         self.contact_ip = new_ip
         self.contact_port = new_port
         self.update_label()
 
     def update_label(self):
-        """Actualiza el texto mostrado basándose en el estado de verificación y conexión."""
-        
-        # Determinar el color y símbolo del estado
         if self.online:
-            status_icon = "[green]●[/]" # Círculo verde para online
+            status_icon = "[green]●[/]" 
             status_text = "Online"
         else:
-            status_icon = "[grey50]●[/]" # Círculo gris para offline
+            status_icon = "[grey50]●[/]" 
             status_text = "Offline"
 
-        # Construcción del nombre a mostrar
         if self.real_name:
             if self.verified:
-                # Nombre verificado (Handshake completo)
                 display_name = f"{self.real_name}"
             else:
-                # Nombre conocido de DB pero no verificado en esta sesión
                 display_name = f"{self.real_name} (?)"
         else:
-            # Solo tenemos el ID (Hash)
             display_name = f"{self.user_id}"
 
-        # Composición final usando Rich Text markup
-        # Formato: ● Nombre (IP)
-        # Mostramos siempre la IP actual conocida
         self.display_label = f"{status_icon} {display_name} [dim]({self.contact_ip})[/]"
             
         try:
@@ -105,11 +89,6 @@ class ChatItem(ListItem):
         yield Label(self.display_label)
 
 class ChatInput(TextArea):
-    """
-    Widget de entrada simplificado.
-    Solo intercepta Enter para enviar. 
-    Los saltos de línea se manejan vía Ctrl+N.
-    """
     BINDINGS = [
         Binding("enter", "submit_message", "Send Message", show=True, priority=True),
         Binding("ctrl+n", "insert_newline", "Line Break (Ctrl+N)", show=True, priority=True),
@@ -156,15 +135,8 @@ class MessengerTUI(App):
         self.last_msg_content = ""
         self.log_buffer = []
         
-        # Caché en memoria para nombres conocidos (ID -> Nombre Real)
         self.known_names = {} 
-        
-        # Diccionario para rastrear la última vez que vimos un paquete mDNS
-        # Key: user_id, Value: timestamp (time.time())
         self.peer_last_seen = {}
-
-        # Diccionario para ignorar paquetes mDNS temporales tras desconexión explícita
-        # Key: user_id, Value: timestamp de desconexión
         self.recently_disconnected = {}
 
     def compose(self) -> ComposeResult:
@@ -183,28 +155,28 @@ class MessengerTUI(App):
     async def on_mount(self):
         self.title = "DNIe Secure Messenger"
         
-        # 1. Cargar contactos guardados desde disco
         await self.load_saved_contacts()
         
-        # Configurar callbacks
+        # Configurar callbacks del protocolo
         self.proto.on_log = self.add_log
         self.proto.on_message = self.receive_message
         self.proto.on_handshake_success = self.on_new_peer_handshake
+        
+        # --- NUEVO: Callback de ACK ---
+        self.proto.on_ack_received = self.on_ack_received
+        
         self.discovery.on_found = self.add_peer
         self.discovery.on_log = self.add_log 
         
         self.query_one("#chat_box", RichLog).write("Selecciona un contacto para chatear.")
         self.add_log(f"System initializing for {self.user_id}...")
         
-        # Iniciar servicio de descubrimiento
         username = f"User-{self.user_id}"
         await self.discovery.start(username, bind_ip=self.bind_ip)
         
-        # Iniciar temporizador para comprobar estado Online/Offline cada 5 segundos
         self.set_interval(5.0, self.check_peer_status)
 
     async def load_saved_contacts(self):
-        """Carga contactos del JSON y los añade a la lista como Offline inicialmente."""
         contacts = await self.storage.get_all_contacts()
         lst = self.query_one("#contact_list", ListView)
         
@@ -215,10 +187,8 @@ class MessengerTUI(App):
             ip = c.get('ip')
             port = c.get('port')
             
-            # Filtro: Solo cargamos si existe un nombre real
             if uid and name:
                 self.known_names[uid] = name
-                # Comprobar duplicados antes de añadir (por seguridad)
                 exists = False
                 for child in lst.children:
                     if isinstance(child, ChatItem) and child.user_id == uid:
@@ -226,7 +196,6 @@ class MessengerTUI(App):
                         break
                 
                 if not exists:
-                    # Offline por defecto
                     item = ChatItem(uid, name, ip, port, verified=False, online=False)
                     lst.append(item)
                     loaded_count += 1
@@ -234,17 +203,12 @@ class MessengerTUI(App):
         self.add_log(f"📚 {loaded_count} Contactos verificados cargados.")
 
     def check_peer_status(self):
-        """
-        Se ejecuta periódicamente.
-        Comprueba si han pasado más de 20 segundos desde el último mDNS de cada peer.
-        """
         now = time.time()
         lst = self.query_one("#contact_list", ListView)
         
         for child in lst.children:
             if isinstance(child, ChatItem):
                 last_seen = self.peer_last_seen.get(child.user_id, 0)
-                # Si han pasado menos de 20s, está online. Si no, offline.
                 is_online = (now - last_seen) < 20.0
                 child.set_online_status(is_online)
 
@@ -276,16 +240,10 @@ class MessengerTUI(App):
         except: pass
 
     def add_peer(self, user_id, ip, port, props):
-        """
-        Llamado cuando el DiscoveryService recibe un mDNS packet.
-        """
-        # FILTRO: Ignorar paquetes mDNS que provienen de la loopback (127.0.0.1)
-        if ip == "127.0.0.1":
-            return
+        if ip == "127.0.0.1": return
         
         stable_id = user_id.strip()
 
-        # FILTRO DE REBOTE DE DESCONEXIÓN:
         if stable_id in self.recently_disconnected:
             if time.time() - self.recently_disconnected[stable_id] < 5.0:
                 return
@@ -301,12 +259,8 @@ class MessengerTUI(App):
         try:
             lst = self.query_one("#contact_list", ListView)
             
-            # --- MANEJO DE DESCONEXIÓN EXPLÍCITA (CUSTOM MDNS GOODBYE) ---
-            # Si el paquete mDNS trae 'stat=exit', es nuestra implementación custom de desconexión.
             if props.get('stat') == 'exit':
                 self.add_log(f"💤 Recibida señal de salida de {user_id} (Multicast)")
-                
-                # Buscar al usuario y ponerlo offline
                 target_child = None
                 for child in lst.children:
                     if isinstance(child, ChatItem) and child.user_id == user_id:
@@ -314,26 +268,19 @@ class MessengerTUI(App):
                         break
                 
                 if target_child:
-                    # Registrar desconexión para evitar rebotes
                     self.recently_disconnected[user_id] = time.time()
-                    self.peer_last_seen[user_id] = 0 # Forzar timeout inmediato
+                    self.peer_last_seen[user_id] = 0 
                     target_child.set_online_status(False)
                     
-                    # Log en el chat si está activo
                     disconnect_panel = Align(Panel(Text(f"{target_child.real_name or user_id} se ha desconectado (Global)."), style="dim white"), align="left")
                     key = f"{ip}:{port}"
                     self._save_history(key, disconnect_panel)
                     if self.current_chat_addr == (ip, port):
                         self.query_one("#chat_box", RichLog).write(disconnect_panel)
-                
-                # Detenemos el procesamiento, no registramos nada.
                 return
-            # -------------------------------------------------------------
 
             pub_hex = props.get('pub', '')
             
-            # --- 1. LLAMADA A STORAGE UNIFICADA ---
-            # Solo registramos si NO es una señal de salida
             if pub_hex:
                 try:
                     pub_bytes = bytes.fromhex(pub_hex)
@@ -341,7 +288,6 @@ class MessengerTUI(App):
                     asyncio.create_task(self.storage.register_contact(ip, port, pub_key, user_id=user_id, real_name=None))
                 except Exception: pass
 
-            # --- 2. ACTUALIZACIÓN VISUAL (UI) ---
             found_item = None
             for child in lst.children:
                 if isinstance(child, ChatItem) and child.user_id == user_id:
@@ -349,7 +295,6 @@ class MessengerTUI(App):
                     break
             
             if found_item:
-                # El usuario YA existe en la lista
                 was_offline = not found_item.online
 
                 if found_item.contact_ip != ip or found_item.contact_port != port:
@@ -404,7 +349,6 @@ class MessengerTUI(App):
         lst = self.query_one("#contact_list", ListView)
         found = False
         
-        # Buscar por IP/Puerto para el handshake inicial
         for child in lst.children:
             if isinstance(child, ChatItem) and child.contact_ip == addr[0] and child.contact_port == addr[1]:
                 child.set_verified_identity(real_name)
@@ -426,7 +370,6 @@ class MessengerTUI(App):
         self._refresh_chat_view(item)
 
     def _refresh_chat_view(self, item: ChatItem):
-        """Helper para renderizar el chat de un contacto específico."""
         chat_box = self.query_one("#chat_box", RichLog)
         chat_box.clear()
         
@@ -436,7 +379,6 @@ class MessengerTUI(App):
         
         chat_box.write(f"Chatting with {target_name} {status} - {conn_status}\n")
         
-        # Recuperamos historial usando la combinación IP:Port actual
         key = f"{item.contact_ip}:{item.contact_port}"
         if key in self.message_history:
             for msg in self.message_history[key]: chat_box.write(msg)
@@ -450,10 +392,8 @@ class MessengerTUI(App):
             self.add_log("⚠️ Select a contact first!")
             return
             
-        # --- VERIFICACIÓN DE ESTADO ONLINE ---
         target_item = None
         lst = self.query_one("#contact_list", ListView)
-        # Buscar el item seleccionado actualmente
         for child in lst.children:
             if isinstance(child, ChatItem) and child.contact_ip == self.current_chat_addr[0] and child.contact_port == self.current_chat_addr[1]:
                 target_item = child
@@ -466,7 +406,6 @@ class MessengerTUI(App):
         else:
              self.add_log("❌ Error: Contact not found in list context.")
              return
-        # --------------------------------------
 
         ta.text = "" 
         self.last_msg_content = text
@@ -475,7 +414,23 @@ class MessengerTUI(App):
         key = f"{self.current_chat_addr[0]}:{self.current_chat_addr[1]}"
         self._save_history(key, msg_panel)
         self.query_one("#chat_box", RichLog).write(msg_panel)
+        
+        # Enviamos y esperamos el ACK
         await self.proto.send_message(self.current_chat_addr, text)
+
+    def on_ack_received(self, addr, ack_id):
+        """Maneja la recepción de un ACK (Confirmación de entrega)"""
+        try: self.call_from_thread(self._handle_ack_safe, addr, ack_id)
+        except: self._handle_ack_safe(addr, ack_id)
+
+    def _handle_ack_safe(self, addr, ack_id):
+        # Si estamos en el chat de la persona que nos confirma, mostramos un tick
+        if self.current_chat_addr == addr:
+            self.query_one("#chat_box", RichLog).write(
+                Align(Text("✓ Entregado", style="bold green italic", justify="right"), align="right")
+            )
+        else:
+            self.add_log(f"✅ Message delivered to {addr} (ACK)")
 
     def receive_message(self, addr, msg):
         try: self.call_from_thread(self._receive_message_thread_safe, addr, msg)
@@ -496,17 +451,14 @@ class MessengerTUI(App):
                  target_child = child
                  break
         
-        # Si no lo conocemos y es solo un mensaje de desconexión, ignoramos.
         if not known and msg.get('disconnect'):
             return
 
         if not known: 
             self._add_peer_thread_safe(f"Peer_{ip}", ip, port, {})
-            # Recuperamos el child recién creado
             if lst.children:
                 target_child = lst.children[-1]
 
-        # --- LÓGICA DE DESCONEXIÓN (Mensaje cifrado UDP) ---
         if msg.get('disconnect') is True:
             if target_child:
                 self.peer_last_seen[target_child.user_id] = 0
@@ -521,14 +473,13 @@ class MessengerTUI(App):
                 if self.current_chat_addr == (ip, port):
                     self.query_one("#chat_box", RichLog).write(disconnect_panel)
             return
-        # -----------------------------
         
         if target_child:
             self.peer_last_seen[target_child.user_id] = time.time()
             target_child.set_online_status(True)
         
         text = msg.get('text', '')
-        if not text: return # Protección extra
+        if not text: return 
 
         ts = msg.get('timestamp')
         msg_panel = self._create_message_panel(text, peer_name, is_me=False, timestamp=ts)
@@ -541,9 +492,7 @@ class MessengerTUI(App):
     def _create_message_panel(self, text, title, is_me, timestamp=None):
         color = "green" if is_me else "yellow"
         
-        # Si recibimos un timestamp, lo formateamos y añadimos al título
         if timestamp:
-            # Formato: 14:30 (si quieres fecha completa usa "%d/%m/%Y %H:%M")
             ts_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
             title = f"{title} [{ts_str}]"
             
@@ -553,7 +502,7 @@ class MessengerTUI(App):
         if key not in self.message_history: self.message_history[key] = []
         self.message_history[key].append(item)
 
-# --- NUEVA APP DE LOGIN DNIe (MEJORADA) ---
+# --- NUEVA APP DE LOGIN DNIe ---
 
 class DNIeLoginApp(App):
     CSS = """
@@ -567,12 +516,9 @@ class DNIeLoginApp(App):
     }
     #title { text-align: center; color: $secondary; text-style: bold; margin-bottom: 2; }
     #status { text-align: center; color: $text-muted; margin-bottom: 1; }
-    
-    /* Estilos para el estado del lector */
     #card-status { text-align: center; margin-bottom: 2; text-style: bold; }
     .card-missing { color: $error; }
     .card-present { color: $success; }
-    
     #error-msg { text-align: center; color: $error; margin-top: 1; text-style: bold; display: none; }
     Input { margin-bottom: 2; }
     Button { width: 100%; }
@@ -583,51 +529,37 @@ class DNIeLoginApp(App):
         super().__init__()
         self.key_to_sign_bytes = key_to_sign_bytes
         self.return_data = None 
-        self.is_logging_in = False # Flag para evitar conflictos con el detector
+        self.is_logging_in = False 
 
     def compose(self) -> ComposeResult:
         with Container(classes="login-box"):
             yield Label("🔐 DNIe Identity Access", id="title")
-            
-            # Indicadores de estado de la tarjeta
             yield Label("Buscando lector...", id="card-status", classes="card-missing")
-            
             yield Label("Introduzca su PIN:", id="status")
             yield LoadingIndicator(id="loading")
-            
-            # Input y Botón desactivados por defecto hasta detectar tarjeta
             yield Input(placeholder="PIN del DNIe", password=True, id="pin", disabled=True)
             yield Button("Acceder", variant="primary", id="btn_login", disabled=True)
             yield Label("", id="error-msg")
 
     def on_mount(self):
-        # Iniciamos el detector en bucle (cada 1.5s)
         self.set_interval(1.5, self.check_card_presence)
-        # Check inicial inmediato
         self.check_card_presence()
 
     @work(thread=True)
     def check_card_presence(self):
-        # Si el usuario está intentando loguearse, no tocamos el lector
         if self.is_logging_in: return
-
         is_present = False
         try:
-            # Check rápido de conexión
             card = DNIeCard()
             if card.connect():
                 is_present = True
                 card.disconnect()
         except:
             is_present = False
-        
-        # Actualizar UI desde el hilo principal
         self.call_from_thread(self.update_card_ui, is_present)
 
     def update_card_ui(self, is_present: bool):
-        # Si el usuario ya pulsó login, ignoramos actualizaciones
         if self.is_logging_in: return
-
         lbl = self.query_one("#card-status", Label)
         btn = self.query_one("#btn_login", Button)
         inp = self.query_one("#pin", Input)
@@ -639,7 +571,7 @@ class DNIeLoginApp(App):
                 lbl.add_class("card-present")
                 btn.disabled = False
                 inp.disabled = False
-                if inp.value == "": inp.focus() # Auto-foco
+                if inp.value == "": inp.focus() 
         else:
             if "card-missing" not in lbl.classes:
                 lbl.update("❌ NO SE DETECTA DNIe")
@@ -662,9 +594,7 @@ class DNIeLoginApp(App):
             self.show_error("⚠️ El PIN no puede estar vacío.")
             return
         
-        self.is_logging_in = True # Bloqueamos el detector
-
-        # UI Update
+        self.is_logging_in = True 
         self.query_one("#btn_login", Button).disabled = True
         self.query_one("#pin", Input).disabled = True
         self.query_one("#loading", LoadingIndicator).display = True
@@ -678,13 +608,10 @@ class DNIeLoginApp(App):
         try:
             card = DNIeCard()
             self.call_from_thread(lambda: self.query_one("#status", Label).update("Autenticando PIN..."))
-            
             card.connect()
             card.authenticate(pin)
-            
             self.call_from_thread(lambda: self.query_one("#status", Label).update("Leyendo certificado..."))
             cert_der = card.get_certificate()
-            
             self.call_from_thread(lambda: self.query_one("#status", Label).update("Firmando identidad de red..."))
             signature = card.sign_data(self.key_to_sign_bytes)
             
@@ -704,19 +631,15 @@ class DNIeLoginApp(App):
         self.exit(result=self.return_data)
 
     def show_error(self, msg):
-        self.is_logging_in = False # Reactivamos el detector
-
+        self.is_logging_in = False
         self.query_one("#loading", LoadingIndicator).display = False
         self.query_one("#status", Label).update("Introduzca su PIN:")
-        
         btn = self.query_one("#btn_login", Button)
         btn.disabled = False
-        
         inp = self.query_one("#pin", Input)
         inp.disabled = False
         inp.value = ""
         inp.focus()
-        
         err_lbl = self.query_one("#error-msg", Label)
         err_lbl.update(msg)
         err_lbl.display = True

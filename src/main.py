@@ -6,7 +6,6 @@ from network import UDPProtocol, SessionManager, DiscoveryService
 from storage import Storage
 from tui import MessengerTUI, DNIeLoginApp
 from cryptography.hazmat.primitives import serialization
-# Importamos librería para generación de claves en memoria
 from cryptography.hazmat.primitives.asymmetric import x25519
 
 # Configuración estándar de argumentos
@@ -32,11 +31,10 @@ async def main_async(dnie_identity_data):
     storage = Storage(data_dir=args.data)
     await storage.init()
     
-    # Ya no cargamos la clave del disco. Usamos la que viene de memoria.
-    
     sessions = SessionManager(local_static_key, storage, local_proofs=proofs)
-    # Callback de log simple para la consola
-    proto = UDPProtocol(sessions, lambda a,m: None, lambda t: print(f"LOG: {t}"))
+    
+    # Callback de log simple para la consola (La TUI sobrescribirá el on_ack_received)
+    proto = UDPProtocol(sessions, lambda a,m: None, lambda t: print(f"LOG: {t}"), on_ack_received=None)
     
     loop = asyncio.get_running_loop()
     transport = None
@@ -83,7 +81,6 @@ def perform_dnie_binding_gui():
     """Realiza el binding usando la interfaz gráfica Textual (Login)"""
     
     # 1. Generamos la clave estática EN MEMORIA (Efímera, solo dura lo que el proceso)
-    # No se guarda en disco en ningún momento.
     print("✨ Generating ephemeral identity key in memory...")
     key_priv = x25519.X25519PrivateKey.generate()
 
@@ -98,12 +95,9 @@ def perform_dnie_binding_gui():
 
     # 2. Lanzar la App de Login dedicada
     login_app = DNIeLoginApp(key_to_sign_bytes=key_pub_bytes)
-    result = login_app.run() # Bloquea hasta que la App se cierra (exit)
+    result = login_app.run() 
     
-    # 3. Procesar resultado del login
     if result:
-        # result es (user_id, proofs)
-        # Devolvemos también la clave privada en memoria para que la use main_async
         return (result[0], result[1], key_priv)
     else:
         print("Login cancelado por el usuario.")

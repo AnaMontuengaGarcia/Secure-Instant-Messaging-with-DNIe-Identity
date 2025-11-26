@@ -8,6 +8,7 @@ import re
 import os
 import netifaces
 import secrets
+import uuid
 from datetime import datetime, timezone
 from zeroconf import ServiceInfo, IPVersion, Zeroconf, InterfaceChoice, DNSIncoming
 from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
@@ -156,11 +157,12 @@ class SessionManager:
         return session
 
 class UDPProtocol(asyncio.DatagramProtocol):
-    def __init__(self, session_manager, on_message_received, on_log, on_handshake_success=None):
+    def __init__(self, session_manager, on_message_received, on_log, on_handshake_success=None, on_ack_received=None):
         self.sessions = session_manager
         self.on_message = on_message_received
         self.on_log = on_log
         self.on_handshake_success = on_handshake_success
+        self.on_ack_received = on_ack_received # Callback para confirmar entregas
         self.transport = None
         self.pending_messages = {}
 
@@ -248,9 +250,41 @@ class UDPProtocol(asyncio.DatagramProtocol):
         try:
             plaintext = session.decrypt_message(data)
             msg_struct = json.loads(plaintext.decode('utf-8'))
+
+            # --- LOGICA ACK Y MENSAJES ---
+            
+            # 1. Si recibimos un ACK (Confirmación de recepción)
+            if 'ack_id' in msg_struct:
+                if self.on_ack_received:
+                    self.on_ack_received(addr, msg_struct['ack_id'])
+                return # No procesamos como mensaje de texto
+
+            # 2. Si recibimos un mensaje normal
+            # Enviamos ACK automáticamente si tiene ID
+            if 'id' in msg_struct and not msg_struct.get('disconnect'):
+                asyncio.create_task(self.send_ack(addr, msg_struct['id']))
+
+            # Entregamos mensaje a la App
             self.on_message(addr, msg_struct)
+            
         except Exception as e:
             self.on_log(f"❌ Decryption failed: {e}")
+
+    async def send_ack(self, addr, msg_id):
+        """Envía un paquete interno de confirmación (ACK)."""
+        session = self.sessions.get_session(addr)
+        if not session or not session.encryptor: return
+        
+        try:
+            ack_payload = {
+                "timestamp": time.time(),
+                "ack_id": msg_id
+            }
+            json_bytes = json.dumps(ack_payload).encode('utf-8')
+            ciphertext = session.encrypt_message(json_bytes)
+            self.transport.sendto(b'\x03' + ciphertext, addr)
+        except Exception as e:
+            self.on_log(f"❌ Failed to send ACK: {e}")
 
     def _queue_message(self, addr, content):
         if addr not in self.pending_messages:
@@ -261,7 +295,6 @@ class UDPProtocol(asyncio.DatagramProtocol):
     async def broadcast_disconnect(self):
         """Envía un mensaje de desconexión cifrado a todas las sesiones activas."""
         self.on_log("📡 Sending encrypted disconnect to active chats...")
-        # Copia de las claves para iteración segura
         active_addresses = list(self.sessions.sessions.keys())
         
         tasks = []
@@ -297,8 +330,10 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 self._queue_message(addr, content)
             return
 
+        # Generar ID único para el mensaje
+        msg_id = str(uuid.uuid4())
+
         try:
-            # Construcción del payload: Texto normal o señal de desconexión
             if is_disconnect:
                 msg_struct = {
                     "timestamp": time.time(),
@@ -306,6 +341,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 }
             else:
                 msg_struct = {
+                    "id": msg_id, # ID para ACK
                     "timestamp": time.time(), 
                     "text": content
                 }
@@ -313,8 +349,12 @@ class UDPProtocol(asyncio.DatagramProtocol):
             payload = json.dumps(msg_struct).encode('utf-8')
             ciphertext = session.encrypt_message(payload)
             self.transport.sendto(b'\x03' + ciphertext, addr)
+            
+            return msg_id # Retornamos ID para seguimiento
+            
         except Exception as e:
             self.on_log(f"❌ Send failed: {e}")
+            return None
 
 class RawSniffer(asyncio.DatagramProtocol):
     def __init__(self, service):
@@ -388,12 +428,9 @@ class RawSniffer(asyncio.DatagramProtocol):
                 props = {'user': user_id_from_net}
                 
                 # --- DETECCIÓN DE MENSAJE DE SALIDA CUSTOM (stat=exit) ---
-                # Esta es nuestra "propia implementación" de mDNS goodbye.
-                # Si encontramos 'stat=exit' en los bytes crudos, es una desconexión explícita.
                 is_exit_msg = re.search(rb'stat=exit', data)
                 if is_exit_msg:
                     props['stat'] = 'exit'
-                    # Pasamos directamente al callback, no necesitamos la clave pública para desconectar
                     self.service.on_found(user_id_from_net, addr[0], port, props)
                     return
                 # ---------------------------------------------------------
@@ -476,38 +513,23 @@ class DiscoveryService:
         self._polling_task = asyncio.create_task(self._active_polling_loop())
 
     def broadcast_exit(self):
-        """
-        Envía un paquete UDP crudo al grupo multicast mDNS (224.0.0.251:5353)
-        que contiene una estructura reconocible por nuestro sniffer con la flag 'stat=exit'.
-        Esto fuerza a todos los clientes (incluso los que no tienen sesión activa)
-        a marcarnos como Offline inmediatamente.
-        """
+        """Envía paquete custom de salida"""
         if not self.sniffer_transport: return
-        
         try:
-            # Construimos un paquete "Fake mDNS" que satisface las regex del RawSniffer
-            # Contiene: _dni-im, User-{id}_{port} y el payload personalizado stat=exit
-            # Rellenamos con nulos al principio para simular cabecera DNS
-            
             fake_payload = (
-                b'\x00' * 12 +     # Cabecera DNS falsa
-                b'_dni-im' +       # Protocolo
-                f'User-{self.unique_instance_id}_{self.port}'.encode('utf-8') + # Identificador
-                b'\x00fake\x00' +  # Relleno
-                b'stat=exit'       # Nuestra flag personalizada de desconexión
+                b'\x00' * 12 +     
+                b'_dni-im' +       
+                f'User-{self.unique_instance_id}_{self.port}'.encode('utf-8') + 
+                b'\x00fake\x00' +  
+                b'stat=exit'       
             )
-            
-            # Enviar al grupo multicast
             self.sniffer_transport.sendto(fake_payload, ('224.0.0.251', 5353))
             self.on_log("📡 Broadcasted custom 'stat=exit' mDNS packet.")
-            
         except Exception as e:
             print(f"Error broadcasting exit: {e}")
 
     async def stop(self):
-        # 1. Enviar nuestra señal de desconexión personalizada
         self.broadcast_exit()
-        
         if hasattr(self, '_polling_task'): self._polling_task.cancel()
         if self.sniffer_transport: self.sniffer_transport.close()
         if hasattr(self, 'info') and hasattr(self, 'aiozc'): 
@@ -515,7 +537,6 @@ class DiscoveryService:
         if hasattr(self, 'aiozc'): await self.aiozc.async_close()
 
     def refresh(self):
-        """Envía una consulta mDNS manual para redescubrir peers."""
         if self.sniffer_transport:
              try: self.sniffer_transport.sendto(RAW_MDNS_QUERY, ('224.0.0.251', 5353))
              except: pass
