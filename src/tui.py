@@ -470,7 +470,8 @@ class MessengerTUI(App):
 
         ta.text = "" 
         self.last_msg_content = text
-        msg_panel = self._create_message_panel(text, "You", is_me=True)
+        now_ts = time.time()
+        msg_panel = self._create_message_panel(text, "You", is_me=True, timestamp=now_ts)
         key = f"{self.current_chat_addr[0]}:{self.current_chat_addr[1]}"
         self._save_history(key, msg_panel)
         self.query_one("#chat_box", RichLog).write(msg_panel)
@@ -529,7 +530,8 @@ class MessengerTUI(App):
         text = msg.get('text', '')
         if not text: return # Protección extra
 
-        msg_panel = self._create_message_panel(text, peer_name, is_me=False)
+        ts = msg.get('timestamp')
+        msg_panel = self._create_message_panel(text, peer_name, is_me=False, timestamp=ts)
         key = f"{ip}:{port}"
         self._save_history(key, msg_panel)
         curr_ip = self.current_chat_addr[0] if self.current_chat_addr else None
