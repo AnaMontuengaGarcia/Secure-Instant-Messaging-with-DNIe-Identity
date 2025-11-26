@@ -2,7 +2,6 @@ import json
 import os
 import asyncio
 from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives import serialization
 
 class Storage:
     def __init__(self, data_dir="data"):
@@ -27,20 +26,21 @@ class Storage:
             if not os.path.exists(self.contacts_file):
                 await self._write_json(self.contacts_file, [])
             if not os.path.exists(self.messages_file):
-                await self._write_json(self.messages_file, [])
+                # Estructura base: Diccionario donde Key=UserID, Value=Lista de mensajes
+                await self._write_json(self.messages_file, {})
 
     async def _read_json(self, filepath):
-        """Lee JSON de forma asíncrona (en un hilo separado)"""
+        """Lee JSON de forma asíncrona"""
         if not os.path.exists(filepath):
-            return []
+            return [] if "contacts" in filepath else {}
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
-            return []
+            return [] if "contacts" in filepath else {}
 
     async def _write_json(self, filepath, data):
-        """Escribe JSON de forma asíncrona (en un hilo separado)"""
+        """Escribe JSON de forma asíncrona"""
         def write():
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -57,13 +57,12 @@ class Storage:
         - La Clave Pública se guarda SOLO EN MEMORIA.
         - Metadatos (IP, Nombre, ID) se guardan en DISCO (JSON).
         """
-        
         # 1. Guardar clave en memoria (RAM)
         self.ephemeral_keys[(ip, port)] = pubkey_obj
         
         # 2. Guardar metadatos en disco
         async with self.lock:
-            contacts = await asyncio.to_thread(self._read_sync, self.contacts_file)
+            contacts = await asyncio.to_thread(self._read_sync, self.contacts_file, default=[])
             
             # Buscar si ya existe
             found_idx = -1
@@ -92,7 +91,7 @@ class Storage:
                 
                 if real_name and c.get('real_name') != real_name:
                     c['real_name'] = real_name
-                    print(f"DB: Identity Verified for {ip}:{port} -> {real_name}")
+                    # print(f"DB: Identity Verified for {ip}:{port} -> {real_name}")
                     updated = True
                     
                 if updated:
@@ -111,32 +110,60 @@ class Storage:
                 print(f"DB: New contact {ip}:{port} metadata saved.")
 
     async def get_pubkey_by_addr(self, ip, port):
-        """
-        Recupera la clave pública desde la MEMORIA RAM.
-        Si se reinició el programa, esto devolverá None hasta que se redescubra al usuario (mDNS).
-        """
+        """Recupera la clave pública desde la MEMORIA RAM."""
         return self.ephemeral_keys.get((ip, port))
 
-    async def log_msg(self, ip, port, direction, text):
-        import time
+    # --- NUEVAS FUNCIONES DE PERSISTENCIA DE MENSAJES ---
+
+    async def save_chat_message(self, user_id, direction, text, timestamp):
+        """
+        Guarda un mensaje en el historial del usuario especificado.
+        user_id: ID único del interlocutor (DNIe hash).
+        direction: "in" (recibido) o "out" (enviado).
+        """
+        if not user_id: return
+
         msg_entry = {
-            "contact_ip": ip,
-            "contact_port": port,
             "direction": direction,
             "content": text,
-            "timestamp": time.time()
+            "timestamp": timestamp
         }
-        
-        async with self.lock:
-            messages = await asyncio.to_thread(self._read_sync, self.messages_file)
-            messages.append(msg_entry)
-            if len(messages) > 1000:
-                messages = messages[-1000:]
-            await self._write_json(self.messages_file, messages)
 
-    def _read_sync(self, filepath):
-        if not os.path.exists(filepath): return []
+        async with self.lock:
+            # Leemos el diccionario completo de mensajes
+            all_chats = await asyncio.to_thread(self._read_sync, self.messages_file, default={})
+            
+            # Si no existe historial para este usuario, lo creamos
+            if user_id not in all_chats:
+                all_chats[user_id] = []
+            
+            # Añadimos el mensaje
+            all_chats[user_id].append(msg_entry)
+            
+            # Ordenamos por timestamp para asegurar consistencia
+            all_chats[user_id].sort(key=lambda x: x['timestamp'])
+            
+            # Opcional: Limitar historial por usuario (ej. 5000 mensajes)
+            if len(all_chats[user_id]) > 5000:
+                all_chats[user_id] = all_chats[user_id][-5000:]
+            
+            await self._write_json(self.messages_file, all_chats)
+
+    async def get_chat_history(self, user_id):
+        """Recupera el historial de conversación con un usuario específico."""
+        if not user_id: return []
+        
+        # No usamos lock aquí para lectura rápida, confiamos en atomicidad básica de lectura de archivo
+        all_chats = await self._read_json(self.messages_file)
+        return all_chats.get(user_id, [])
+
+    # ----------------------------------------------------
+
+    def _read_sync(self, filepath, default=None):
+        """Lectura síncrona auxiliar para usar dentro de hilos"""
+        if default is None: default = []
+        if not os.path.exists(filepath): return default
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except: return []
+        except: return default

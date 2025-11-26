@@ -9,7 +9,7 @@ import os
 import netifaces
 import secrets
 import uuid
-import hashlib  # Importamos hashlib para el cálculo del hash
+import hashlib
 from datetime import datetime, timezone
 from zeroconf import ServiceInfo, IPVersion, Zeroconf, InterfaceChoice, DNSIncoming
 from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
@@ -31,7 +31,7 @@ def load_trusted_cas():
     """Carga certificados CA de confianza desde el disco."""
     trusted_cas = []
     if not os.path.exists(TRUSTED_CERTS_DIR):
-        print(f"⚠️ Warning: '{TRUSTED_CERTS_DIR}' directory not found. No Chain of Trust verification possible.")
+        # print(f"⚠️ Warning: '{TRUSTED_CERTS_DIR}' directory not found. No Chain of Trust verification possible.")
         return []
     
     for filename in os.listdir(TRUSTED_CERTS_DIR):
@@ -84,7 +84,7 @@ def verify_peer_identity(x25519_pub_key, proofs):
         is_trusted = False
         
         if not GLOBAL_TRUST_STORE:
-             print("⚠️  SECURITY WARNING: No CA certificates found. Skipping Chain of Trust check.")
+             # print("⚠️  SECURITY WARNING: No CA certificates found. Skipping Chain of Trust check.")
              issuer_name = "UNTRUSTED/NO-STORE"
              is_trusted = True 
         else:
@@ -163,9 +163,9 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.on_message = on_message_received
         self.on_log = on_log
         self.on_handshake_success = on_handshake_success
-        self.on_ack_received = on_ack_received # Callback para confirmar entregas
+        self.on_ack_received = on_ack_received
         self.transport = None
-        self.pending_messages = {}
+        self.pending_messages = {} # Stores tuples: (msg_id, content)
 
     def connection_made(self, transport):
         self.transport = transport
@@ -238,8 +238,9 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 self.on_handshake_success(addr, session.rs_pub, real_name)
 
             if addr in self.pending_messages:
-                for content in self.pending_messages[addr]:
-                    asyncio.create_task(self.send_message(addr, content))
+                # Send all queued messages ensuring we use their original IDs
+                for msg_id, content in self.pending_messages[addr]:
+                    asyncio.create_task(self.send_message(addr, content, forced_msg_id=msg_id))
                 del self.pending_messages[addr]
 
         except Exception as e:
@@ -252,42 +253,31 @@ class UDPProtocol(asyncio.DatagramProtocol):
             plaintext = session.decrypt_message(data)
             msg_struct = json.loads(plaintext.decode('utf-8'))
 
-            # --- LOGICA ACK Y MENSAJES ---
-            
-            # 1. Si recibimos un ACK (Confirmación de recepción)
             if 'ack_id' in msg_struct:
                 if self.on_ack_received:
                     self.on_ack_received(addr, msg_struct['ack_id'])
-                return # No procesamos como mensaje de texto
+                return 
 
-            # 2. Si recibimos un mensaje normal
-            # --- INTEGRITY CHECK ---
             if 'text' in msg_struct and 'hash' in msg_struct:
                 content = msg_struct['text']
                 received_hash = msg_struct['hash']
-                # Recalcular hash localmente
                 local_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
                 
                 if local_hash == received_hash:
                     msg_struct['integrity'] = True
-                    # Optional logging to avoid spam
-                    # self.on_log(f"🛡️ Hash verified: {received_hash[:8]}...")
                 else:
                     msg_struct['integrity'] = False
                     self.on_log(f"🚨 INTEGRITY FAILURE: Recv Hash {received_hash[:8]}... != Calc {local_hash[:8]}...")
             
-            # Enviamos ACK automáticamente si tiene ID
             if 'id' in msg_struct and not msg_struct.get('disconnect'):
                 asyncio.create_task(self.send_ack(addr, msg_struct['id']))
 
-            # Entregamos mensaje a la App
             self.on_message(addr, msg_struct)
             
         except Exception as e:
             self.on_log(f"❌ Decryption failed: {e}")
 
     async def send_ack(self, addr, msg_id):
-        """Envía un paquete interno de confirmación (ACK)."""
         session = self.sessions.get_session(addr)
         if not session or not session.encryptor: return
         
@@ -302,53 +292,61 @@ class UDPProtocol(asyncio.DatagramProtocol):
         except Exception as e:
             self.on_log(f"❌ Failed to send ACK: {e}")
 
-    def _queue_message(self, addr, content):
+    def _queue_message(self, addr, msg_id, content):
         if addr not in self.pending_messages:
             self.pending_messages[addr] = []
-        self.pending_messages[addr].append(content)
-        self.on_log(f"⏳ Message queued...")
+        # Store tuple (msg_id, content) to preserve ID after handshake
+        self.pending_messages[addr].append((msg_id, content))
+        self.on_log(f"⏳ Message queued (waiting for handshake)...")
 
     async def broadcast_disconnect(self):
-        """Envía un mensaje de desconexión cifrado a todas las sesiones activas."""
         self.on_log("📡 Sending encrypted disconnect to active chats...")
         active_addresses = list(self.sessions.sessions.keys())
-        
         tasks = []
         for addr in active_addresses:
             tasks.append(self.send_message(addr, content=None, is_disconnect=True))
-        
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def send_message(self, addr, content, is_disconnect=False):
+    async def send_message(self, addr, content, is_disconnect=False, forced_msg_id=None):
+        """
+        Envía un mensaje. Si no hay sesión, inicia handshake y encola.
+        Returns: msg_id (str) si se envió o se encoló, None si hubo error.
+        """
         session = self.sessions.get_session(addr)
         
-        # Si nos estamos desconectando y no hay sesión, no la creamos ahora
         if not session and is_disconnect:
-            return
+            return None
+
+        # 1. Generar ID ahora (incluso antes de encolar)
+        msg_id = forced_msg_id if forced_msg_id else str(uuid.uuid4())
 
         if not session:
             remote_pub = await self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
                 self.on_log(f"❌ Cannot send: No public key for {addr}")
-                return
+                return None
             
+            # Start Handshake
             session = self.sessions.create_initiator_session(addr, remote_pub)
             hs_msg = session.create_handshake_message()
             self.transport.sendto(b'\x01' + hs_msg, addr)
             self.on_log(f"🔄 Initiating handshake with {addr}")
+            
             if content:
-                self._queue_message(addr, content)
-            return
+                # Encolar con el ID generado para rastrearlo
+                self._queue_message(addr, msg_id, content)
+            
+            # IMPORTANTE: Retornamos el msg_id aunque esté en cola, para que la TUI lo rastree
+            return msg_id
 
         if session.encryptor is None:
+            # Handshake en progreso pero no completo
             if content:
-                self._queue_message(addr, content)
-            return
+                self._queue_message(addr, msg_id, content)
+            return msg_id
 
-        # Generar ID único para el mensaje
-        msg_id = str(uuid.uuid4())
-
+        # Enviar mensaje cifrado
         try:
             if is_disconnect:
                 msg_struct = {
@@ -356,21 +354,19 @@ class UDPProtocol(asyncio.DatagramProtocol):
                     "disconnect": True
                 }
             else:
-                # Calcular Hash del mensaje
                 text_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
-                
                 msg_struct = {
-                    "id": msg_id, # ID para ACK
+                    "id": msg_id,
                     "timestamp": time.time(), 
                     "text": content,
-                    "hash": text_hash # Enviamos el hash para verificación
+                    "hash": text_hash
                 }
             
             payload = json.dumps(msg_struct).encode('utf-8')
             ciphertext = session.encrypt_message(payload)
             self.transport.sendto(b'\x03' + ciphertext, addr)
             
-            return msg_id # Retornamos ID para seguimiento
+            return msg_id 
             
         except Exception as e:
             self.on_log(f"❌ Send failed: {e}")
@@ -410,12 +406,10 @@ class RawSniffer(asyncio.DatagramProtocol):
         except Exception: pass
 
     def datagram_received(self, data, addr):
-        # Filtro básico: Debe contener el identificador del protocolo
         if b"_dni-im" not in data: return
         
         try:
             found_info = None
-            # 1. Intentar Regex simple para User-ID_Port
             try:
                 match = re.search(rb'User-([^_\x00]+)_(\d+)', data)
                 if match:
@@ -424,7 +418,6 @@ class RawSniffer(asyncio.DatagramProtocol):
                     found_info = (name, port)
             except: pass
 
-            # 2. Intentar parsing completo DNS si regex falla
             if not found_info:
                 try:
                     msg = DNSIncoming(data)
@@ -440,22 +433,16 @@ class RawSniffer(asyncio.DatagramProtocol):
 
             if found_info:
                 user_id_from_net, port = found_info
-                
-                # Ignorar paquetes propios
                 if user_id_from_net == self.service.unique_instance_id and port == self.service.port:
                     return
 
                 props = {'user': user_id_from_net}
-                
-                # --- DETECCIÓN DE MENSAJE DE SALIDA CUSTOM (stat=exit) ---
                 is_exit_msg = re.search(rb'stat=exit', data)
                 if is_exit_msg:
                     props['stat'] = 'exit'
                     self.service.on_found(user_id_from_net, addr[0], port, props)
                     return
-                # ---------------------------------------------------------
 
-                # Si NO es un mensaje de salida, exigimos la clave pública
                 try:
                     pub_match = re.search(rb'pub=([a-fA-F0-9]+)', data)
                     if pub_match:
@@ -463,10 +450,9 @@ class RawSniffer(asyncio.DatagramProtocol):
                         if len(pub_str) != 64: return 
                         props['pub'] = pub_str
                     else:
-                        return # Sin clave pública y sin stat=exit, ignoramos.
+                        return 
                 except: return
                 
-                # Intentar sacar usuario del TXT si existe
                 try:
                     user_match = re.search(rb'user=([^\x00]+)', data)
                     if user_match:
@@ -533,7 +519,6 @@ class DiscoveryService:
         self._polling_task = asyncio.create_task(self._active_polling_loop())
 
     def broadcast_exit(self):
-        """Envía paquete custom de salida"""
         if not self.sniffer_transport: return
         try:
             fake_payload = (

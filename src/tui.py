@@ -131,13 +131,14 @@ class MessengerTUI(App):
         self.user_id = user_id 
         self.bind_ip = bind_ip 
         self.current_chat_addr = None 
-        self.message_history = {}
-        self.last_msg_content = ""
+        
         self.log_buffer = []
         
         self.known_names = {} 
         self.peer_last_seen = {}
         self.recently_disconnected = {}
+        
+        self.pending_acks = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -157,12 +158,9 @@ class MessengerTUI(App):
         
         await self.load_saved_contacts()
         
-        # Configurar callbacks del protocolo
         self.proto.on_log = self.add_log
         self.proto.on_message = self.receive_message
         self.proto.on_handshake_success = self.on_new_peer_handshake
-        
-        # --- NUEVO: Callback de ACK ---
         self.proto.on_ack_received = self.on_ack_received
         
         self.discovery.on_found = self.add_peer
@@ -224,14 +222,14 @@ class MessengerTUI(App):
         self.discovery.refresh()
 
     def action_copy_last_message(self):
-        if self.last_msg_content:
-            try: pyperclip.copy(self.last_msg_content)
-            except: self.add_log("❌ Clipboard error")
+        pass
 
     def action_copy_logs(self):
         if self.log_buffer:
             try: pyperclip.copy("\n".join(self.log_buffer))
             except: pass
+
+    # --- CORRECCIÓN HILOS: Llamadas directas ya que estamos en asyncio loop ---
 
     def add_log(self, text):
         self.log_buffer.append(text)
@@ -241,21 +239,14 @@ class MessengerTUI(App):
 
     def add_peer(self, user_id, ip, port, props):
         if ip == "127.0.0.1": return
-        
         stable_id = user_id.strip()
-
         if stable_id in self.recently_disconnected:
-            if time.time() - self.recently_disconnected[stable_id] < 5.0:
-                return
-            else:
-                del self.recently_disconnected[stable_id]
-
+            if time.time() - self.recently_disconnected[stable_id] < 5.0: return
+            else: del self.recently_disconnected[stable_id]
         self.peer_last_seen[stable_id] = time.time()
-        
-        try: self.call_from_thread(self._add_peer_thread_safe, stable_id, ip, port, props)
-        except: self._add_peer_thread_safe(stable_id, ip, port, props)
+        self._add_peer_safe(stable_id, ip, port, props)
 
-    def _add_peer_thread_safe(self, user_id, ip, port, props):
+    def _add_peer_safe(self, user_id, ip, port, props):
         try:
             lst = self.query_one("#contact_list", ListView)
             
@@ -271,16 +262,12 @@ class MessengerTUI(App):
                     self.recently_disconnected[user_id] = time.time()
                     self.peer_last_seen[user_id] = 0 
                     target_child.set_online_status(False)
-                    
                     disconnect_panel = Align(Panel(Text(f"{target_child.real_name or user_id} se ha desconectado (Global)."), style="dim white"), align="left")
-                    key = f"{ip}:{port}"
-                    self._save_history(key, disconnect_panel)
                     if self.current_chat_addr == (ip, port):
                         self.query_one("#chat_box", RichLog).write(disconnect_panel)
                 return
 
             pub_hex = props.get('pub', '')
-            
             if pub_hex:
                 try:
                     pub_bytes = bytes.fromhex(pub_hex)
@@ -296,21 +283,14 @@ class MessengerTUI(App):
             
             if found_item:
                 was_offline = not found_item.online
-
                 if found_item.contact_ip != ip or found_item.contact_port != port:
                     old_addr = f"{found_item.contact_ip}:{found_item.contact_port}"
-                    new_addr = f"{ip}:{port}"
-                    self.add_log(f"🔄 Network Change: {user_id} moved {old_addr} -> {new_addr}")
                     found_item.update_address(ip, port)
-                    
                     if self.current_chat_addr and (self.current_chat_addr[0] == old_addr.split(':')[0]):
                         self.current_chat_addr = (ip, port)
-                        self._refresh_chat_view(found_item)
                         self.add_log("⚡ Active chat session rerouted to new IP.")
                     was_offline = True
-
                 found_item.set_online_status(True)
-                
                 if was_offline:
                     try:
                         addr_tuple = (ip, port)
@@ -319,75 +299,87 @@ class MessengerTUI(App):
                             self.add_log(f"🔄 Session reset for {found_item.real_name or user_id} (Reconnected)")
                     except Exception as e:
                         print(f"Error resetting session: {e}")
-
                 if not found_item.real_name:
                      display_name = self.known_names.get(user_id)
                      if display_name:
                          found_item.real_name = display_name
                          found_item.update_label()
-
             else:
                 display_name = self.known_names.get(user_id)
                 item = ChatItem(user_id, display_name, ip, port, verified=False, online=True)
                 lst.append(item)
-                
                 log_msg = f"🔎 Peer Found: {user_id}"
-                if display_name:
-                    log_msg += f" (Known as: {display_name})"
+                if display_name: log_msg += f" (Known as: {display_name})"
                 log_msg += f" @ {ip}"
                 self.add_log(log_msg)
-            
         except Exception as e: 
             self.add_log(f"Error updating UI peer: {e}")
 
     def on_new_peer_handshake(self, addr, pub_key, real_name=None):
-        try: self.call_from_thread(self._update_peer_identity_safe, addr, real_name)
-        except: self._update_peer_identity_safe(addr, real_name)
+        self._update_peer_identity_safe(addr, real_name)
 
     def _update_peer_identity_safe(self, addr, real_name):
         if not real_name: return
         lst = self.query_one("#contact_list", ListView)
         found = False
-        
         for child in lst.children:
             if isinstance(child, ChatItem) and child.contact_ip == addr[0] and child.contact_port == addr[1]:
                 child.set_verified_identity(real_name)
                 self.known_names[child.user_id] = real_name
                 found = True
-                
                 if self.current_chat_addr == (child.contact_ip, child.contact_port):
-                    self._refresh_chat_view(child)
+                    self.call_later(self._load_and_refresh_chat_history, child)
                 break
-        
         if not found:
-            self._add_peer_thread_safe(f"Unknown_{addr[0]}", addr[0], addr[1], {})
+            self._add_peer_safe(f"Unknown_{addr[0]}", addr[0], addr[1], {})
             self._update_peer_identity_safe(addr, real_name)
 
-    def on_list_view_selected(self, event: ListView.Selected):
+    async def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
         if not isinstance(item, ChatItem): return
         self.current_chat_addr = (item.contact_ip, item.contact_port)
-        self._refresh_chat_view(item)
+        await self._load_and_refresh_chat_history(item)
 
-    def _refresh_chat_view(self, item: ChatItem):
+    async def _load_and_refresh_chat_history(self, item: ChatItem):
         chat_box = self.query_one("#chat_box", RichLog)
         chat_box.clear()
-        
         target_name = item.real_name if item.real_name else item.user_id
         status = "(Verified)" if item.verified else "(Unverified)"
         conn_status = "[green]ONLINE[/]" if item.online else "[grey]OFFLINE[/]"
-        
         chat_box.write(f"Chatting with {target_name} {status} - {conn_status}\n")
+        chat_box.write(f"[dim]History from {item.user_id}[/]\n")
         
-        key = f"{item.contact_ip}:{item.contact_port}"
-        if key in self.message_history:
-            for msg in self.message_history[key]: chat_box.write(msg)
+        history = await self.storage.get_chat_history(item.user_id)
+        for msg in history:
+            text = msg.get('content')
+            ts = msg.get('timestamp')
+            direction = msg.get('direction')
+            is_me = (direction == "out")
+            sender_name = "You" if is_me else target_name
+            panel = self._create_message_panel(text, sender_name, is_me, timestamp=ts)
+            chat_box.write(panel)
+            
+        # --- FIX: Mostrar también mensajes pendientes de ACK ---
+        # Si se refresca la vista (ej. al completarse el handshake), estos mensajes
+        # aún no están en DB, así que debemos pintarlos manualmente para que no desaparezcan.
+        pending_list = [v for k, v in self.pending_acks.items() if v['user_id'] == item.user_id]
+        pending_list.sort(key=lambda x: x['timestamp'])
+
+        for p_data in pending_list:
+            panel = self._create_message_panel(
+                p_data['text'], 
+                "You", 
+                is_me=True, 
+                timestamp=p_data['timestamp']
+            )
+            chat_box.write(panel)
+            
+        chat_box.write("\n")
 
     async def submit_message(self):
         ta = self.query_one("#msg_input", ChatInput)
         text = ta.text.strip()
         if not text: return
-        
         if not self.current_chat_addr:
             self.add_log("⚠️ Select a contact first!")
             return
@@ -408,40 +400,51 @@ class MessengerTUI(App):
              return
 
         ta.text = "" 
-        self.last_msg_content = text
         now_ts = time.time()
+        
         msg_panel = self._create_message_panel(text, "You", is_me=True, timestamp=now_ts)
-        key = f"{self.current_chat_addr[0]}:{self.current_chat_addr[1]}"
-        self._save_history(key, msg_panel)
         self.query_one("#chat_box", RichLog).write(msg_panel)
         
-        # Enviamos y esperamos el ACK
-        await self.proto.send_message(self.current_chat_addr, text)
+        # Enviar (puede que encole si hay handshake, pero ahora devuelve ID siempre)
+        msg_id = await self.proto.send_message(self.current_chat_addr, text)
+        
+        if msg_id:
+            # Rastrear para ACK (tanto si se envió ya como si está en cola de handshake)
+            self.pending_acks[msg_id] = {
+                'text': text,
+                'timestamp': now_ts,
+                'user_id': target_item.user_id
+            }
+        else:
+            self.add_log("❌ Error fatal al enviar el paquete.")
 
     def on_ack_received(self, addr, ack_id):
-        """Maneja la recepción de un ACK (Confirmación de entrega)"""
-        try: self.call_from_thread(self._handle_ack_safe, addr, ack_id)
-        except: self._handle_ack_safe(addr, ack_id)
+        self._handle_ack_safe(addr, ack_id)
 
     def _handle_ack_safe(self, addr, ack_id):
-        # Si estamos en el chat de la persona que nos confirma, mostramos un tick
-        if self.current_chat_addr == addr:
-            self.query_one("#chat_box", RichLog).write(
-                Align(Text("✓ Entregado", style="bold green italic", justify="left"), align="left")
+        if ack_id in self.pending_acks:
+            data = self.pending_acks.pop(ack_id)
+            asyncio.create_task(
+                self.storage.save_chat_message(
+                    user_id=data['user_id'],
+                    direction="out",
+                    text=data['text'],
+                    timestamp=data['timestamp']
+                )
             )
-        else:
-            self.add_log(f"✅ Message delivered to {addr} (ACK)")
+            if self.current_chat_addr == addr:
+                self.query_one("#chat_box", RichLog).write(
+                    Align(Text("✓ Entregado (Saved to DB)", style="bold green italic", justify="left"), align="left")
+                )
 
     def receive_message(self, addr, msg):
-        try: self.call_from_thread(self._receive_message_thread_safe, addr, msg)
-        except: self._receive_message_thread_safe(addr, msg)
+        self._receive_message_safe(addr, msg)
 
-    def _receive_message_thread_safe(self, addr, msg):
+    def _receive_message_safe(self, addr, msg):
         ip, port = addr
         lst = self.query_one("#contact_list", ListView)
         known = False
         peer_name = f"Peer_{ip}"
-        
         target_child = None
 
         for child in lst.children:
@@ -451,13 +454,10 @@ class MessengerTUI(App):
                  target_child = child
                  break
         
-        if not known and msg.get('disconnect'):
-            return
-
+        if not known and msg.get('disconnect'): return
         if not known: 
-            self._add_peer_thread_safe(f"Peer_{ip}", ip, port, {})
-            if lst.children:
-                target_child = lst.children[-1]
+            self._add_peer_safe(f"Peer_{ip}", ip, port, {})
+            if lst.children: target_child = lst.children[-1]
 
         if msg.get('disconnect') is True:
             if target_child:
@@ -465,11 +465,7 @@ class MessengerTUI(App):
                 self.recently_disconnected[target_child.user_id] = time.time()
                 target_child.set_online_status(False)
                 self.add_log(f"💤 {peer_name} has disconnected (Graceful exit).")
-                
                 disconnect_panel = Align(Panel(Text(f"{peer_name} se ha desconectado."), style="dim white"), align="left")
-                key = f"{ip}:{port}"
-                self._save_history(key, disconnect_panel)
-                
                 if self.current_chat_addr == (ip, port):
                     self.query_one("#chat_box", RichLog).write(disconnect_panel)
             return
@@ -481,32 +477,36 @@ class MessengerTUI(App):
         text = msg.get('text', '')
         if not text: return 
 
-        # --- VALIDACIÓN VISUAL DE INTEGRIDAD ---
         integrity = msg.get('integrity', None)
         if integrity is False:
              text = f"[bold red blink]⚠️ MENSAJE CORRUPTO (HASH MISMATCH):[/]\n{text}"
-        # ---------------------------------------
 
         ts = msg.get('timestamp')
+        
+        if target_child:
+            asyncio.create_task(
+                self.storage.save_chat_message(
+                    user_id=target_child.user_id,
+                    direction="in",
+                    text=text,
+                    timestamp=ts
+                )
+            )
+
         msg_panel = self._create_message_panel(text, peer_name, is_me=False, timestamp=ts)
-        key = f"{ip}:{port}"
-        self._save_history(key, msg_panel)
         curr_ip = self.current_chat_addr[0] if self.current_chat_addr else None
-        if curr_ip == ip: self.query_one("#chat_box", RichLog).write(msg_panel)
-        else: self.add_log(f"📨 New message from {peer_name}")
+        
+        if curr_ip == ip: 
+            self.query_one("#chat_box", RichLog).write(msg_panel)
+        else: 
+            self.add_log(f"📨 New message from {peer_name}")
 
     def _create_message_panel(self, text, title, is_me, timestamp=None):
         color = "green" if is_me else "yellow"
-        
         if timestamp:
             ts_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
             title = f"{title} [{ts_str}]"
-            
         return Align(Panel(Text(text), title=title, title_align="left", border_style=color, box=box.ROUNDED, padding=(0, 1), expand=False), align="left")
-
-    def _save_history(self, key, item):
-        if key not in self.message_history: self.message_history[key] = []
-        self.message_history[key].append(item)
 
 # --- NUEVA APP DE LOGIN DNIe ---
 

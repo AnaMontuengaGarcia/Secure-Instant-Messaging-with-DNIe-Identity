@@ -28,3 +28,5 @@ build/
 *.json
 
 networkcorrupted.py
+
+src/certs
