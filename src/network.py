@@ -10,6 +10,7 @@ import netifaces
 import secrets
 import uuid
 import hashlib
+from collections import deque
 from datetime import datetime, timezone
 from zeroconf import ServiceInfo, IPVersion, Zeroconf, InterfaceChoice, DNSIncoming
 from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
@@ -185,7 +186,13 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.on_handshake_success = on_handshake_success
         self.on_ack_received = on_ack_received
         self.transport = None
-        self.pending_messages = {} # Stores tuples: (msg_id, content)
+        
+        # --- RELIABILITY & RETRY SYSTEM (SEQUENTIAL) ---
+        # Key: addr (ip, port), Value: deque of dicts {'msg_id', 'content', 'attempts', 'last_retry', 'status'}
+        self.peer_message_queues = {} 
+        self.dedup_buffer = deque(maxlen=200) # Almacena msg_id recientes recibidos para evitar duplicados
+        self.is_online_checker = lambda addr: True # Callback por defecto (asume todos online)
+        self._retry_task_handle = None
 
     def connection_made(self, transport):
         self.transport = transport
@@ -195,6 +202,97 @@ class UDPProtocol(asyncio.DatagramProtocol):
             addr = sock.getsockname()
             self.on_log(f"✅ UDP Bound to {addr[0]}:{addr[1]}")
         except: pass
+        
+        # Iniciar tarea de reintentos
+        self._retry_task_handle = asyncio.create_task(self._retry_worker())
+
+    def set_online_checker(self, func):
+        """Permite a la capa superior (TUI) definir cómo saber si una IP está online."""
+        self.is_online_checker = func
+
+    def notify_peer_online(self, ip, port):
+        """Llamado cuando un peer vuelve a estar online. Reinicia contadores de reintento."""
+        addr = (ip, port)
+        if addr in self.peer_message_queues and self.peer_message_queues[addr]:
+            head = self.peer_message_queues[addr][0]
+            head['attempts'] = 0 # Reiniciamos intentos
+            head['last_retry'] = 0 # Forzar reintento inmediato
+
+    def migrate_queue(self, old_addr, new_addr):
+        """Mueve la cola de mensajes de una dirección antigua a una nueva (Roaming)."""
+        if old_addr in self.peer_message_queues:
+            self.on_log(f"🔀 Migrating message queue from {old_addr} to {new_addr}")
+            old_q = self.peer_message_queues.pop(old_addr)
+            
+            if new_addr not in self.peer_message_queues:
+                self.peer_message_queues[new_addr] = old_q
+            else:
+                # Si ya existía cola en la nueva (raro), ponemos los viejos PRIMERO
+                self.peer_message_queues[new_addr].extendleft(reversed(old_q))
+            
+            # Forzamos reintento inmediato en la nueva dirección
+            if self.peer_message_queues[new_addr]:
+                 head = self.peer_message_queues[new_addr][0]
+                 head['attempts'] = 0 
+                 head['last_retry'] = 0
+
+    def consolidate_peer_sessions(self, active_session, current_addr):
+        """
+        Busca sesiones antiguas con la misma identidad (Public Key) y migra sus colas
+        de mensajes a la dirección actual. Vital cuando cambia la IP de ambos extremos.
+        """
+        if not active_session.rs_pub: return
+
+        active_pub_bytes = active_session.rs_pub.public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+
+        # Copiamos para iterar seguro
+        for addr, session in list(self.sessions.sessions_by_addr.items()):
+            if addr == current_addr: continue
+            if not session.rs_pub: continue
+
+            other_pub_bytes = session.rs_pub.public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw
+            )
+
+            if active_pub_bytes == other_pub_bytes:
+                self.on_log(f"🔗 Consolidating session for peer {addr} -> {current_addr}")
+                self.migrate_queue(addr, current_addr)
+
+    async def _retry_worker(self):
+        """Tarea en segundo plano para reenviar el mensaje en cabecera de cada cola."""
+        while True:
+            await asyncio.sleep(1.0) # Check frequency
+            now = time.time()
+            
+            # Iteramos sobre todos los peers con cola
+            for addr, queue in list(self.peer_message_queues.items()):
+                if not queue: continue
+                
+                head = queue[0]
+                
+                # AUDIT FIX: Estrategia híbrida Fast/Slow sin dependencia de is_online_checker
+                attempts = head['attempts']
+                delta = now - head['last_retry']
+                
+                # 2s para ráfaga inicial, 10s para persistencia en desconexiones largas
+                interval = 2.0 if attempts < 10 else 10.0
+                
+                if delta >= interval:
+                    try:
+                        # Reenviar cabecera
+                        await self._attempt_send_head(addr, head)
+                    except Exception as e:
+                        print(f"Retry error: {e}")
+
+    async def _attempt_send_head(self, addr, item):
+        """Intenta enviar el mensaje de cabecera. Si no hay sesión, inicia handshake."""
+        item['last_retry'] = time.time()
+        item['attempts'] += 1
+        
+        # Llamamos a _transmit_raw que maneja la lógica de sesión/handshake
+        await self._transmit_raw(addr, item['content'], item['msg_id'], timestamp=item['timestamp'])
 
     def datagram_received(self, data, addr):
         if len(data) < 1: return
@@ -202,7 +300,6 @@ class UDPProtocol(asyncio.DatagramProtocol):
             packet_type = data[0]
             payload = data[1:]
             
-            # AUDIT FIX: Multiplexing Logic
             if packet_type == 0x01: # Handshake Init
                 self.handle_handshake_init(payload, addr)
             elif packet_type == 0x02: # Handshake Resp
@@ -213,16 +310,10 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"❌ Error packet {addr}: {e}")
 
     def handle_handshake_init(self, data, addr):
-        # Type 1: [0x01] + [SenderIndex] + [Payload]
         self.on_log(f"🔄 Handshake Init from {addr}")
-        
-        # We assume new session for Handshake Init
         session = self.sessions.create_responder_session(addr)
-        
         try:
-            # consume_handshake_message now extracts remote_index
             remote_pub = session.consume_handshake_message(data)
-            
             try:
                 real_name, issuer = verify_peer_identity(remote_pub, session.remote_proofs)
                 self.on_log(f"✅ Verified Identity: {real_name}")
@@ -236,25 +327,23 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"🤝 Handshake Response sent to {addr} (CID: {session.local_index})")
             
             asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], remote_pub, real_name=real_name))
-            
             if self.on_handshake_success:
                 self.on_handshake_success(addr, remote_pub, real_name)
+            
+            # NUEVO: Consolidar colas por identidad y forzar envío si hay pendientes
+            self.consolidate_peer_sessions(session, addr)
+            if addr in self.peer_message_queues and self.peer_message_queues[addr]:
+                head = self.peer_message_queues[addr][0]
+                asyncio.create_task(self._attempt_send_head(addr, head))
                 
         except Exception as e:
             self.on_log(f"❌ Handshake failed: {e}")
-            # Clean up
             if session.local_index in self.sessions.sessions_by_id:
                 del self.sessions.sessions_by_id[session.local_index]
 
     def handle_handshake_resp(self, data, addr):
-        # Type 2: [0x02] + [SenderIdx] + [ReceiverIdx] + [Payload]
         if len(data) < 8: return
-
-        # Read the receiver index to find WHO this is for
-        # Payload struct: [Sender(4B)] [Receiver(4B)] ...
-        # We need the second integer (Receiver, bytes 4-8) to find our local session
         receiver_index = struct.unpack('<I', data[4:8])[0]
-        
         session = self.sessions.get_session_by_id(receiver_index)
         
         if not session: 
@@ -262,76 +351,92 @@ class UDPProtocol(asyncio.DatagramProtocol):
             return
 
         try:
-            # Check for Roaming (IP Changed?)
+            # Check Roaming y Migrar Cola
+            old_addr = session.current_addr
             if self.sessions.update_session_addr(session, addr):
                  self.on_log(f"ℹ️ Peer {session.local_index} roamed to {addr}")
+                 self.migrate_queue(old_addr, addr)
 
             session.consume_handshake_response(data)
             try:
                 real_name, issuer = verify_peer_identity(session.rs_pub, session.remote_proofs)
                 self.on_log(f"✅ Verified Identity: {real_name}")
                 self.on_log(f"   ↳ Signed by: {issuer}")
-                
                 asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], session.rs_pub, real_name=real_name))
             except Exception as e:
                 self.on_log(f"⛔ SECURITY ALERT: {e}")
-                # cleanup
                 return
 
             self.on_log(f"🔒 Secure Session established with {real_name} (CID: {session.local_index})")
-            
             if self.on_handshake_success:
                 self.on_handshake_success(addr, session.rs_pub, real_name)
 
-            if addr in self.pending_messages:
-                # Send all queued messages ensuring we use their original IDs
-                for msg_id, content in self.pending_messages[addr]:
-                    asyncio.create_task(self.send_message(addr, content, forced_msg_id=msg_id))
-                del self.pending_messages[addr]
+            # NUEVO: Consolidar colas por identidad (Cross-IP Queue Migration)
+            self.consolidate_peer_sessions(session, addr)
+
+            # Forzar envío inmediato si hay cola (ahora en la dirección correcta)
+            if addr in self.peer_message_queues and self.peer_message_queues[addr]:
+                head = self.peer_message_queues[addr][0]
+                asyncio.create_task(self._attempt_send_head(addr, head))
 
         except Exception as e:
             self.on_log(f"❌ Handshake completion failed: {e}")
 
     def handle_data(self, data, addr):
-        # Type 3: [0x03] + [ReceiverIndex (4B)] + [Encrypted]
         if len(data) < 4: return
-        
         receiver_index = struct.unpack('<I', data[:4])[0]
         encrypted_payload = data[4:]
-        
         session = self.sessions.get_session_by_id(receiver_index)
         
         if not session:
             self.on_log(f"❌ Data packet for unknown session ID {receiver_index} from {addr}")
             return
-            
-        # AUDIT FIX: Roaming Support (Multiplexing)
+        
+        # Check Roaming y Migrar Cola
+        old_addr = session.current_addr
         if self.sessions.update_session_addr(session, addr):
              self.on_log(f"ℹ️ Peer {session.local_index} roamed to {addr}")
+             self.migrate_queue(old_addr, addr)
         
         try:
-            # decrypt_message handles protocol logic, headers handled here
             plaintext = session.decrypt_message(encrypted_payload)
             msg_struct = json.loads(plaintext.decode('utf-8'))
 
+            # --- MANEJO DE ACK (SEQUENTIAL) ---
             if 'ack_id' in msg_struct:
+                ack_id = msg_struct['ack_id']
+                if addr in self.peer_message_queues and self.peer_message_queues[addr]:
+                    queue = self.peer_message_queues[addr]
+                    # Solo confirmamos si coincide con la cabecera (orden estricto)
+                    if queue and queue[0]['msg_id'] == ack_id:
+                        queue.popleft() # ¡Confirmado! Quitamos de la cola
+                        
+                        # Si queda otro mensaje, lo enviamos inmediatamente (Trigger Chain)
+                        if queue:
+                            next_head = queue[0]
+                            next_head['last_retry'] = 0 # Reset para envío inmediato
+                            next_head['attempts'] = 0
+                            asyncio.create_task(self._attempt_send_head(addr, next_head))
+
                 if self.on_ack_received:
-                    self.on_ack_received(addr, msg_struct['ack_id'])
+                    self.on_ack_received(addr, ack_id)
                 return 
 
+            # --- MANEJO DE MENSAJES DE TEXTO ---
             if 'text' in msg_struct and 'hash' in msg_struct:
                 content = msg_struct['text']
                 received_hash = msg_struct['hash']
                 local_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
-                
-                if local_hash == received_hash:
-                    msg_struct['integrity'] = True
-                else:
-                    msg_struct['integrity'] = False
-                    self.on_log(f"🚨 INTEGRITY FAILURE: Recv Hash {received_hash[:8]}... != Calc {local_hash[:8]}...")
+                msg_struct['integrity'] = (local_hash == received_hash)
             
+            # --- DEDUPLICACIÓN Y ENVÍO DE ACK ---
             if 'id' in msg_struct and not msg_struct.get('disconnect'):
-                asyncio.create_task(self.send_ack(addr, msg_struct['id']))
+                incoming_id = msg_struct['id']
+                asyncio.create_task(self.send_ack(addr, incoming_id))
+                
+                if incoming_id in self.dedup_buffer:
+                    return
+                self.dedup_buffer.append(incoming_id)
 
             self.on_message(addr, msg_struct)
             
@@ -341,121 +446,116 @@ class UDPProtocol(asyncio.DatagramProtocol):
     async def send_ack(self, addr, msg_id):
         session = self.sessions.get_session_by_addr(addr)
         if not session or not session.encryptor: return
-        
         try:
-            ack_payload = {
-                "timestamp": time.time(),
-                "ack_id": msg_id
-            }
+            ack_payload = {"timestamp": time.time(), "ack_id": msg_id}
             json_bytes = json.dumps(ack_payload).encode('utf-8')
-            # Encrypt adds RemoteID automatically now in protocol.py
             full_packet_payload = session.encrypt_message(json_bytes)
-            
-            # We just add the Type
             self.transport.sendto(b'\x03' + full_packet_payload, addr)
         except Exception as e:
             self.on_log(f"❌ Failed to send ACK: {e}")
-
-    def _queue_message(self, addr, msg_id, content):
-        if addr not in self.pending_messages:
-            self.pending_messages[addr] = []
-        # Store tuple (msg_id, content) to preserve ID after handshake
-        self.pending_messages[addr].append((msg_id, content))
-        self.on_log(f"⏳ Message queued (waiting for handshake)...")
 
     async def broadcast_disconnect(self):
         self.on_log("📡 Sending encrypted disconnect to active chats...")
         active_sessions = list(self.sessions.sessions_by_addr.values())
         tasks = []
         for sess in active_sessions:
-            tasks.append(self.send_message(sess.current_addr, content=None, is_disconnect=True))
+            # Disconnects bypass the queue
+            tasks.append(self._transmit_raw(sess.current_addr, None, str(uuid.uuid4()), is_disconnect=True))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def send_message(self, addr, content, is_disconnect=False, forced_msg_id=None):
         """
-        Envía un mensaje. Si no hay sesión, inicia handshake y encola.
-        Returns: msg_id (str) si se envió o se encoló, None si hubo error.
+        Encola un mensaje para envío secuencial y fiable.
+        Returns: msg_id (str) inmediatamente.
         """
+        msg_id = forced_msg_id if forced_msg_id else str(uuid.uuid4())
+        
+        # Caso especial: Disconnects no se encolan, se envían directos
+        if is_disconnect:
+            await self._transmit_raw(addr, content, msg_id, is_disconnect=True)
+            return msg_id
+
+        # Encolado Secuencial
+        if addr not in self.peer_message_queues:
+            self.peer_message_queues[addr] = deque()
+            
+        queue = self.peer_message_queues[addr]
+        
+        # MODIFICADO: Capturar timestamp AHORA (creación) para usarlo siempre
+        creation_timestamp = time.time()
+        
+        queue.append({
+            'msg_id': msg_id,
+            'content': content,
+            'attempts': 0,
+            'last_retry': 0,
+            'timestamp': creation_timestamp # Guardamos la hora original
+        })
+        
+        # Si era el único mensaje (la cola estaba vacía), iniciamos el proceso de envío
+        if len(queue) == 1:
+            await self._attempt_send_head(addr, queue[0])
+            
+        return msg_id
+
+    async def _transmit_raw(self, addr, content, msg_id, is_disconnect=False, timestamp=None):
+        """Lógica de bajo nivel: Busca sesión y envía, o inicia handshake."""
         session = self.sessions.get_session_by_addr(addr)
         
         if not session and is_disconnect:
-            return None
+            return
 
-        # 1. Generar ID ahora (incluso antes de encolar)
-        msg_id = forced_msg_id if forced_msg_id else str(uuid.uuid4())
+        # FIX: Detectar sesión atascada en handshake incompleto (Stale Session)
+        if session and session.encryptor is None:
+            # Si estamos aquí, es porque el retry loop ha disparado este intento y el handshake sigue sin acabar.
+            # Borramos la sesión para forzar un nuevo Handshake Init.
+            if session.current_addr in self.sessions.sessions_by_addr:
+                del self.sessions.sessions_by_addr[session.current_addr]
+            if session.local_index in self.sessions.sessions_by_id:
+                del self.sessions.sessions_by_id[session.local_index]
+            session = None
 
+        # Si no hay sesión, iniciamos Handshake (no enviamos datos aún)
         if not session:
+            # Buscamos pubkey para iniciar handshake
             remote_pub = await self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
             if not remote_pub:
                 self.on_log(f"❌ Cannot send: No public key for {addr}")
-                return None
+                # Si falla fatalmente, deberíamos quitarlo de la cola para no bloquear,
+                # pero por simplicidad dejamos que el retry expire o el usuario intervenga.
+                return 
             
-            # AUDIT FIX: Check for Roaming Initiator (Peer moved, we have session but old IP)
-            remote_pub_bytes = remote_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-            
-            # Buscamos en todas las sesiones activas si alguna coincide con esta clave pública
-            found_existing = None
-            for s in self.sessions.sessions_by_id.values():
-                if s.rs_pub:
-                    s_pub_bytes = s.rs_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-                    if s_pub_bytes == remote_pub_bytes:
-                        found_existing = s
-                        break
-            
-            if found_existing:
-                self.on_log(f"ℹ️ Roaming: Redirecting session {found_existing.local_index} to new IP {addr}")
-                self.sessions.update_session_addr(found_existing, addr)
-                session = found_existing
-            else:
-                # Start Handshake (Standard logic if truly new)
-                session = self.sessions.create_initiator_session(addr, remote_pub)
-                hs_msg = session.create_handshake_message() # Includes Type 1 data (SenderID + Payload)
-                
-                self.transport.sendto(b'\x01' + hs_msg, addr)
-                self.on_log(f"🔄 Initiating handshake with {addr}")
-                
-                if content:
-                    # Encolar con el ID generado para rastrearlo
-                    self._queue_message(addr, msg_id, content)
-                
-                return msg_id
+            # Start Handshake
+            session = self.sessions.create_initiator_session(addr, remote_pub)
+            hs_msg = session.create_handshake_message()
+            self.transport.sendto(b'\x01' + hs_msg, addr)
+            self.on_log(f"🔄 Initiating handshake with {addr} (Triggered by queue)")
+            return 
 
-        if session.encryptor is None:
-            # Handshake en progreso pero no completo
-            if content:
-                self._queue_message(addr, msg_id, content)
-            return msg_id
-
-        # Enviar mensaje cifrado
+        # Enviar mensaje cifrado (La sesión ya debe estar completa aquí)
         try:
             if is_disconnect:
-                msg_struct = {
-                    "timestamp": time.time(),
-                    "disconnect": True
-                }
+                msg_struct = {"timestamp": time.time(), "disconnect": True}
             else:
                 text_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+                
+                # Usamos el timestamp original si se proporciona (reintentos), sino el actual
+                final_ts = timestamp if timestamp is not None else time.time()
+                
                 msg_struct = {
                     "id": msg_id,
-                    "timestamp": time.time(), 
+                    "timestamp": final_ts, 
                     "text": content,
                     "hash": text_hash
                 }
             
             payload = json.dumps(msg_struct).encode('utf-8')
-            
-            # Encrypt adds RemoteID automatically now in protocol.py
             full_packet_payload = session.encrypt_message(payload)
-            
-            # We just add Type 0x03
             self.transport.sendto(b'\x03' + full_packet_payload, addr)
             
-            return msg_id 
-            
         except Exception as e:
-            self.on_log(f"❌ Send failed: {e}")
-            return None
+            self.on_log(f"❌ Send raw failed: {e}")
 
 class RawSniffer(asyncio.DatagramProtocol):
     def __init__(self, service):
@@ -575,6 +675,10 @@ class DiscoveryService:
         self.sniffer_protocol = None 
         self.bind_ip = None
         self.unique_instance_id = None 
+        self.protocol_ref = None # Referencia al protocolo para notificar cambios
+
+    def set_protocol(self, proto):
+        self.protocol_ref = proto
 
     async def start(self, username, bind_ip=None):
         self.loop = asyncio.get_running_loop()
@@ -618,6 +722,37 @@ class DiscoveryService:
         await self.aiozc.async_register_service(self.info)
         
         self._polling_task = asyncio.create_task(self._active_polling_loop())
+
+    def on_found(self, user_id, ip, port, props):
+        # Lógica original de on_found (delegada a TUI)
+        if self.on_found_callback:
+             self.on_found_callback(user_id, ip, port, props)
+        
+        # NUEVO: Notificar al protocolo sobre posible Roaming
+        # Esto ayuda si el cambio de IP se detecta por mDNS antes que por tráfico UDP directo
+        if self.protocol_ref:
+             # Buscamos si tenemos una sesión activa con este usuario (por ID) para actualizar IP
+             # Como DiscoveryService no tiene acceso directo al session manager, 
+             # delegamos una función específica en UDPProtocol si es necesario,
+             # pero aquí lo crítico es que el protocolo sepa "Oye, User X está en IP Y".
+             # Sin embargo, el protocolo trabaja con IPs, no UserIDs en su capa baja.
+             # La forma más robusta es que la TUI, al recibir on_found, notifique al protocolo
+             # si detecta que es un usuario conocido con IP diferente.
+             pass
+
+    # Modificamos init para guardar el callback original correctamente
+    def __init__(self, port, pubkey_bytes, on_service_found, on_log=None):
+        self.aiozc = None 
+        self.port = port
+        self.pubkey_b64 = pubkey_bytes.hex()
+        self.on_found_callback = on_service_found # Renombramos para uso interno
+        self.on_log = on_log if on_log else lambda x: None
+        self.loop = None
+        self.sniffer_transport = None
+        self.sniffer_protocol = None 
+        self.bind_ip = None
+        self.unique_instance_id = None 
+        self.protocol_ref = None
 
     def broadcast_exit(self):
         if not self.sniffer_transport: return

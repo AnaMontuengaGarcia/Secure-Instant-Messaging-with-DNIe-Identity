@@ -34,6 +34,12 @@ class NoiseIKState:
         self.tx_nonce = 0
         self.rx_nonce = 0
         
+        # --- ANTI-REPLAY SLIDING WINDOW ---
+        # Bitmap de 64 bits para rastrear paquetes recibidos en la ventana actual.
+        # rx_nonce actuará como el "Next Expected Sequence" (Highest Seen + 1).
+        self.replay_bitmap = 0
+        self.replay_window_size = 64
+        
         # Connection IDs for Multiplexing
         # Generamos un identificador local aleatorio de 4 bytes (32-bit int)
         self.local_index = struct.unpack('<I', os.urandom(4))[0]
@@ -176,24 +182,79 @@ class NoiseIKState:
 
     def encrypt_message(self, plaintext):
         """
-        Cifra un mensaje de datos post-handshake
-        Type 3: [0x03] + [ReceiverIndex (4B)] + [Ciphertext]
+        Cifra un mensaje de datos post-handshake.
+        Type 3: [0x03] + [ReceiverIndex (4B)] + [Nonce (8B)] + [Ciphertext]
         """
         if self.encryptor is None:
             raise Exception("Handshake not complete")
         
-        nonce = struct.pack('<Q', self.tx_nonce) + b'\x00'*4
-        ciphertext = self.encryptor.encrypt(nonce, plaintext, b'')
+        # Preparamos el nonce de 12 bytes (8 bytes contador + 4 bytes padding ceros)
+        nonce_bytes = struct.pack('<Q', self.tx_nonce)
+        iv = nonce_bytes + b'\x00'*4
+        
+        ciphertext = self.encryptor.encrypt(iv, plaintext, b'')
         self.tx_nonce += 1
         
-        # Prepend Receiver Index so peer can route it
-        return struct.pack('<I', self.remote_index) + ciphertext
+        # Empaquetamos: [ReceiverIndex] + [Nonce] + [Ciphertext]
+        return struct.pack('<I', self.remote_index) + nonce_bytes + ciphertext
 
-    def decrypt_message(self, ciphertext):
-        """Descifra un mensaje de datos post-handshake"""
+    def decrypt_message(self, data_with_nonce):
+        """
+        Descifra un mensaje de datos post-handshake usando Ventana Deslizante (Anti-Replay).
+        Espera: [Nonce (8B)] + [Ciphertext]
+        """
         if self.decryptor is None:
             raise Exception("Handshake not complete")
-        nonce = struct.pack('<Q', self.rx_nonce) + b'\x00'*4
-        plaintext = self.decryptor.decrypt(nonce, ciphertext, b'')
-        self.rx_nonce += 1
+        
+        if len(data_with_nonce) < 8:
+            raise Exception("Message too short (missing nonce)")
+
+        # 1. Extraemos el nonce (secuencia) del paquete
+        nonce_bytes = data_with_nonce[:8]
+        ciphertext = data_with_nonce[8:]
+        received_seq = struct.unpack('<Q', nonce_bytes)[0]
+        
+        # 2. VALIDACIÓN DE REPLAY (Antes de descifrar para eficiencia, aunque auth tag también protege)
+        # self.rx_nonce rastrea el "Siguiente Esperado" (Máximo Visto + 1)
+        
+        if received_seq < self.rx_nonce:
+            # Es un paquete antiguo
+            diff = self.rx_nonce - received_seq
+            
+            # Chequeo A: ¿Es demasiado viejo?
+            if diff > self.replay_window_size:
+                raise Exception(f"Replay Error: Message too old (seq {received_seq} < {self.rx_nonce - self.replay_window_size})")
+            
+            # Chequeo B: ¿Ya lo hemos visto en la ventana reciente?
+            # El bit 0 del mapa representa (rx_nonce - 1), el bit 1 es (rx_nonce - 2)...
+            bit_index = diff - 1
+            if (self.replay_bitmap >> bit_index) & 1:
+                raise Exception(f"Replay Error: Message {received_seq} already processed")
+
+        # 3. Descifrado (Si falla la autenticación, lanza excepción y no actualizamos estado)
+        iv = nonce_bytes + b'\x00'*4
+        plaintext = self.decryptor.decrypt(iv, ciphertext, b'')
+        
+        # 4. ACTUALIZACIÓN DE ESTADO (Solo si el descifrado fue exitoso)
+        if received_seq >= self.rx_nonce:
+            # Caso: Nuevo paquete más reciente. Avanzamos la ventana.
+            jump = received_seq - self.rx_nonce + 1
+            
+            if jump >= self.replay_window_size:
+                # Salto muy grande, limpiamos todo el historial
+                self.replay_bitmap = 0
+            else:
+                # Desplazamos la ventana
+                self.replay_bitmap <<= jump
+            
+            # Marcamos el bit 0 que corresponde al paquete actual (received_seq) relativo al nuevo rx_nonce
+            self.replay_bitmap |= 1
+            self.rx_nonce = received_seq + 1
+            
+        else:
+            # Caso: Paquete antiguo pero válido (dentro de la ventana). Lo marcamos.
+            diff = self.rx_nonce - received_seq
+            bit_index = diff - 1
+            self.replay_bitmap |= (1 << bit_index)
+            
         return plaintext

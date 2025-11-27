@@ -111,8 +111,9 @@ class MessengerTUI(App):
     Screen { layout: grid; grid-size: 2; grid-columns: 30% 70%; }
     .sidebar { background: $surface; border-right: solid $primary; }
     .chat-area { layout: vertical; }
-    .logs { height: 30%; border-top: solid $secondary; background: $surface-darken-1; }
-    .messages { height: 60%; padding: 1; }
+    /* MODIFICADO: Aumentado height de .logs al 20% */
+    .logs { height: 20%; border-top: solid $secondary; background: $surface-darken-1; }
+    .messages { height: 1fr; padding: 1; }
     .input-container { dock: bottom; height: 6; layout: horizontal; padding: 0 1 1 1; }
     ChatInput { width: 1fr; height: 100%; border: solid $accent; } 
     #btn_send { height: 100%; width: 12; margin-left: 1; background: $primary; color: $text; }
@@ -369,6 +370,7 @@ class MessengerTUI(App):
         rule_drawn = False
 
         # 2. Cargar e imprimir Historial (desde memoria descifrada)
+        # NOTA: Los mensajes guardados en storage ya están confirmados (ACK recibido)
         history = await self.storage.get_chat_history(item.user_id)
         
         for msg in history:
@@ -384,23 +386,26 @@ class MessengerTUI(App):
             direction = msg.get('direction')
             is_me = (direction == "out")
             sender_name = "You" if is_me else target_name
-            panel = self._create_message_panel(text, sender_name, is_me, timestamp=ts)
+            # Si está en el historial guardado, asumimos que está entregado (delivered=True)
+            panel = self._create_message_panel(text, sender_name, is_me, timestamp=ts, delivered=True)
             chat_box.write(panel)
 
         # Si no se pintó raya de nuevos (todos leídos), pintamos raya final gris
         if not rule_drawn:
             chat_box.write(Rule(style="dim"))
             
-        # 3. Imprimir Mensajes Pendientes (Memoria temporal)
+        # 3. Imprimir Mensajes Pendientes (Memoria temporal, no confirmados)
         pending_list = [v for k, v in self.pending_acks.items() if v['user_id'] == item.user_id]
         pending_list.sort(key=lambda x: x['timestamp'])
 
         for p_data in pending_list:
+            # Mensajes pendientes -> delivered=False (Hora Gris)
             panel = self._create_message_panel(
                 p_data['text'], 
                 "You", 
                 is_me=True, 
-                timestamp=p_data['timestamp']
+                timestamp=p_data['timestamp'],
+                delivered=False 
             )
             chat_box.write(panel)
         
@@ -437,7 +442,8 @@ class MessengerTUI(App):
         ta.text = "" 
         now_ts = time.time()
         
-        msg_panel = self._create_message_panel(text, "You", is_me=True, timestamp=now_ts)
+        # Mostrar mensaje inmediatamente (Pendiente -> Gris)
+        msg_panel = self._create_message_panel(text, "You", is_me=True, timestamp=now_ts, delivered=False)
         self.query_one("#chat_box", RichLog).write(msg_panel)
         
         # Enviar (puede que encole si hay handshake, pero ahora devuelve ID siempre)
@@ -467,10 +473,18 @@ class MessengerTUI(App):
                     timestamp=data['timestamp']
                 )
             )
+            # Si estamos en el chat correcto, REFRESCAMOS para cambiar el color a verde
             if self.current_chat_addr == addr:
-                self.query_one("#chat_box", RichLog).write(
-                    Align(Text("✓ Entregado (Saved to Encrypted Memory)", style="bold green italic", justify="left"), align="left")
-                )
+                lst = self.query_one("#contact_list", ListView)
+                target_child = None
+                for child in lst.children:
+                    if isinstance(child, ChatItem) and child.contact_ip == addr[0] and child.contact_port == addr[1]:
+                        target_child = child
+                        break
+                
+                if target_child:
+                    # Esto repintará el historial, y como el mensaje ya está guardado (delivered), saldrá verde
+                    self.call_later(self._load_and_refresh_chat_history, target_child)
 
     def receive_message(self, addr, msg):
         self._receive_message_safe(addr, msg)
@@ -532,7 +546,8 @@ class MessengerTUI(App):
                 )
             )
 
-        msg_panel = self._create_message_panel(text, peer_name, is_me=False, timestamp=ts)
+        # Los mensajes recibidos siempre se muestran como "Entregados" (son verdes o por defecto)
+        msg_panel = self._create_message_panel(text, peer_name, is_me=False, timestamp=ts, delivered=True)
         curr_ip = self.current_chat_addr[0] if self.current_chat_addr else None
         
         if curr_ip == ip: 
@@ -540,11 +555,18 @@ class MessengerTUI(App):
         else: 
             self.add_log(f"📨 New message from {peer_name}")
 
-    def _create_message_panel(self, text, title, is_me, timestamp=None):
+    def _create_message_panel(self, text, title, is_me, timestamp=None, delivered=True):
         color = "green" if is_me else "yellow"
         if timestamp:
             ts_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
-            title = f"{title} [{ts_str}]"
+            if is_me:
+                # Si soy yo: Verde si entregado, Gris (dim) si pendiente
+                time_color = "green" if delivered else "dim"
+                title = f"{title} [{time_color}]{ts_str}[/]"
+            else:
+                # Si es el otro: Siempre verde (ya llegó)
+                title = f"{title} [green]{ts_str}[/]"
+                
         return Align(Panel(Text(text), title=title, title_align="left", border_style=color, box=box.ROUNDED, padding=(0, 1), expand=False), align="left")
 
 # --- NUEVA APP DE LOGIN DNIe ---
