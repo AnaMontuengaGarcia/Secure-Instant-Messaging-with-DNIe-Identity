@@ -79,6 +79,11 @@ async def main_async(identity_data):
         # Iniciamos el servicio de descubrimiento (mDNS)
         discovery = DiscoveryService(args.port, pub_bytes, lambda n,i,p,pr: None)
         
+        # --- CRITICAL FIX: CONECTAR PROTOCOLO AL DESCUBRIMIENTO ---
+        # Esto permite que el cambio de IP detectado por mDNS notifique al protocolo para
+        # redirigir el tráfico y despertar las colas.
+        discovery.set_protocol(proto) 
+        
         # Lanzamos la interfaz de Chat (TUI)
         app = MessengerTUI(proto, discovery, storage, user_id=user_id, bind_ip=args.bind)
         await app.run_async()
