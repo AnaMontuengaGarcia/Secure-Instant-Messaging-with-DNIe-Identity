@@ -170,6 +170,10 @@ class MessengerTUI(App):
         self.proto.on_handshake_success = self.on_new_peer_handshake
         self.proto.on_ack_received = self.on_ack_received
         
+        # NUEVO: Callbacks para resolver IP y user_id desde la lista de contactos
+        self.proto.get_peer_addr_callback = self._get_peer_addr_from_list
+        self.proto.get_user_id_callback = self._get_user_id_for_addr
+        
         self.discovery.on_found = self.add_peer
         self.discovery.on_log = self.add_log 
         
@@ -220,6 +224,38 @@ class MessengerTUI(App):
                 last_seen = self.peer_last_seen.get(child.user_id, 0)
                 is_online = (now - last_seen) < 20.0
                 child.set_online_status(is_online)
+
+    def _get_peer_addr_from_list(self, user_id):
+        """
+        Callback para el protocolo: obtiene la IP actual de un peer desde la lista de contactos.
+        Retorna (ip, port) si el peer está online, None si no.
+        """
+        try:
+            lst = self.query_one("#contact_list", ListView)
+            for child in lst.children:
+                if isinstance(child, ChatItem) and child.user_id == user_id:
+                    if child.online:
+                        return (child.contact_ip, child.contact_port)
+                    else:
+                        return None  # Peer existe pero está offline
+        except:
+            pass
+        return None
+
+    def _get_user_id_for_addr(self, addr):
+        """
+        Callback para el protocolo: obtiene el user_id de un peer dada su dirección.
+        Retorna user_id (string) o None.
+        """
+        try:
+            lst = self.query_one("#contact_list", ListView)
+            for child in lst.children:
+                if isinstance(child, ChatItem):
+                    if child.contact_ip == addr[0] and child.contact_port == addr[1]:
+                        return child.user_id
+        except:
+            pass
+        return None
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn_send":
@@ -368,6 +404,7 @@ class MessengerTUI(App):
         # 1. Recuperamos umbral de lectura
         last_read_ts = self.peer_last_read.get(item.user_id, 0)
         rule_drawn = False
+        current_day = None  # Para trackear el día actual y mostrar separadores
 
         # 2. Cargar e imprimir Historial (desde memoria descifrada)
         # NOTA: Los mensajes guardados en storage ya están confirmados (ACK recibido)
@@ -375,6 +412,12 @@ class MessengerTUI(App):
         
         for msg in history:
             ts = msg.get('timestamp', 0)
+            
+            # Verificar si cambió el día para mostrar separador
+            msg_date = datetime.fromtimestamp(ts).date() if ts else None
+            if msg_date and msg_date != current_day:
+                current_day = msg_date
+                chat_box.write(self._create_date_separator(ts))
             
             # Si el mensaje es más nuevo que lo último que leímos, pintamos la raya
             # y solo una vez.
@@ -399,12 +442,20 @@ class MessengerTUI(App):
         pending_list.sort(key=lambda x: x['timestamp'])
 
         for p_data in pending_list:
+            ts = p_data['timestamp']
+            
+            # Verificar si cambió el día para mostrar separador
+            msg_date = datetime.fromtimestamp(ts).date() if ts else None
+            if msg_date and msg_date != current_day:
+                current_day = msg_date
+                chat_box.write(self._create_date_separator(ts))
+            
             # Mensajes pendientes -> delivered=False (Hora Gris)
             panel = self._create_message_panel(
                 p_data['text'], 
                 "You", 
                 is_me=True, 
-                timestamp=p_data['timestamp'],
+                timestamp=ts,
                 delivered=False 
             )
             chat_box.write(panel)
@@ -447,7 +498,7 @@ class MessengerTUI(App):
         self.query_one("#chat_box", RichLog).write(msg_panel)
         
         # Enviar (puede que encole si hay handshake, pero ahora devuelve ID siempre)
-        msg_id = await self.proto.send_message(self.current_chat_addr, text)
+        msg_id = await self.proto.send_message(self.current_chat_addr, text, user_id=target_item.user_id)
         
         if msg_id:
             # Rastrear para ACK (tanto si se envió ya como si está en cola de handshake)
@@ -556,18 +607,23 @@ class MessengerTUI(App):
             self.add_log(f"📨 New message from {peer_name}")
 
     def _create_message_panel(self, text, title, is_me, timestamp=None, delivered=True):
-        color = "green" if is_me else "yellow"
+        color = "green" if is_me else "orange1"
         if timestamp:
             ts_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
             if is_me:
-                # Si soy yo: Verde si entregado, Gris (dim) si pendiente
-                time_color = "green" if delivered else "dim"
-                title = f"{title} [{time_color}]{ts_str}[/]"
+                # Si soy yo: Verde si entregado, Gris oscuro si pendiente de ACK
+                time_color = "green" if delivered else "grey37"
+                title = f"{title} [{time_color}]\\[{ts_str}][/]"
             else:
-                # Si es el otro: Siempre verde (ya llegó)
-                title = f"{title} [green]{ts_str}[/]"
+                # Si es el otro: Naranja igual que el nombre
+                title = f"{title} [orange1]\\[{ts_str}][/]"
                 
         return Align(Panel(Text(text), title=title, title_align="left", border_style=color, box=box.ROUNDED, padding=(0, 1), expand=False), align="left")
+    
+    def _create_date_separator(self, timestamp):
+        """Crea una barra separadora con la fecha del día."""
+        date_str = datetime.fromtimestamp(timestamp).strftime("%d / %m / %Y")
+        return Rule(title=f"📅 {date_str}", style="cyan")
 
 # --- NUEVA APP DE LOGIN DNIe ---
 
