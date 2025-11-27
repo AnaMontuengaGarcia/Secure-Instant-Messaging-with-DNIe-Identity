@@ -806,7 +806,7 @@ class DiscoveryService:
             self.sniffer_transport, self.sniffer_protocol = await self.loop.create_datagram_endpoint(
                 lambda: RawSniffer(self), sock=sock
             )
-            self.on_log("👂 Sniffer Optimizado Activo")
+            self.on_log("👂 Sniffer Activo")
         except Exception as e:
             self.on_log(f"⚠️ Fallo al iniciar Sniffer: {e}")
 
