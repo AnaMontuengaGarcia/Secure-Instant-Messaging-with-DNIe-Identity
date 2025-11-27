@@ -79,7 +79,7 @@ def verify_peer_identity(x25519_pub_key, proofs):
     3. Verifica que el certificado tenga permisos de Firma Digital.
     4. Comprueba si el emisor del certificado (Issuer) está en nuestro almacén de confianza (GLOBAL_TRUST_STORE).
     5. Verifica la firma digital: El par debe haber firmado su propia clave pública efímera (x25519) usando la clave privada RSA del DNIe.
-    6. Si todo es correcto, extrae y devuelve el nombre real del usuario.
+    6. Si todo es correcto, extrae y devuelve el nombre real del usuario y el nombre del emisor (CA).
     """
     if not proofs or 'cert' not in proofs or 'sig' not in proofs:
         raise Exception("No se proporcionaron pruebas de identidad")
@@ -122,6 +122,7 @@ def verify_peer_identity(x25519_pub_key, proofs):
                     )
                     is_trusted = True
                     issuer_name = get_common_name(ca_cert)
+                    print(f"🔐 [SEGURIDAD] Certificado DNIe verificado correctamente por: {issuer_name}")
                     break 
                 except Exception:
                     continue
@@ -468,7 +469,8 @@ class UDPProtocol(asyncio.DatagramProtocol):
             
             try:
                 real_name, issuer = verify_peer_identity(remote_pub, session.remote_proofs)
-                self.on_log(f"✅ Identidad Verificada: {real_name}")
+                # --- CAMBIO SOLICITADO: Incluir Emisor en el Log de UI ---
+                self.on_log(f"✅ Identidad Verificada: {real_name} | Emisor: {issuer}")
             except Exception as e:
                 self.on_log(f"⛔ ALERTA DE SEGURIDAD: {e}")
                 return
@@ -524,7 +526,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
             
             try:
                 real_name, issuer = verify_peer_identity(session.rs_pub, session.remote_proofs)
-                self.on_log(f"✅ Identidad Verificada: {real_name} (Completado)")
+                self.on_log(f"✅ Identidad Verificada: {real_name} (Completado) | Emisor: {issuer}")
                 asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], session.rs_pub, real_name=real_name))
             except Exception as e:
                 self.on_log(f"⛔ ALERTA DE SEGURIDAD: {e}")
