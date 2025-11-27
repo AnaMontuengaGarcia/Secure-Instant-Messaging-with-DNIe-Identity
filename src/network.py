@@ -31,7 +31,6 @@ def load_trusted_cas():
     """Carga certificados CA de confianza desde el disco."""
     trusted_cas = []
     if not os.path.exists(TRUSTED_CERTS_DIR):
-        # print(f"⚠️ Warning: '{TRUSTED_CERTS_DIR}' directory not found. No Chain of Trust verification possible.")
         return []
     
     for filename in os.listdir(TRUSTED_CERTS_DIR):
@@ -84,7 +83,6 @@ def verify_peer_identity(x25519_pub_key, proofs):
         is_trusted = False
         
         if not GLOBAL_TRUST_STORE:
-             # print("⚠️  SECURITY WARNING: No CA certificates found. Skipping Chain of Trust check.")
              issuer_name = "UNTRUSTED/NO-STORE"
              is_trusted = True 
         else:
@@ -129,12 +127,25 @@ class SessionManager:
     def __init__(self, local_static_key, db, local_proofs):
         self.local_static_key = local_static_key
         self.local_proofs = local_proofs
-        self.sessions = {}
+        
+        # AUDIT FIX: Mapping sessions by ID for Multiplexing
+        self.sessions_by_addr = {} # (ip, port) -> session (Legacy/Initial)
+        self.sessions_by_id = {}   # local_index (int) -> session
+        
         self.db = db
         self.transport = None
 
-    def get_session(self, addr):
-        return self.sessions.get(addr)
+    def get_session_by_addr(self, addr):
+        return self.sessions_by_addr.get(addr)
+    
+    def get_session_by_id(self, idx):
+        return self.sessions_by_id.get(idx)
+
+    def register_session(self, session, addr):
+        self.sessions_by_addr[addr] = session
+        self.sessions_by_id[session.local_index] = session
+        # Almacenamos la dirección actual en la sesión para "Roaming"
+        session.current_addr = addr
 
     def create_initiator_session(self, addr, remote_pub_key):
         session = NoiseIKState(
@@ -144,7 +155,7 @@ class SessionManager:
             local_proofs=self.local_proofs
         )
         session.initialize()
-        self.sessions[addr] = session
+        self.register_session(session, addr)
         return session
 
     def create_responder_session(self, addr):
@@ -154,8 +165,17 @@ class SessionManager:
             local_proofs=self.local_proofs
         )
         session.initialize()
-        self.sessions[addr] = session
+        self.register_session(session, addr)
         return session
+        
+    def update_session_addr(self, session, new_addr):
+        if session.current_addr != new_addr:
+            if session.current_addr in self.sessions_by_addr:
+                del self.sessions_by_addr[session.current_addr]
+            session.current_addr = new_addr
+            self.sessions_by_addr[new_addr] = session
+            return True
+        return False
 
 class UDPProtocol(asyncio.DatagramProtocol):
     def __init__(self, session_manager, on_message_received, on_log, on_handshake_success=None, on_ack_received=None):
@@ -181,20 +201,28 @@ class UDPProtocol(asyncio.DatagramProtocol):
         try:
             packet_type = data[0]
             payload = data[1:]
-            if packet_type == 0x01:
+            
+            # AUDIT FIX: Multiplexing Logic
+            if packet_type == 0x01: # Handshake Init
                 self.handle_handshake_init(payload, addr)
-            elif packet_type == 0x02:
+            elif packet_type == 0x02: # Handshake Resp
                 self.handle_handshake_resp(payload, addr)
-            elif packet_type == 0x03:
+            elif packet_type == 0x03: # Data Message
                 self.handle_data(payload, addr)
         except Exception as e:
             self.on_log(f"❌ Error packet {addr}: {e}")
 
     def handle_handshake_init(self, data, addr):
+        # Type 1: [0x01] + [SenderIndex] + [Payload]
         self.on_log(f"🔄 Handshake Init from {addr}")
+        
+        # We assume new session for Handshake Init
         session = self.sessions.create_responder_session(addr)
+        
         try:
+            # consume_handshake_message now extracts remote_index
             remote_pub = session.consume_handshake_message(data)
+            
             try:
                 real_name, issuer = verify_peer_identity(remote_pub, session.remote_proofs)
                 self.on_log(f"✅ Verified Identity: {real_name}")
@@ -205,7 +233,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
 
             resp_data = session.create_handshake_response()
             self.transport.sendto(b'\x02' + resp_data, addr)
-            self.on_log(f"🤝 Handshake Response sent to {addr}")
+            self.on_log(f"🤝 Handshake Response sent to {addr} (CID: {session.local_index})")
             
             asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], remote_pub, real_name=real_name))
             
@@ -214,12 +242,30 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 
         except Exception as e:
             self.on_log(f"❌ Handshake failed: {e}")
-            if addr in self.sessions.sessions: del self.sessions.sessions[addr]
+            # Clean up
+            if session.local_index in self.sessions.sessions_by_id:
+                del self.sessions.sessions_by_id[session.local_index]
 
     def handle_handshake_resp(self, data, addr):
-        session = self.sessions.get_session(addr)
-        if not session: return
+        # Type 2: [0x02] + [SenderIdx] + [ReceiverIdx] + [Payload]
+        if len(data) < 8: return
+
+        # Read the receiver index to find WHO this is for
+        # Payload struct: [Sender(4B)] [Receiver(4B)] ...
+        # We need the second integer (Receiver, bytes 4-8) to find our local session
+        receiver_index = struct.unpack('<I', data[4:8])[0]
+        
+        session = self.sessions.get_session_by_id(receiver_index)
+        
+        if not session: 
+            self.on_log(f"❌ Received HandshakeResp for unknown ID {receiver_index}")
+            return
+
         try:
+            # Check for Roaming (IP Changed?)
+            if self.sessions.update_session_addr(session, addr):
+                 self.on_log(f"ℹ️ Peer {session.local_index} roamed to {addr}")
+
             session.consume_handshake_response(data)
             try:
                 real_name, issuer = verify_peer_identity(session.rs_pub, session.remote_proofs)
@@ -229,10 +275,10 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], session.rs_pub, real_name=real_name))
             except Exception as e:
                 self.on_log(f"⛔ SECURITY ALERT: {e}")
-                del self.sessions.sessions[addr]
+                # cleanup
                 return
 
-            self.on_log(f"🔒 Secure Session established with {real_name}")
+            self.on_log(f"🔒 Secure Session established with {real_name} (CID: {session.local_index})")
             
             if self.on_handshake_success:
                 self.on_handshake_success(addr, session.rs_pub, real_name)
@@ -247,10 +293,25 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"❌ Handshake completion failed: {e}")
 
     def handle_data(self, data, addr):
-        session = self.sessions.get_session(addr)
-        if not session: return
+        # Type 3: [0x03] + [ReceiverIndex (4B)] + [Encrypted]
+        if len(data) < 4: return
+        
+        receiver_index = struct.unpack('<I', data[:4])[0]
+        encrypted_payload = data[4:]
+        
+        session = self.sessions.get_session_by_id(receiver_index)
+        
+        if not session:
+            self.on_log(f"❌ Data packet for unknown session ID {receiver_index} from {addr}")
+            return
+            
+        # AUDIT FIX: Roaming Support (Multiplexing)
+        if self.sessions.update_session_addr(session, addr):
+             self.on_log(f"ℹ️ Peer {session.local_index} roamed to {addr}")
+        
         try:
-            plaintext = session.decrypt_message(data)
+            # decrypt_message handles protocol logic, headers handled here
+            plaintext = session.decrypt_message(encrypted_payload)
             msg_struct = json.loads(plaintext.decode('utf-8'))
 
             if 'ack_id' in msg_struct:
@@ -278,7 +339,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
             self.on_log(f"❌ Decryption failed: {e}")
 
     async def send_ack(self, addr, msg_id):
-        session = self.sessions.get_session(addr)
+        session = self.sessions.get_session_by_addr(addr)
         if not session or not session.encryptor: return
         
         try:
@@ -287,8 +348,11 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 "ack_id": msg_id
             }
             json_bytes = json.dumps(ack_payload).encode('utf-8')
-            ciphertext = session.encrypt_message(json_bytes)
-            self.transport.sendto(b'\x03' + ciphertext, addr)
+            # Encrypt adds RemoteID automatically now in protocol.py
+            full_packet_payload = session.encrypt_message(json_bytes)
+            
+            # We just add the Type
+            self.transport.sendto(b'\x03' + full_packet_payload, addr)
         except Exception as e:
             self.on_log(f"❌ Failed to send ACK: {e}")
 
@@ -301,10 +365,10 @@ class UDPProtocol(asyncio.DatagramProtocol):
 
     async def broadcast_disconnect(self):
         self.on_log("📡 Sending encrypted disconnect to active chats...")
-        active_addresses = list(self.sessions.sessions.keys())
+        active_sessions = list(self.sessions.sessions_by_addr.values())
         tasks = []
-        for addr in active_addresses:
-            tasks.append(self.send_message(addr, content=None, is_disconnect=True))
+        for sess in active_sessions:
+            tasks.append(self.send_message(sess.current_addr, content=None, is_disconnect=True))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -313,7 +377,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
         Envía un mensaje. Si no hay sesión, inicia handshake y encola.
         Returns: msg_id (str) si se envió o se encoló, None si hubo error.
         """
-        session = self.sessions.get_session(addr)
+        session = self.sessions.get_session_by_addr(addr)
         
         if not session and is_disconnect:
             return None
@@ -327,18 +391,35 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 self.on_log(f"❌ Cannot send: No public key for {addr}")
                 return None
             
-            # Start Handshake
-            session = self.sessions.create_initiator_session(addr, remote_pub)
-            hs_msg = session.create_handshake_message()
-            self.transport.sendto(b'\x01' + hs_msg, addr)
-            self.on_log(f"🔄 Initiating handshake with {addr}")
+            # AUDIT FIX: Check for Roaming Initiator (Peer moved, we have session but old IP)
+            remote_pub_bytes = remote_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
             
-            if content:
-                # Encolar con el ID generado para rastrearlo
-                self._queue_message(addr, msg_id, content)
+            # Buscamos en todas las sesiones activas si alguna coincide con esta clave pública
+            found_existing = None
+            for s in self.sessions.sessions_by_id.values():
+                if s.rs_pub:
+                    s_pub_bytes = s.rs_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+                    if s_pub_bytes == remote_pub_bytes:
+                        found_existing = s
+                        break
             
-            # IMPORTANTE: Retornamos el msg_id aunque esté en cola, para que la TUI lo rastree
-            return msg_id
+            if found_existing:
+                self.on_log(f"ℹ️ Roaming: Redirecting session {found_existing.local_index} to new IP {addr}")
+                self.sessions.update_session_addr(found_existing, addr)
+                session = found_existing
+            else:
+                # Start Handshake (Standard logic if truly new)
+                session = self.sessions.create_initiator_session(addr, remote_pub)
+                hs_msg = session.create_handshake_message() # Includes Type 1 data (SenderID + Payload)
+                
+                self.transport.sendto(b'\x01' + hs_msg, addr)
+                self.on_log(f"🔄 Initiating handshake with {addr}")
+                
+                if content:
+                    # Encolar con el ID generado para rastrearlo
+                    self._queue_message(addr, msg_id, content)
+                
+                return msg_id
 
         if session.encryptor is None:
             # Handshake en progreso pero no completo
@@ -363,8 +444,12 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 }
             
             payload = json.dumps(msg_struct).encode('utf-8')
-            ciphertext = session.encrypt_message(payload)
-            self.transport.sendto(b'\x03' + ciphertext, addr)
+            
+            # Encrypt adds RemoteID automatically now in protocol.py
+            full_packet_payload = session.encrypt_message(payload)
+            
+            # We just add Type 0x03
+            self.transport.sendto(b'\x03' + full_packet_payload, addr)
             
             return msg_id 
             
@@ -375,22 +460,36 @@ class UDPProtocol(asyncio.DatagramProtocol):
 class RawSniffer(asyncio.DatagramProtocol):
     def __init__(self, service):
         self.service = service
+        self.transport = None
+        self.sock = None
 
     def connection_made(self, transport):
         self.transport = transport
-        sock = transport.get_extra_info('socket')
+        self.sock = transport.get_extra_info('socket')
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if hasattr(socket, 'SO_REUSEPORT'):
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except: pass
 
+        self.join_multicast_groups()
+
+    def join_multicast_groups(self):
+        """
+        Se asegura de que el socket sea miembro del grupo multicast en todas las interfaces.
+        Es seguro llamar a esto repetidamente (los errores de 'ya unido' se ignoran).
+        """
+        if not self.sock: return
         group = socket.inet_aton('224.0.0.251')
+        
+        # 1. Intento unirse en la interfaz por defecto (INADDR_ANY)
         try:
             mreq = struct.pack('4sL', group, socket.INADDR_ANY)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         except: pass
 
+        # 2. Intento unirse explícitamente en todas las interfaces detectadas
+        # Esto es vital si la interfaz por defecto cambia o cae.
         try:
             for iface in netifaces.interfaces():
                 addrs = netifaces.ifaddresses(iface)
@@ -401,7 +500,7 @@ class RawSniffer(asyncio.DatagramProtocol):
                         try:
                             local = socket.inet_aton(ip)
                             mreq = struct.pack('4s4s', group, local)
-                            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
                         except: pass
         except Exception: pass
 
@@ -473,6 +572,7 @@ class DiscoveryService:
         self.on_log = on_log if on_log else lambda x: None
         self.loop = None
         self.sniffer_transport = None
+        self.sniffer_protocol = None 
         self.bind_ip = None
         self.unique_instance_id = None 
 
@@ -490,7 +590,8 @@ class DiscoveryService:
             except: pass
             sock.bind(('', 5353))
             
-            self.sniffer_transport, _ = await self.loop.create_datagram_endpoint(
+            # Guardamos transporte Y protocolo
+            self.sniffer_transport, self.sniffer_protocol = await self.loop.create_datagram_endpoint(
                 lambda: RawSniffer(self), sock=sock
             )
             self.on_log("👂 Sniffer Active on all interfaces")
@@ -549,6 +650,56 @@ class DiscoveryService:
     async def _active_polling_loop(self):
         while True:
             await asyncio.sleep(5)
+            
+            # RE-UNIRSE a grupos multicast si la red ha cambiado
+            if self.sniffer_protocol:
+                self.sniffer_protocol.join_multicast_groups()
+
+            # DETECTAR CAMBIO DE IP Y REINICIAR SERVICIO SI ES NECESARIO
+            if hasattr(self, 'info') and self.aiozc:
+                try:
+                    # Determinar IP actual
+                    current_ip = self.bind_ip if (self.bind_ip and self.bind_ip != "0.0.0.0") else self.get_local_ip()
+                    current_ip_bytes = socket.inet_aton(current_ip)
+                    
+                    # Comprobamos si la IP registrada coincide con la actual
+                    registered_ip_bytes = self.info.addresses[0] if self.info.addresses else b''
+
+                    if registered_ip_bytes != current_ip_bytes:
+                         self.on_log(f"🔄 Network IP changed: {current_ip}. Restarting mDNS Service...")
+                         
+                         # 1. Desregistrar servicio antiguo
+                         try: await self.aiozc.async_unregister_service(self.info)
+                         except: pass
+                         
+                         # 2. Cerrar instancia vieja (para liberar sockets viejos)
+                         try: await self.aiozc.async_close()
+                         except: pass
+                         
+                         # 3. Crear nueva instancia Zeroconf
+                         interfaces = InterfaceChoice.All
+                         if self.bind_ip and self.bind_ip != "0.0.0.0": interfaces = [self.bind_ip]
+                         
+                         try:
+                             self.aiozc = AsyncZeroconf(interfaces=interfaces, ip_version=IPVersion.V4Only)
+                         except:
+                             self.aiozc = AsyncZeroconf(interfaces=InterfaceChoice.All)
+
+                         # 4. Actualizar IP en la info del servicio
+                         self.info.addresses = [current_ip_bytes]
+                         
+                         # 5. Registrar de nuevo con la nueva instancia
+                         await self.aiozc.async_register_service(self.info)
+                         self.on_log(f"✅ mDNS Service Restarted on {current_ip}")
+
+                    else:
+                        # Si la IP no ha cambiado, enviamos un "update" como heartbeat
+                        await self.aiozc.async_update_service(self.info)
+                        
+                except Exception as e:
+                    # self.on_log(f"⚠️ Error updating mDNS: {e}")
+                    pass
+
             if self.sniffer_transport:
                  try: self.sniffer_transport.sendto(RAW_MDNS_QUERY, ('224.0.0.251', 5353))
                  except: pass
