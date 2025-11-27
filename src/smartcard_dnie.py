@@ -12,6 +12,11 @@ class DNIeCardError(Exception):
 class DNIeCard:
     """Interfaz para operaciones con DNIe (PKCS#11)"""
     
+    # OPTIMIZACIÓN: Variable de clase para almacenar la referencia a la librería cargada.
+    # Esto actúa como un Singleton, evitando que 'pkcs11.lib(path)' cargue la DLL/SO
+    # desde el disco cada vez que se instancia la clase.
+    _shared_lib = None
+    
     def __init__(self):
         """
         Inicializa la instancia detectando el sistema operativo.
@@ -33,17 +38,39 @@ class DNIeCard:
             self.lib_path = "/usr/local/lib/opensc-pkcs11.so"
         else:
             raise DNIeCardError(f"SO no soportado: {system}")
+
+    @classmethod
+    def _get_library_singleton(cls, lib_path):
+        """
+        Gestiona la carga única de la librería PKCS#11 (Singleton).
+        
+        Cómo lo hace:
+        Si _shared_lib es None, carga la librería desde disco.
+        Si ya existe, devuelve la referencia en memoria.
+        Esto es vital para el rendimiento en bucles de chequeo (polling).
+        """
+        if cls._shared_lib is None:
+            try:
+                cls._shared_lib = pkcs11.lib(lib_path)
+            except Exception as e:
+                # Si falla la carga inicial, permitimos reintentar en el futuro
+                # (quizás el usuario instale el driver mientras la app corre)
+                raise DNIeCardError(f"No se pudo cargar la librería OpenSC en {lib_path}. Asegúrese de tener los drivers del DNIe instalados. Error: {e}")
+        return cls._shared_lib
     
     def connect(self):
         """
         Establece conexión con el lector de tarjetas inteligentes.
         
         Cómo lo hace:
-        Carga la librería PKCS#11, busca slots con token presente (tarjeta insertada)
-        y abre una sesión inicial de solo lectura sin PIN.
+        1. Obtiene la librería (usando el Singleton optimizado).
+        2. Busca slots con token presente (tarjeta insertada).
+        3. Abre una sesión inicial de solo lectura sin PIN.
         """
         try:
-            self.lib = pkcs11.lib(self.lib_path)
+            # Usamos el getter del Singleton en lugar de pkcs11.lib() directo
+            self.lib = self._get_library_singleton(self.lib_path)
+            
             slots = list(self.lib.get_slots(token_present=True))
             if not slots:
                 raise DNIeCardError("No se detectó tarjeta inteligente.")
@@ -51,6 +78,7 @@ class DNIeCard:
             self.session = self.token.open(rw=False)
             return True
         except Exception as e:
+            # Relanzamos como error propio para manejo limpio en UI
             raise DNIeCardError(f"Conexión fallida: {e}")
 
     def get_serial(self):
