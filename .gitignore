@@ -21,12 +21,13 @@ build/
 # Environment variables
 .env
 
-# Key
-*.key
-
 # Database
-*.json
+*.db
+*.db-shm
+*.db-wal
 
-networkcorrupted.py
-
+# Certificates
 src/certs
+
+# Test scripts
+networkcorrupted.py
