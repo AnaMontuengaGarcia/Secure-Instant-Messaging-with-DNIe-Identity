@@ -1,15 +1,22 @@
 import json
 import os
 import asyncio
-import time
 import base64
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.asymmetric import x25519
 
 class Storage:
+    """
+    Sistema de almacenamiento cifrado.
+    Mantiene los datos en memoria plana (RAM) y los cifra con AES (Fernet) al escribir en disco.
+    """
     def __init__(self, key_bytes, data_dir="data"):
         """
-        key_bytes: Clave simétrica de 32 bytes derivada del DNIe
+        Inicializa el gestor de almacenamiento.
+        
+        Cómo lo hace:
+        Recibe una clave simétrica de 32 bytes (derivada del DNIe), configura el cifrador Fernet
+        y prepara las rutas de archivo y estructuras de memoria.
         """
         self.data_dir = data_dir
         if not os.path.exists(data_dir):
@@ -18,15 +25,14 @@ class Storage:
         self.contacts_file = os.path.join(data_dir, "contacts.json")
         self.messages_file = os.path.join(data_dir, "messages.json")
         
-        # Inicializamos cifrado Fernet (Requiere clave base64 url-safe)
+        # Inicializa cifrado Fernet (Requiere clave base64 url-safe)
         self.fernet = Fernet(base64.urlsafe_b64encode(key_bytes))
         
         # ALMACENES EN MEMORIA (Texto Plano / Objetos)
         self.ram_contacts = []
         self.ram_messages = {}
-        self.ephemeral_keys = {} # (ip, port) -> X25519PublicKey
+        self.ephemeral_keys = {} # (ip, puerto) -> X25519PublicKey
         
-        # Flag de "sucio" para saber si hay que escribir en disco
         self.dirty = False
         
         self.lock = asyncio.Lock()
@@ -34,7 +40,15 @@ class Storage:
         self.running = False
 
     async def init(self):
-        """Carga inicial de datos descifrados a memoria e inicia tarea de fondo"""
+        """
+        Carga y descifra los datos desde el disco a la memoria RAM.
+        
+        Cómo lo hace:
+        1. Lee los archivos cifrados de contactos y mensajes.
+        2. Descifra el contenido usando Fernet.
+        3. Parsea el JSON resultante a objetos Python.
+        4. Inicia la tarea en segundo plano para guardado periódico.
+        """
         # Cargar Contactos
         if os.path.exists(self.contacts_file):
             try:
@@ -45,7 +59,7 @@ class Storage:
                 else:
                     self.ram_contacts = []
             except Exception as e:
-                print(f"⚠️ Error decrypting contacts (File might be corrupted or key changed): {e}")
+                print(f"⚠️ Error descifrando contactos (Archivo corrupto o clave cambió): {e}")
                 self.ram_contacts = []
         else:
              self.ram_contacts = []
@@ -60,26 +74,38 @@ class Storage:
                 else:
                     self.ram_messages = {}
             except Exception as e:
-                print(f"⚠️ Error decrypting messages: {e}")
+                print(f"⚠️ Error descifrando mensajes: {e}")
                 self.ram_messages = {}
         else:
             self.ram_messages = {}
 
-        # Iniciar tarea de guardado periódico
         self.running = True
         self.bg_task = asyncio.create_task(self._background_saver())
-        print("💾 Storage system initialized (Encrypted-at-Rest / Plain-in-RAM)")
+        print("💾 Sistema de almacenamiento inicializado (Cifrado-en-Reposo / Plano-en-RAM)")
 
     async def _background_saver(self):
-        """Tarea que se ejecuta cada 60 segundos"""
+        """
+        Tarea de guardado automático.
+        
+        Cómo lo hace:
+        Se ejecuta cada 60 segundos. Si el flag 'dirty' está activo (hubo cambios), llama a save_to_disk.
+        """
         while self.running:
             await asyncio.sleep(60)
             if self.dirty:
-                print("💾 Auto-saving encrypted database to disk...")
+                print("💾 Auto-guardando base de datos cifrada...")
                 await self.save_to_disk()
 
     async def save_to_disk(self):
-        """Cifra y guarda el estado actual de memoria a disco"""
+        """
+        Persiste el estado de la memoria al disco de forma segura.
+        
+        Cómo lo hace:
+        1. Adquiere un lock para evitar condiciones de carrera.
+        2. Serializa los objetos de RAM a JSON.
+        3. Cifra el JSON resultante con Fernet.
+        4. Escribe los bytes cifrados en el archivo correspondiente.
+        """
         async with self.lock:
             try:
                 # 1. Contactos
@@ -94,25 +120,32 @@ class Storage:
                 
                 self.dirty = False
             except Exception as e:
-                print(f"❌ Error saving to disk: {e}")
+                print(f"❌ Error guardando en disco: {e}")
 
     async def close(self):
-        """Cierra el sistema guardando cambios pendientes"""
+        """
+        Cierra el sistema de almacenamiento.
+        
+        Cómo lo hace:
+        Detiene la tarea de fondo y fuerza un último guardado.
+        """
         self.running = False
         if self.bg_task:
             self.bg_task.cancel()
-        print("💾 Saving final state before exit...")
+        print("💾 Guardando estado final antes de salir...")
         await self.save_to_disk()
 
     # --- Métodos de Archivo Base ---
 
     async def _read_file_bytes(self, filepath):
+        """Helper para lectura de archivos binarios asíncrona."""
         def read():
             with open(filepath, 'rb') as f:
                 return f.read()
         return await asyncio.to_thread(read)
 
     async def _write_file_bytes(self, filepath, data):
+        """Helper para escritura de archivos binarios asíncrona."""
         def write():
             with open(filepath, 'wb') as f:
                 f.write(data)
@@ -121,13 +154,21 @@ class Storage:
     # --- Lógica de Negocio (Opera sobre RAM) ---
 
     async def get_all_contacts(self):
+        """Retorna la lista de contactos en memoria."""
         return self.ram_contacts
 
     async def register_contact(self, ip, port, pubkey_obj, user_id=None, real_name=None):
-        # 1. Guardar clave en memoria (RAM, Efímera)
+        """
+        Añade o actualiza un contacto en la memoria.
+        
+        Cómo lo hace:
+        1. Guarda la clave pública efímera en un diccionario separado.
+        2. Busca si el contacto ya existe en la lista (por ID o IP/Puerto).
+        3. Si existe, actualiza sus campos. Si no, crea una nueva entrada.
+        4. Marca el flag 'dirty' para forzar guardado en disco posteriormente.
+        """
         self.ephemeral_keys[(ip, port)] = pubkey_obj
         
-        # 2. Actualizar lista de contactos en RAM
         found_idx = -1
         for i, c in enumerate(self.ram_contacts):
             match_id = (user_id is not None) and (c.get('userID') == user_id)
@@ -165,9 +206,20 @@ class Storage:
             self.dirty = True
 
     async def get_pubkey_by_addr(self, ip, port):
+        """Recupera la clave pública efímera de una dirección dada."""
         return self.ephemeral_keys.get((ip, port))
 
     async def save_chat_message(self, user_id, direction, text, timestamp):
+        """
+        Guarda un mensaje de chat en el historial.
+        
+        Cómo lo hace:
+        1. Crea la entrada del mensaje.
+        2. La añade a la lista correspondiente al usuario.
+        3. Ordena los mensajes por timestamp.
+        4. Limita el historial a los últimos 5000 mensajes para no saturar la RAM.
+        5. Marca 'dirty' para persistencia.
+        """
         if not user_id: return
 
         msg_entry = {
@@ -180,7 +232,6 @@ class Storage:
             self.ram_messages[user_id] = []
         
         self.ram_messages[user_id].append(msg_entry)
-        # Ordenar (ligera sobrecarga en memoria, pero segura)
         self.ram_messages[user_id].sort(key=lambda x: x['timestamp'])
         
         # Limitar historial en RAM
@@ -190,5 +241,6 @@ class Storage:
         self.dirty = True
 
     async def get_chat_history(self, user_id):
+        """Retorna el historial de chat para un usuario específico."""
         if not user_id: return []
         return self.ram_messages.get(user_id, [])

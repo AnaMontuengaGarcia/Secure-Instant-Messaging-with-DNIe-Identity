@@ -8,12 +8,20 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 class NoiseIKState:
     """
-    Protocolo Noise IK con Payload de Identidad DNIe.
-    Implementa Multiplexación WireGuard-style (Connection IDs) y BLAKE2s.
+    Protocolo Noise IK con Carga Útil de Identidad DNIe.
+    Implementa Multiplexación (Connection IDs tipo WireGuard) y hash BLAKE2s.
+    Proporciona confidencialidad, autenticación mutua y protección contra repetición.
     """
     PROLOGUE = b"DNIe-IM-v2-Signed"
 
     def __init__(self, static_priv, remote_static_pub=None, initiator=False, local_proofs=None):
+        """
+        Inicializa el estado del protocolo criptográfico.
+        
+        Cómo lo hace:
+        Configura las claves estáticas locales, el rol (iniciador/respondedor)
+        y pre-calcula el 'chaining_key' inicial usando el prólogo del protocolo.
+        """
         self.s_priv = static_priv
         self.s_pub = static_priv.public_key()
         self.rs_pub = remote_static_pub
@@ -34,43 +42,72 @@ class NoiseIKState:
         self.tx_nonce = 0
         self.rx_nonce = 0
         
-        # --- ANTI-REPLAY SLIDING WINDOW ---
+        # --- VENTANA DESLIZANTE ANTI-REPLAY ---
         # Bitmap de 64 bits para rastrear paquetes recibidos en la ventana actual.
-        # rx_nonce actuará como el "Next Expected Sequence" (Highest Seen + 1).
+        # rx_nonce actuará como el "Próximo Secuencial Esperado" (Más alto visto + 1).
         self.replay_bitmap = 0
         self.replay_window_size = 64
         
-        # Connection IDs for Multiplexing
+        # Connection IDs para Multiplexación
         # Generamos un identificador local aleatorio de 4 bytes (32-bit int)
         self.local_index = struct.unpack('<I', os.urandom(4))[0]
         self.remote_index = 0  # Se aprende durante el handshake
 
     def _dh(self, priv, pub):
+        """
+        Realiza el intercambio de claves Diffie-Hellman (X25519).
+        """
         return priv.exchange(pub)
 
     def _kdf(self, km, material):
+        """
+        Función de Derivación de Claves (HKDF).
+        
+        Cómo lo hace:
+        Usa BLAKE2s como función hash subyacente para derivar dos claves nuevas
+        a partir del material de entrada y la 'chaining key' actual.
+        """
         hkdf = HKDF(algorithm=hashes.BLAKE2s(digest_size=32), length=64, salt=km, info=b'')
         output = hkdf.derive(material)
         return output[:32], output[32:]
 
     def _mix_key(self, ck, dh_out):
+        """
+        Mezcla el resultado de un DH en la cadena de claves actual (Stateful Hash).
+        """
         return self._kdf(ck, dh_out)
 
     def initialize(self):
+        """
+        Prepara el estado para iniciar la conexión.
+        
+        Cómo lo hace:
+        Genera un par de claves efímeras (e_priv, e_pub) para esta sesión
+        y finaliza el cálculo inicial del chaining_key.
+        """
         self.e_priv = x25519.X25519PrivateKey.generate()
         self.e_pub = self.e_priv.public_key()
         self.ck = self.chaining_key.finalize()
 
     def _prepare_identity_payload(self):
+        """
+        Serializa las pruebas de identidad local (certificado + firma).
+        """
         if not self.local_proofs:
             return b'{}'
         return json.dumps(self.local_proofs).encode('utf-8')
 
     def create_handshake_message(self):
         """
-        Type 1: [0x01] + [SenderIndex (4B)] + [Noise Payload]
+        Genera el mensaje inicial del Handshake (Tipo 1).
+        
+        Cómo lo hace (Noise IK Pattern):
+        1. Envía la clave pública efímera (e).
+        2. Realiza DH(e, rs) y cifra la clave estática local (s).
+        3. Realiza DH(s, rs) y cifra el payload de identidad.
+        4. Retorna: [ÍndiceLocal] + [e] + [Cifrado S] + [Cifrado Identidad]
         """
-        if not self.initiator: raise Exception("Role error")
+        if not self.initiator: raise Exception("Error de rol")
 
         msg = self.e_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         self.ck, k = self._mix_key(self.ck, self._dh(self.e_priv, self.rs_pub))
@@ -85,19 +122,22 @@ class NoiseIKState:
         chacha = ChaCha20Poly1305(k)
         msg += chacha.encrypt(b'\x01'*12, payload_data, b'')
         
-        # Prepend Sender Index (local_index)
-        # Header es handled en network.py, aqui retornamos la parte especifica del protocolo
         return struct.pack('<I', self.local_index) + msg
 
     def consume_handshake_message(self, data):
         """
-        Parses payload from Type 1 message.
-        Expected data: [SenderIndex (4B)] + [Noise Payload]
+        Procesa el mensaje inicial de Handshake recibido.
+        
+        Cómo lo hace:
+        1. Extrae el índice del remitente remoto.
+        2. Lee la clave efímera remota (re).
+        3. Descifra la clave estática remota (rs).
+        4. Descifra el payload de identidad y extrae las pruebas.
+        5. Actualiza el estado de claves criptográficas.
         """
-        if self.initiator: raise Exception("Role error")
+        if self.initiator: raise Exception("Error de rol")
 
-        # Extract Remote Sender Index
-        if len(data) < 4: raise Exception("Handshake Init too short")
+        if len(data) < 4: raise Exception("Handshake Init muy corto")
         self.remote_index = struct.unpack('<I', data[:4])[0]
         actual_msg = data[4:]
 
@@ -124,9 +164,16 @@ class NoiseIKState:
 
     def create_handshake_response(self):
         """
-        Type 2: [0x02] + [SenderIndex (4B)] + [ReceiverIndex (4B)] + [Noise Payload]
+        Genera la respuesta del Handshake (Tipo 2).
+        
+        Cómo lo hace:
+        1. Envía la clave efímera (e).
+        2. Realiza DH(e, re) y DH(e, rs).
+        3. Cifra el payload de identidad local.
+        4. Deriva las claves finales de tráfico (k1, k2).
+        5. Retorna: [ÍndiceLocal] + [ÍndiceRemoto] + [e] + [Cifrado Identidad]
         """
-        if self.initiator: raise Exception("Role error")
+        if self.initiator: raise Exception("Error de rol")
         
         msg = self.e_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         self.ck, k = self._mix_key(self.ck, self._dh(self.e_priv, self.re_pub))
@@ -140,25 +187,28 @@ class NoiseIKState:
         self.encryptor = ChaCha20Poly1305(k1)
         self.decryptor = ChaCha20Poly1305(k2)
         
-        # Include Local Index (Sender) and Remote Index (Receiver)
         indices = struct.pack('<II', self.local_index, self.remote_index)
         return indices + msg
 
     def consume_handshake_response(self, data):
         """
-        Parses payload from Type 2 message.
-        Expected data: [SenderIndex (4B)] + [ReceiverIndex (4B)] + [Noise Payload]
+        Procesa la respuesta del Handshake recibida.
+        
+        Cómo lo hace:
+        1. Valida los índices de sesión.
+        2. Lee la clave efímera remota (re).
+        3. Realiza las mezclas DH restantes.
+        4. Descifra el payload de identidad del servidor.
+        5. Deriva las claves finales de tráfico (Traffic Keys).
         """
-        if not self.initiator: raise Exception("Role error")
+        if not self.initiator: raise Exception("Error de rol")
         
-        if len(data) < 8: raise Exception("Handshake Resp too short")
+        if len(data) < 8: raise Exception("Handshake Resp muy corto")
         
-        # Extract indices
         sender_idx, receiver_idx = struct.unpack('<II', data[:8])
         
-        # Validate that the receiver index matches our local index
         if receiver_idx != self.local_index:
-            raise Exception(f"Index mismatch: Expected {self.local_index}, got {receiver_idx}")
+            raise Exception(f"Desajuste de índice: Esperado {self.local_index}, recibido {receiver_idx}")
             
         self.remote_index = sender_idx
         actual_msg = data[8:]
@@ -182,77 +232,69 @@ class NoiseIKState:
 
     def encrypt_message(self, plaintext):
         """
-        Cifra un mensaje de datos post-handshake.
-        Type 3: [0x03] + [ReceiverIndex (4B)] + [Nonce (8B)] + [Ciphertext]
+        Cifra un mensaje de datos usando las claves de tráfico.
+        
+        Cómo lo hace:
+        1. Usa un nonce incremental (tx_nonce).
+        2. Cifra con ChaCha20Poly1305.
+        3. Retorna: [ÍndiceRemoto] + [Nonce (8B)] + [Texto Cifrado]
         """
         if self.encryptor is None:
-            raise Exception("Handshake not complete")
+            raise Exception("Handshake no completado")
         
-        # Preparamos el nonce de 12 bytes (8 bytes contador + 4 bytes padding ceros)
         nonce_bytes = struct.pack('<Q', self.tx_nonce)
         iv = nonce_bytes + b'\x00'*4
         
         ciphertext = self.encryptor.encrypt(iv, plaintext, b'')
         self.tx_nonce += 1
         
-        # Empaquetamos: [ReceiverIndex] + [Nonce] + [Ciphertext]
         return struct.pack('<I', self.remote_index) + nonce_bytes + ciphertext
 
     def decrypt_message(self, data_with_nonce):
         """
-        Descifra un mensaje de datos post-handshake usando Ventana Deslizante (Anti-Replay).
-        Espera: [Nonce (8B)] + [Ciphertext]
+        Descifra un mensaje y aplica protección contra ataques de repetición (Replay).
+        
+        Cómo lo hace:
+        1. Extrae el nonce del paquete recibido.
+        2. Comprueba si el nonce es válido usando una Ventana Deslizante (Bitmap).
+           - Si el nonce es demasiado antiguo (fuera de ventana), lo rechaza.
+           - Si el nonce ya está marcado en el bitmap, lo rechaza.
+        3. Si pasa el chequeo, intenta descifrar el contenido.
+        4. Si el descifrado es correcto, actualiza la ventana deslizante.
         """
         if self.decryptor is None:
-            raise Exception("Handshake not complete")
+            raise Exception("Handshake no completado")
         
         if len(data_with_nonce) < 8:
-            raise Exception("Message too short (missing nonce)")
+            raise Exception("Mensaje muy corto (falta nonce)")
 
-        # 1. Extraemos el nonce (secuencia) del paquete
         nonce_bytes = data_with_nonce[:8]
         ciphertext = data_with_nonce[8:]
         received_seq = struct.unpack('<Q', nonce_bytes)[0]
         
-        # 2. VALIDACIÓN DE REPLAY (Antes de descifrar para eficiencia, aunque auth tag también protege)
-        # self.rx_nonce rastrea el "Siguiente Esperado" (Máximo Visto + 1)
-        
+        # Validación Anti-Replay
         if received_seq < self.rx_nonce:
-            # Es un paquete antiguo
             diff = self.rx_nonce - received_seq
-            
-            # Chequeo A: ¿Es demasiado viejo?
             if diff > self.replay_window_size:
-                raise Exception(f"Replay Error: Message too old (seq {received_seq} < {self.rx_nonce - self.replay_window_size})")
+                raise Exception(f"Error de Replay: Mensaje muy antiguo (seq {received_seq} < {self.rx_nonce - self.replay_window_size})")
             
-            # Chequeo B: ¿Ya lo hemos visto en la ventana reciente?
-            # El bit 0 del mapa representa (rx_nonce - 1), el bit 1 es (rx_nonce - 2)...
             bit_index = diff - 1
             if (self.replay_bitmap >> bit_index) & 1:
-                raise Exception(f"Replay Error: Message {received_seq} already processed")
+                raise Exception(f"Error de Replay: Mensaje {received_seq} ya procesado")
 
-        # 3. Descifrado (Si falla la autenticación, lanza excepción y no actualizamos estado)
         iv = nonce_bytes + b'\x00'*4
         plaintext = self.decryptor.decrypt(iv, ciphertext, b'')
         
-        # 4. ACTUALIZACIÓN DE ESTADO (Solo si el descifrado fue exitoso)
+        # Actualización de estado (solo si el descifrado fue exitoso)
         if received_seq >= self.rx_nonce:
-            # Caso: Nuevo paquete más reciente. Avanzamos la ventana.
             jump = received_seq - self.rx_nonce + 1
-            
             if jump >= self.replay_window_size:
-                # Salto muy grande, limpiamos todo el historial
                 self.replay_bitmap = 0
             else:
-                # Desplazamos la ventana
                 self.replay_bitmap <<= jump
-            
-            # Marcamos el bit 0 que corresponde al paquete actual (received_seq) relativo al nuevo rx_nonce
             self.replay_bitmap |= 1
             self.rx_nonce = received_seq + 1
-            
         else:
-            # Caso: Paquete antiguo pero válido (dentro de la ventana). Lo marcamos.
             diff = self.rx_nonce - received_seq
             bit_index = diff - 1
             self.replay_bitmap |= (1 << bit_index)

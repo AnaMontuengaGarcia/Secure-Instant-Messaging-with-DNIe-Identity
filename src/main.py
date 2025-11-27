@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-# Configuración estándar de argumentos
+# Configuración estándar de argumentos de línea de comandos
 parser = argparse.ArgumentParser(description="DNIe Secure Messenger")
 parser.add_argument('-p', '--port', type=int, default=443, help="Puerto UDP (Default: 443)")
 parser.add_argument('-b', '--bind', type=str, default="0.0.0.0", help="IP de escucha (Default: 0.0.0.0)")
@@ -18,7 +18,13 @@ parser.add_argument('--mock', type=str, help="Simular DNIe para pruebas (Ej: --m
 args = parser.parse_args()
 
 def ensure_cert_structure():
-    """Asegura que existen las carpetas para la CA"""
+    """
+    Asegura que exista la estructura de directorios necesaria para certificados.
+    
+    Cómo lo hace:
+    Verifica si existe la carpeta 'certs'. Si no, la crea y añade un archivo README
+    con instrucciones para el usuario.
+    """
     if not os.path.exists('certs'):
         os.makedirs('certs')
         with open('certs/README.txt', 'w') as f:
@@ -26,33 +32,44 @@ def ensure_cert_structure():
 
 def derive_storage_key(signature_bytes):
     """
-    Deriva una clave simétrica de 32 bytes (para AES/Fernet) usando HKDF
-    sobre la firma RSA generada por el DNIe.
+    Deriva una clave simétrica criptográficamente fuerte a partir de la firma del DNIe.
+    
+    Cómo lo hace:
+    Usa HKDF (SHA256) tomando la firma digital (bytes) generada por la tarjeta
+    como material de entrada para producir una clave de 32 bytes apta para AES.
     """
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=None, # Sal vacía está permitida, o podríamos usar el Serial Hash como sal
+        salt=None,
         info=b'DNIe-Storage-Encryption-Key',
     )
     return hkdf.derive(signature_bytes)
 
 async def main_async(identity_data):
-    # Desempaquetamos los 4 elementos: ID, Pruebas, Firma de Almacenamiento y Clave Privada
-    # Nota: storage_signature viene del nuevo TUI
+    """
+    Función principal asíncrona que inicia el backend y la interfaz de usuario.
+    
+    Cómo lo hace:
+    1. Desempaqueta los datos de identidad obtenidos del login.
+    2. Deriva la clave de almacenamiento y carga la base de datos cifrada.
+    3. Inicializa el gestor de sesiones y el protocolo UDP.
+    4. Vincula el socket UDP al puerto especificado.
+    5. Inicia el servicio de descubrimiento mDNS.
+    6. Lanza la aplicación TUI (Textual) y espera a que termine.
+    7. Realiza el cierre limpio (guardado de datos, desconexión de red) al salir.
+    """
     user_id, proofs, storage_signature, local_static_key = identity_data
     
-    # Derivamos la clave de cifrado para el disco
-    print("🔐 Deriving storage key from DNIe signature...")
+    print("🔐 Derivando clave de almacenamiento desde la firma DNIe...")
     storage_key = derive_storage_key(storage_signature)
     
-    # Inicializamos el storage con la clave derivada
     storage = Storage(key_bytes=storage_key, data_dir=args.data)
     await storage.init()
     
     sessions = SessionManager(local_static_key, storage, local_proofs=proofs)
     
-    # Callback de log simple para la consola
+    # Callback de log simple para consola antes de que arranque la TUI
     proto = UDPProtocol(sessions, lambda a,m: None, lambda t: print(f"LOG: {t}"), on_ack_received=None)
     
     loop = asyncio.get_running_loop()
@@ -60,13 +77,13 @@ async def main_async(identity_data):
     discovery = None
 
     try:
-        print(f"🔌 Binding socket to {args.bind}:{args.port}...")
+        print(f"🔌 Vinculando socket a {args.bind}:{args.port}...")
         transport, _ = await loop.create_datagram_endpoint(
             lambda: proto,
             local_addr=(args.bind, args.port)
         )
     except Exception as e:
-        print(f"❌ Socket error: {e}")
+        print(f"❌ Error de Socket: {e}")
         print("💡 Consejo: Si el puerto 443 requiere permisos de root, prueba con un puerto alto: -p 5000")
         return
 
@@ -76,43 +93,45 @@ async def main_async(identity_data):
             format=serialization.PublicFormat.Raw
         )
         
-        # Iniciamos el servicio de descubrimiento (mDNS)
         discovery = DiscoveryService(args.port, pub_bytes, lambda n,i,p,pr: None)
         
-        # --- CRITICAL FIX: CONECTAR PROTOCOLO AL DESCUBRIMIENTO ---
-        # Esto permite que el cambio de IP detectado por mDNS notifique al protocolo para
-        # redirigir el tráfico y despertar las colas.
+        # Conectar protocolo al descubrimiento para soportar Roaming
         discovery.set_protocol(proto) 
         
-        # Lanzamos la interfaz de Chat (TUI)
         app = MessengerTUI(proto, discovery, storage, user_id=user_id, bind_ip=args.bind)
         await app.run_async()
         
     finally:
-        print("\n🛑 Closing application...")
+        print("\n🛑 Cerrando aplicación...")
         # 0. Guardamos datos cifrados finales
         await storage.close()
 
         if proto:
-            # 1. Enviamos el "Adiós" cifrado
+            # 1. Enviamos el "Adiós" cifrado a la red
             await proto.broadcast_disconnect()
 
         if discovery:
-            # 2. Enviamos el "Adiós" mDNS global
+            # 2. Detenemos anuncios mDNS
             await discovery.stop()
             
         if transport: transport.close()
         print("👋 Bye!")
 
 def perform_dnie_binding_gui():
-    """Realiza el binding usando la interfaz gráfica Textual (Login)"""
+    """
+    Gestiona la fase de Login / Autenticación antes de entrar al chat.
     
-    print("✨ Generating ephemeral identity key in memory...")
+    Cómo lo hace:
+    1. Genera una clave privada efímera en memoria para la sesión.
+    2. Si está en modo mock, devuelve datos falsos para pruebas.
+    3. Si no, lanza la aplicación 'DNIeLoginApp' para pedir PIN e interactuar con la tarjeta.
+    4. Retorna las credenciales firmadas y la firma de almacenamiento.
+    """
+    
+    print("✨ Generando clave de identidad efímera en memoria...")
     key_priv = x25519.X25519PrivateKey.generate()
 
-    # Si se usa el modo --mock
     if args.mock:
-        # Mock signature for storage
         mock_sig = b'\x00' * 256 
         return (args.mock, {'cert': '00', 'sig': '00'}, mock_sig, key_priv)
 
@@ -121,7 +140,6 @@ def perform_dnie_binding_gui():
         format=serialization.PublicFormat.Raw
     )
 
-    # 2. Lanzar la App de Login dedicada
     login_app = DNIeLoginApp(key_to_sign_bytes=key_pub_bytes)
     result = login_app.run() 
     
