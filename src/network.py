@@ -531,7 +531,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
             # Verificación de identidad del servidor/respondedor
             try:
                 real_name, issuer = verify_peer_identity(session.rs_pub, session.remote_proofs)
-                self.on_log(f"✅ Identidad del Par Verificada: {real_name}")
+                self.on_log(f"✅ Identidad del Par Verificada: {real_name} | Emisor: {issuer}")
                 asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], session.rs_pub, real_name=real_name))
             except Exception as e:
                 self.on_log(f"⛔ SEGURIDAD: Fallo verificación par: {e}")

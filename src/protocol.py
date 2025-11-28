@@ -22,39 +22,6 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 
-def secure_zeroize_key(key_obj):
-    """
-    Intenta borrar de forma segura los bytes de una clave criptográfica.
-    
-    Las claves de cryptography no exponen directamente sus bytes privados,
-    pero podemos intentar sobreescribir cualquier buffer interno accesible.
-    """
-    if key_obj is None:
-        return
-    try:
-        # Para claves privadas X25519, obtenemos los bytes y los borramos
-        if hasattr(key_obj, 'private_bytes'):
-            # Extraer bytes en formato raw para poder zeroizarlos
-            key_bytes = bytearray(key_obj.private_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PrivateFormat.Raw,
-                encryption_algorithm=serialization.NoEncryption()
-            ))
-            zeroize1(key_bytes)
-    except Exception:
-        pass  # Algunas claves pueden no soportar esta operación
-
-
-def secure_zeroize_bytes(data):
-    """Borra de forma segura un bytearray o bytes mutables."""
-    if data is None:
-        return
-    try:
-        if isinstance(data, bytearray):
-            zeroize1(data)
-    except Exception:
-        pass
-
 class NoiseIKState:
     """
     Máquina de estados para una sesión segura Noise IK.
@@ -123,10 +90,11 @@ class NoiseIKState:
         """
         Función de Derivación de Claves (HKDF).
         Usa BLAKE2s para derivar nuevas claves de encadenamiento y cifrado.
+        Retorna bytearray para poder zeroizar después.
         """
-        hkdf = HKDF(algorithm=hashes.BLAKE2s(digest_size=32), length=64, salt=km, info=b'')
-        output = hkdf.derive(material)
-        return output[:32], output[32:] # Retorna (nueva_ck, clave_cifrado)
+        hkdf = HKDF(algorithm=hashes.BLAKE2s(digest_size=32), length=64, salt=bytes(km), info=b'')
+        output = bytearray(hkdf.derive(material))
+        return output[:32], output[32:]  # Retorna (nueva_ck, clave_cifrado) como bytearray
 
     def _mix_key(self, ck, dh_out):
         """Mezcla el resultado de un DH en el estado (Stateful Hash)."""
@@ -136,7 +104,8 @@ class NoiseIKState:
         """Genera claves efímeras y finaliza el hash inicial."""
         self.e_priv = x25519.X25519PrivateKey.generate()
         self.e_pub = self.e_priv.public_key()
-        self.ck = self.chaining_key.finalize()
+        # Almacenamos ck como bytearray para poder zeroizarlo después
+        self.ck = bytearray(self.chaining_key.finalize())
 
     def _prepare_identity_payload(self):
         """Serializa las pruebas (Certificado + Firma) a JSON bytes."""
@@ -284,32 +253,29 @@ class NoiseIKState:
 
     def zeroize_session(self):
         """
-        Borra de forma segura todas las claves criptográficas de la sesión.
+        Limpia las claves criptográficas de la sesión.
         
         Debe llamarse cuando:
         - La sesión se cierra explícitamente
         - El peer se desconecta
         - La aplicación se cierra
         
-        Esto previene que las claves queden en memoria y puedan ser
-        extraídas mediante ataques de memoria (cold boot, memory dump, etc.)
-        """
-        # Borrar claves privadas
-        secure_zeroize_key(self.e_priv)
-        self.e_priv = None
+        NOTA: Las claves X25519 de cryptography no pueden ser zeroizadas
+        porque la librería no expone los bytes internos de forma mutable.
+        Solo podemos eliminar las referencias y confiar en el GC.
         
-        # Borrar chaining key si existe como bytes
+        El chaining key (ck) SÍ se almacena como bytearray y puede ser zeroizado.
+        """
+        # Borrar chaining key (almacenada como bytearray)
         if hasattr(self, 'ck') and self.ck is not None:
-            if isinstance(self.ck, (bytes, bytearray)):
-                secure_zeroize_bytes(bytearray(self.ck))
+            if isinstance(self.ck, bytearray):
+                zeroize1(self.ck)
             self.ck = None
         
-        # Los cifradores ChaCha20Poly1305 contienen claves internamente
-        # No podemos acceder directamente, pero los eliminamos
+        # Eliminar referencias a claves (no podemos zeroizar los bytes internos)
+        self.e_priv = None
         self.encryptor = None
         self.decryptor = None
-        
-        # Limpiar referencias a claves públicas remotas
         self.rs_pub = None
         self.re_pub = None
         

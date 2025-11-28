@@ -54,7 +54,7 @@ def derive_storage_key(signature_bytes):
         signature_bytes (bytes): La firma digital cruda generada por la tarjeta.
 
     Returns:
-        bytes: Una clave de 32 bytes.
+        bytearray: Una clave de 32 bytes (mutable para poder zeroizar).
     """
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
@@ -62,7 +62,7 @@ def derive_storage_key(signature_bytes):
         salt=None, # No usamos salt porque la fuente (firma RSA) ya tiene alta entropía
         info=b'DNIe-Storage-Encryption-Key', # Contexto para la derivación
     )
-    return hkdf.derive(signature_bytes)
+    return bytearray(hkdf.derive(signature_bytes))
 
 async def main_async(identity_data):
     """
@@ -143,11 +143,10 @@ async def main_async(identity_data):
         if transport: 
             transport.close()
         
-        # 5. Borrar la clave de almacenamiento derivada
+        # 5. Borrar la clave de almacenamiento derivada (ya es bytearray)
         if storage_key:
             try:
-                storage_key_ba = bytearray(storage_key)
-                zeroize1(storage_key_ba)
+                zeroize1(storage_key)
                 print("🔒 Clave de almacenamiento derivada borrada.")
             except Exception:
                 pass
