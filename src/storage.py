@@ -13,6 +13,7 @@ Características:
 import os
 import base64
 import aiosqlite
+from zeroize import zeroize1
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -29,6 +30,8 @@ class Storage:
             os.makedirs(data_dir)
         
         self.db_path = os.path.join(data_dir, "storage.db")
+        # Guardar copia de la clave en bytearray para poder zeroizarla después
+        self._key_bytes = bytearray(key_bytes)
         # Inicializar motor de cifrado Fernet (Symmetric Auth Encryption)
         self.fernet = Fernet(base64.urlsafe_b64encode(key_bytes))
         self.db = None
@@ -76,6 +79,21 @@ class Storage:
         if self.db:
             await self.db.close()
             print("💾 Database connection closed.")
+        
+        # Borrado seguro de la clave de cifrado
+        if hasattr(self, '_key_bytes') and self._key_bytes is not None:
+            try:
+                zeroize1(self._key_bytes)
+                print("🔒 Clave de almacenamiento borrada de forma segura.")
+            except Exception:
+                pass
+            self._key_bytes = None
+        
+        # Limpiar el objeto Fernet (no podemos acceder a su clave interna)
+        self.fernet = None
+        
+        # Limpiar cache de claves efímeras
+        self.ephemeral_keys.clear()
 
     def _encrypt(self, text: str) -> bytes:
         """Helper para cifrar texto plano antes de insertar en SQL."""

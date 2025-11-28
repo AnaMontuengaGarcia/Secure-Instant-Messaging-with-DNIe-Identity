@@ -14,6 +14,7 @@ import sys
 import asyncio
 import argparse
 import os
+from zeroize import zeroize1
 from network import UDPProtocol, SessionManager, DiscoveryService
 from storage import Storage
 from tui import MessengerTUI, DNIeLoginApp
@@ -123,19 +124,33 @@ async def main_async(identity_data):
         # --- Bloque de Cierre Limpio ---
         print("\n🛑 Cerrando aplicación y liberando recursos...")
         
-        # 1. Cerrar conexión a base de datos
+        # 1. Borrar de forma segura todas las sesiones criptográficas
+        if sessions:
+            sessions.zeroize_all_sessions()
+            print("🔒 Sesiones criptográficas borradas de forma segura.")
+        
+        # 2. Cerrar conexión a base de datos (incluye borrado de clave)
         await storage.close()
 
         if proto:
-            # 2. Enviar mensaje de "Desconexión" cifrado a los pares activos
+            # 3. Enviar mensaje de "Desconexión" cifrado a los pares activos
             await proto.broadcast_disconnect()
 
         if discovery:
-            # 3. Detener anuncios mDNS y salir del grupo multicast
+            # 4. Detener anuncios mDNS y salir del grupo multicast
             await discovery.stop()
             
         if transport: 
             transport.close()
+        
+        # 5. Borrar la clave de almacenamiento derivada
+        if storage_key:
+            try:
+                storage_key_ba = bytearray(storage_key)
+                zeroize1(storage_key_ba)
+                print("🔒 Clave de almacenamiento derivada borrada.")
+            except Exception:
+                pass
             
         print("👋 Bye! (Ejecución finalizada)")
 

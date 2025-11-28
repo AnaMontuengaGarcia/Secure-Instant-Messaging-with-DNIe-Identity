@@ -249,7 +249,11 @@ class SessionManager:
         session.peer_identity = identity
 
     def remove_session(self, session):
-        """Elimina una sesión de todos los registros."""
+        """Elimina una sesión de todos los registros y borra sus claves de forma segura."""
+        # Borrado seguro de claves de la sesión
+        if hasattr(session, 'zeroize_session'):
+            session.zeroize_session()
+        
         if session.local_index in self.sessions_by_id:
             del self.sessions_by_id[session.local_index]
         
@@ -257,6 +261,14 @@ class SessionManager:
         if identity and identity in self.sessions:
             if self.sessions[identity] is session:
                 del self.sessions[identity]
+
+    def zeroize_all_sessions(self):
+        """Borra de forma segura todas las sesiones activas. Llamar al cerrar la aplicación."""
+        for session in list(self.sessions_by_id.values()):
+            if hasattr(session, 'zeroize_session'):
+                session.zeroize_session()
+        self.sessions.clear()
+        self.sessions_by_id.clear()
 
     def create_initiator_session(self, remote_pub_key, identity=None):
         """
@@ -554,6 +566,11 @@ class UDPProtocol(asyncio.DatagramProtocol):
         
         session = self.sessions.get_session_by_id(receiver_index)
         if not session: return
+        
+        # Si la sesión fue invalidada (zeroizada), ignorar el paquete silenciosamente
+        # Esto ocurre cuando el peer envía desconexión por mDNS y luego llega el paquete UDP
+        if not session.decryptor:
+            return
         
         user_id = getattr(session, 'peer_identity', None)
         
@@ -886,11 +903,16 @@ class DiscoveryService:
              self.on_found_callback(user_id, ip, port, props)
         
         # Manejar desconexión voluntaria
-        if props.get('stat') == 'exit' and self.protocol_ref:
+        if props.get('stat') == 'exit':
             self.on_log(f"📴 Peer {user_id} anunció desconexión (stat=exit)")
-            session = self.protocol_ref.sessions.get_session(user_id)
-            if session:
-                session.encryptor = None # Invalidar sesión
+            if self.protocol_ref:
+                session = self.protocol_ref.sessions.get_session(user_id)
+                if session:
+                    # Borrado seguro de claves de la sesión
+                    if hasattr(session, 'zeroize_session'):
+                        session.zeroize_session()
+                    else:
+                        session.encryptor = None
             return
         
         # Actualizar dirección IP en el protocolo

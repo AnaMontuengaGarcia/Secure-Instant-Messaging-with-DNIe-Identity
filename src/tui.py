@@ -354,9 +354,13 @@ class MessengerTUI(App):
         session = self.proto.sessions.get_session(user_id)
         if session and session.encryptor:
             self.add_log(f"🔒 Sesión invalidada para {user_id} ({reason})")
-            # Invalidar los cifradores para forzar un nuevo handshake
-            session.encryptor = None
-            session.decryptor = None
+            # Borrar de forma segura las claves de la sesión
+            if hasattr(session, 'zeroize_session'):
+                session.zeroize_session()
+            else:
+                # Fallback: solo invalidar los cifradores
+                session.encryptor = None
+                session.decryptor = None
 
     def _is_peer_online(self, user_id: str) -> bool:
         """Helper para el protocolo: ¿Debemos reintentar enviar?"""

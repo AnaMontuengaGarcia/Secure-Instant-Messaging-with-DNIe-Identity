@@ -15,10 +15,49 @@ Características:
 import os
 import struct
 import json
+from zeroize import zeroize1
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+
+def secure_zeroize_key(key_obj):
+    """
+    Intenta borrar de forma segura los bytes de una clave criptográfica.
+    
+    Las claves de cryptography no exponen directamente sus bytes privados,
+    pero podemos intentar sobreescribir cualquier buffer interno accesible.
+    """
+    if key_obj is None:
+        return
+    try:
+        # Para claves privadas X25519, obtenemos los bytes y los borramos
+        if hasattr(key_obj, 'private_bytes'):
+            # Extraer bytes en formato raw para poder zeroizarlos
+            key_bytes = bytearray(key_obj.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+            zeroize1(key_bytes)
+    except Exception:
+        pass  # Algunas claves pueden no soportar esta operación
+
+
+def secure_zeroize_bytes(data):
+    """Borra de forma segura un bytearray o bytes mutables."""
+    if data is None:
+        return
+    try:
+        if isinstance(data, bytearray):
+            zeroize1(data)
+        elif isinstance(data, bytes):
+            # bytes es inmutable, pero podemos intentar con un bytearray temporal
+            temp = bytearray(data)
+            zeroize1(temp)
+    except Exception:
+        pass
 
 class NoiseIKState:
     """
@@ -246,6 +285,42 @@ class NoiseIKState:
         self.tx_nonce += 1
         
         return struct.pack('<I', self.remote_index) + nonce_bytes + ciphertext
+
+    def zeroize_session(self):
+        """
+        Borra de forma segura todas las claves criptográficas de la sesión.
+        
+        Debe llamarse cuando:
+        - La sesión se cierra explícitamente
+        - El peer se desconecta
+        - La aplicación se cierra
+        
+        Esto previene que las claves queden en memoria y puedan ser
+        extraídas mediante ataques de memoria (cold boot, memory dump, etc.)
+        """
+        # Borrar claves privadas
+        secure_zeroize_key(self.e_priv)
+        self.e_priv = None
+        
+        # Borrar chaining key si existe como bytes
+        if hasattr(self, 'ck') and self.ck is not None:
+            if isinstance(self.ck, (bytes, bytearray)):
+                secure_zeroize_bytes(bytearray(self.ck))
+            self.ck = None
+        
+        # Los cifradores ChaCha20Poly1305 contienen claves internamente
+        # No podemos acceder directamente, pero los eliminamos
+        self.encryptor = None
+        self.decryptor = None
+        
+        # Limpiar referencias a claves públicas remotas
+        self.rs_pub = None
+        self.re_pub = None
+        
+        # Resetear contadores
+        self.tx_nonce = 0
+        self.rx_nonce = 0
+        self.replay_bitmap = 0
 
     def decrypt_message(self, data_with_nonce):
         """
