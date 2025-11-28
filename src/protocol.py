@@ -52,10 +52,6 @@ def secure_zeroize_bytes(data):
     try:
         if isinstance(data, bytearray):
             zeroize1(data)
-        elif isinstance(data, bytes):
-            # bytes es inmutable, pero podemos intentar con un bytearray temporal
-            temp = bytearray(data)
-            zeroize1(temp)
     except Exception:
         pass
 
