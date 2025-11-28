@@ -160,44 +160,71 @@ def verify_peer_identity(x25519_pub_key, proofs):
 class SessionManager:
     """
     Gestor central de sesiones criptográficas Noise IK.
-    Administra el mapeo entre direcciones IP, IDs de sesión y claves públicas.
+    Usa la identidad DNIe (real_name) como clave principal para las sesiones.
     """
     def __init__(self, local_static_key, db, local_proofs):
         self.local_static_key = local_static_key
         self.local_proofs = local_proofs
-        self.sessions_by_addr = {}
+        # Diccionario principal: real_name (DNIe) -> session
+        self.sessions = {}
+        # Índice secundario necesario para recibir paquetes (el protocolo usa local_index)
         self.sessions_by_id = {}
-        self.sessions_by_identity = {} 
         self.db = db
         self.transport = None
 
-    def get_session_by_addr(self, addr):
-        """Busca una sesión activa por dirección IP."""
-        return self.sessions_by_addr.get(addr)
+    def get_session(self, identity):
+        """Busca una sesión por identidad DNIe (real_name)."""
+        return self.sessions.get(identity)
     
     def get_session_by_id(self, idx):
-        """Busca una sesión por su ID de multiplexación local."""
+        """Busca una sesión por su ID de multiplexación local (necesario para recibir paquetes)."""
         return self.sessions_by_id.get(idx)
-    
-    def get_session_by_pubkey(self, pub_bytes):
-        """Busca una sesión por la clave pública del peer (independiente de IP)."""
-        return self.sessions_by_identity.get(pub_bytes)
 
-    def register_session(self, session, addr):
+    def register_session(self, session, identity=None):
         """
-        Registra una sesión nueva en los índices de búsqueda rápida.
-        Asocia la sesión con la IP, el ID local y la identidad remota.
+        Registra una sesión nueva.
+        Si ya existe una sesión para esta identidad, la reemplaza.
         """
-        self.sessions_by_addr[addr] = session
+        # Limpiar sesión anterior si existe para esta identidad
+        if identity and identity in self.sessions:
+            old_session = self.sessions[identity]
+            if old_session.local_index in self.sessions_by_id:
+                del self.sessions_by_id[old_session.local_index]
+        
+        # Registrar en índice por ID (siempre)
         self.sessions_by_id[session.local_index] = session
-        session.current_addr = addr
-        if session.rs_pub:
-            pub_bytes = session.rs_pub.public_bytes(
-                serialization.Encoding.Raw, serialization.PublicFormat.Raw
-            )
-            self.sessions_by_identity[pub_bytes] = session
+        
+        # Registrar por identidad si la conocemos
+        if identity:
+            self.sessions[identity] = session
+            session.peer_identity = identity
 
-    def create_initiator_session(self, addr, remote_pub_key):
+    def update_session_identity(self, session, identity):
+        """
+        Actualiza/establece la identidad de una sesión tras verificar el DNIe.
+        Si ya existe otra sesión para esta identidad, la reemplaza.
+        """
+        # Si ya hay una sesión para esta identidad y no es la misma, limpiarla
+        if identity in self.sessions:
+            old_session = self.sessions[identity]
+            if old_session is not session:
+                if old_session.local_index in self.sessions_by_id:
+                    del self.sessions_by_id[old_session.local_index]
+        
+        self.sessions[identity] = session
+        session.peer_identity = identity
+
+    def remove_session(self, session):
+        """Elimina una sesión de todos los índices."""
+        if session.local_index in self.sessions_by_id:
+            del self.sessions_by_id[session.local_index]
+        
+        identity = getattr(session, 'peer_identity', None)
+        if identity and identity in self.sessions:
+            if self.sessions[identity] is session:
+                del self.sessions[identity]
+
+    def create_initiator_session(self, remote_pub_key, identity=None):
         """
         Crea una nueva sesión en modo INICIADOR (Cliente).
         Prepara el estado Noise IK para comenzar el handshake.
@@ -209,11 +236,11 @@ class SessionManager:
             local_proofs=self.local_proofs
         )
         session.initialize()
-        self.register_session(session, addr)
-        self.db.ephemeral_keys[addr] = remote_pub_key
+        session.peer_identity = identity
+        self.register_session(session, identity)
         return session
 
-    def create_responder_session(self, addr):
+    def create_responder_session(self):
         """
         Crea una nueva sesión en modo RESPONDEDOR (Servidor).
         Espera recibir el primer mensaje del handshake.
@@ -224,29 +251,17 @@ class SessionManager:
             local_proofs=self.local_proofs
         )
         session.initialize()
-        self.register_session(session, addr)
+        session.peer_identity = None
+        # Solo registramos en sessions_by_id, la identidad se añade tras verificar DNIe
+        self.sessions_by_id[session.local_index] = session
         return session
-        
-    def update_session_addr(self, session, new_addr):
-        """
-        Actualiza la dirección IP asociada a una sesión existente (Roaming).
-        Mueve la referencia en el diccionario de sesiones por dirección.
-        """
-        if session.current_addr != new_addr:
-            if session.current_addr in self.sessions_by_addr:
-                del self.sessions_by_addr[session.current_addr]
-            session.current_addr = new_addr
-            self.sessions_by_addr[new_addr] = session
-            return True
-        return False
 
 # --- PROTOCOLO UDP ---
 
 class UDPProtocol(asyncio.DatagramProtocol):
     """
     Implementación del protocolo de red UDP asíncrono.
-    Maneja el ciclo de vida de la conexión, envío/recepción de paquetes,
-    reintentos, handshake criptográfico y lógica de roaming.
+    Usa la identidad DNIe (user_id/real_name) como clave para gestionar sesiones.
     """
     def __init__(self, session_manager, on_message_received, on_log, on_handshake_success=None, on_ack_received=None):
         self.sessions = session_manager
@@ -256,24 +271,26 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.on_ack_received = on_ack_received
         self.transport = None
         
-        # Colas de mensajes y estado
+        # Colas de mensajes por identidad (user_id)
         self.message_queues = {}
-        self.latest_peer_locations = {}
+        # Mapeo: user_id -> (ip, port) actual
+        self.peer_addresses = {}
+        # Mapeo: (ip, port) -> user_id (inverso, para recibir mensajes)
+        self.addr_to_identity = {}
+        # Handshakes pendientes por user_id
         self.pending_handshakes = {}
         self.dedup_buffer = deque(maxlen=200)
         
         # Callbacks para integración con UI
         self.get_peer_addr_callback = None
         self.get_user_id_callback = None
+        self.is_peer_online_callback = None  # Para verificar si el peer está online antes de retry
         self.discovery_service = None 
         
         self._retry_task_handle = None
 
     def connection_made(self, transport):
-        """
-        Evento de inicio del protocolo.
-        Configura el transporte y lanza la tarea de reenvío de mensajes en segundo plano.
-        """
+        """Evento de inicio del protocolo."""
         self.transport = transport
         self.sessions.transport = transport
         try:
@@ -283,38 +300,53 @@ class UDPProtocol(asyncio.DatagramProtocol):
         except: pass
         self._retry_task_handle = asyncio.create_task(self._retry_worker())
 
-    def update_peer_location(self, new_addr, pub_bytes):
+    def update_peer_location(self, user_id, new_addr, pub_key_obj=None):
         """
-        Actualiza la ubicación de un par basada en datos de mDNS.
-        Si la IP ha cambiado, actualiza la sesión activa para mantener la conexión (Roaming).
+        Actualiza la ubicación (IP:puerto) de un peer identificado por su user_id.
+        Se llama cuando recibimos anuncios mDNS o cuando un peer envía un mensaje.
         """
-        pub_hex_short = pub_bytes.hex()[:8] if pub_bytes else "None"
-        old_addr = self.latest_peer_locations.get(pub_bytes)
-        if old_addr == new_addr: return 
-
-        self.on_log(f"📡 Discovery update: par {pub_hex_short}... en {new_addr}")
+        old_addr = self.peer_addresses.get(user_id)
         
-        if pub_bytes:
-            self.latest_peer_locations[pub_bytes] = new_addr
-            if old_addr and old_addr != new_addr:
-                self.on_log(f"📍 CAMBIO DE IP: {old_addr} -> {new_addr}")
-                self.pending_handshakes.pop(old_addr, None)
-            
-            try:
-                pub_key_obj = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
-                self.sessions.db.ephemeral_keys[new_addr] = pub_key_obj
-            except Exception as e:
-                self.on_log(f"❌ Error actualizando ubicación peer: {e}")
-
-        session = self.sessions.get_session_by_pubkey(pub_bytes)
+        if old_addr == new_addr:
+            return  # Sin cambios
+        
+        self.on_log(f"📡 Ubicación de {user_id}: {old_addr} -> {new_addr}")
+        
+        # Limpiar mapeo inverso antiguo
+        if old_addr and old_addr in self.addr_to_identity:
+            del self.addr_to_identity[old_addr]
+        
+        # Actualizar mapeos
+        self.peer_addresses[user_id] = new_addr
+        self.addr_to_identity[new_addr] = user_id
+        
+        # Guardar clave pública efímera para handshakes
+        if pub_key_obj:
+            self.sessions.db.ephemeral_keys[new_addr] = pub_key_obj
+        
+        # Si hay sesión existente para este usuario, actualizar su dirección
+        session = self.sessions.get_session(user_id)
         if session:
-            if session.current_addr != new_addr:
-                self.on_log(f"🔄 Actualización dirección sesión: {session.current_addr} -> {new_addr}")
-                self.sessions.update_session_addr(session, new_addr)
-                # Invalidamos encriptador para forzar renegociación si es necesario o por seguridad
-                if session.encryptor:
+            session.current_addr = new_addr
+            # Si cambió la dirección y teníamos handshake pendiente en la vieja, limpiarlo
+            if old_addr:
+                self.pending_handshakes.pop(user_id, None)
+            # Invalidar cifrado - necesitamos nuevo handshake porque la clave efímera cambió
+            if pub_key_obj and session.rs_pub:
+                old_pub = session.rs_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+                new_pub = pub_key_obj.public_bytes_raw() if hasattr(pub_key_obj, 'public_bytes_raw') else pub_key_obj.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+                if old_pub != new_pub:
+                    self.on_log(f"🔄 {user_id} reconectó con nueva clave, invalidando sesión")
                     session.encryptor = None
                     session.decryptor = None
+
+    def get_identity_from_addr(self, addr):
+        """Obtiene el user_id asociado a una dirección."""
+        return self.addr_to_identity.get(addr)
+
+    def get_addr_for_identity(self, user_id):
+        """Obtiene la dirección actual de un usuario."""
+        return self.peer_addresses.get(user_id)
 
     async def _retry_worker(self):
         """
@@ -329,67 +361,66 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 if not queue: continue
                 head = queue[0]
                 
-                target_addr = None
-                if self.get_peer_addr_callback:
-                    target_addr = self.get_peer_addr_callback(user_id)
-                if not target_addr: continue
+                # Obtener dirección actual del peer
+                target_addr = self.peer_addresses.get(user_id)
+                if not target_addr:
+                    continue
                 
-                session = self.sessions.get_session_by_addr(target_addr)
+                # Buscar sesión por identidad
+                session = self.sessions.get_session(user_id)
                 
-                # Si hay sesión establecida, reintentar envío cifrado
+                # Si hay sesión establecida con encryptor válido
                 if session and session.encryptor:
                     try:
                         head['last_retry'] = now
                         head['attempts'] += 1
-                        await self._transmit_raw(target_addr, head['content'], head['msg_id'], timestamp=head['timestamp'])
-                    except Exception: pass
-                # Si no, intentar Handshake de nuevo
+                        await self._transmit_raw(user_id, head['content'], head['msg_id'], timestamp=head['timestamp'])
+                    except Exception as e:
+                        self.on_log(f"❌ Retry fallido: {e}")
+                # Si no hay sesión o el encryptor es inválido, iniciar handshake
                 else:
-                    last_hs = self.pending_handshakes.get(target_addr, 0)
+                    # Verificar si el peer está online antes de reintentar
+                    if self.is_peer_online_callback and not self.is_peer_online_callback(user_id):
+                        # Peer no está online, no reintentar handshake
+                        continue
+                    
+                    last_hs = self.pending_handshakes.get(user_id, 0)
                     if now - last_hs > 5.0:
                         try:
                             remote_pub = await self.sessions.db.get_pubkey_by_addr(target_addr[0], target_addr[1])
                             if remote_pub:
-                                new_session = self.sessions.create_initiator_session(target_addr, remote_pub)
+                                self.on_log(f"🔄 Retry: Iniciando handshake con {user_id} @ {target_addr}")
+                                new_session = self.sessions.create_initiator_session(remote_pub, user_id)
+                                new_session.current_addr = target_addr
                                 hs_msg = new_session.create_handshake_message()
                                 self.transport.sendto(b'\x01' + hs_msg, target_addr)
-                                self.pending_handshakes[target_addr] = now
-                        except Exception: pass
+                                self.pending_handshakes[user_id] = now
+                        except Exception as e:
+                            self.on_log(f"❌ Error en retry handshake: {e}")
 
     async def _send_next_in_queue(self, user_id):
-        """
-        Envía el siguiente mensaje en la cola tras recibir un ACK del anterior.
-        Garantiza el orden de entrega.
-        """
+        """Envía el siguiente mensaje en la cola tras recibir un ACK."""
         if user_id not in self.message_queues: return
         queue = self.message_queues[user_id]
         if not queue: return
         head = queue[0]
         
-        target_addr = None
-        if self.get_peer_addr_callback:
-            target_addr = self.get_peer_addr_callback(user_id)
-        if not target_addr: return
-        
-        session = self.sessions.get_session_by_addr(target_addr)
+        session = self.sessions.get_session(user_id)
         if session and session.encryptor:
             try:
                 head['last_retry'] = time.time()
                 head['attempts'] += 1
-                await self._transmit_raw(target_addr, head['content'], head['msg_id'], timestamp=head['timestamp'])
+                await self._transmit_raw(user_id, head['content'], head['msg_id'], timestamp=head['timestamp'])
             except Exception: pass
 
-    async def _attempt_send_head(self, addr, item):
+    async def _attempt_send_head(self, user_id, item):
         """Intenta enviar el primer mensaje de una cola nueva."""
         item['last_retry'] = time.time()
         item['attempts'] += 1
-        await self._transmit_raw(addr, item['content'], item['msg_id'], timestamp=item['timestamp'])
+        await self._transmit_raw(user_id, item['content'], item['msg_id'], timestamp=item['timestamp'])
 
     def datagram_received(self, data, addr):
-        """
-        Punto de entrada de paquetes UDP.
-        Despacha según el tipo de paquete (Handshake Init, Resp, Datos).
-        """
+        """Punto de entrada de paquetes UDP."""
         if len(data) < 1: return
         try:
             packet_type = data[0]
@@ -409,7 +440,8 @@ class UDPProtocol(asyncio.DatagramProtocol):
         Crea sesión, verifica identidad y envía respuesta.
         """
         self.on_log(f"🔄 Handshake Init desde {addr}")
-        session = self.sessions.create_responder_session(addr)
+        session = self.sessions.create_responder_session()
+        session.current_addr = addr
         try:
             remote_pub = session.consume_handshake_message(data)
             try:
@@ -417,11 +449,19 @@ class UDPProtocol(asyncio.DatagramProtocol):
                 self.on_log(f"✅ Identidad Verificada: {real_name} | Emisor: {issuer}")
             except Exception as e:
                 self.on_log(f"⛔ ALERTA DE SEGURIDAD: {e}")
+                self.sessions.remove_session(session)
                 return
 
-            pub_bytes = remote_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-            self.sessions.sessions_by_identity[pub_bytes] = session
-            self.latest_peer_locations[pub_bytes] = addr
+            # Usar el user_id que ya conocíamos por mDNS, o el real_name si es nuevo
+            user_id = self.addr_to_identity.get(addr, real_name)
+            self.sessions.update_session_identity(session, user_id)
+            
+            # Actualizar mapeos de direcciones
+            self.peer_addresses[user_id] = addr
+            self.addr_to_identity[addr] = user_id
+            
+            # Limpiar handshake pendiente si existía
+            self.pending_handshakes.pop(user_id, None)
 
             resp_data = session.create_handshake_response()
             self.transport.sendto(b'\x02' + resp_data, addr)
@@ -431,99 +471,83 @@ class UDPProtocol(asyncio.DatagramProtocol):
             if self.on_handshake_success:
                 self.on_handshake_success(addr, remote_pub, real_name)
             
-            user_id = None
-            if self.get_user_id_callback:
-                user_id = self.get_user_id_callback(addr)
-            if user_id and user_id in self.message_queues and self.message_queues[user_id]:
-                self.on_log(f"🚀 Handshake completado, enviando mensajes pendientes...")
+            # Enviar mensajes pendientes si los hay
+            if user_id in self.message_queues and self.message_queues[user_id]:
+                self.on_log(f"🚀 Handshake completado, enviando mensajes pendientes a {user_id}...")
                 asyncio.create_task(self._flush_pending_queue(user_id, session))
                 
         except Exception as e:
             self.on_log(f"❌ Handshake fallido: {e}")
-            if session.local_index in self.sessions.sessions_by_id:
-                del self.sessions.sessions_by_id[session.local_index]
+            self.sessions.remove_session(session)
 
     def handle_handshake_resp(self, data, addr):
         """
         Maneja la recepción de una respuesta de Handshake (Lado Iniciador).
         Finaliza el establecimiento de claves y verifica identidad.
         """
-        self.pending_handshakes.pop(addr, None)
         if len(data) < 8: return
         receiver_index = struct.unpack('<I', data[4:8])[0]
         session = self.sessions.get_session_by_id(receiver_index)
         if not session: return
 
         try:
-            # Roaming durante handshake
-            if self.sessions.update_session_addr(session, addr):
-                 self.on_log(f"ℹ️ Peer {session.local_index} hizo roaming a {addr}")
-
+            session.current_addr = addr
             session.consume_handshake_response(data)
+            
             try:
                 real_name, issuer = verify_peer_identity(session.rs_pub, session.remote_proofs)
                 self.on_log(f"✅ Identidad Verificada: {real_name} (Completado) | Emisor: {issuer}")
                 asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], session.rs_pub, real_name=real_name))
             except Exception as e:
                 self.on_log(f"⛔ ALERTA DE SEGURIDAD: {e}")
+                self.sessions.remove_session(session)
                 return
 
-            pub_bytes = session.rs_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-            self.sessions.sessions_by_identity[pub_bytes] = session
-            self.latest_peer_locations[pub_bytes] = addr
+            # Usar el user_id con el que se creó la sesión, o el de addr_to_identity
+            user_id = getattr(session, 'peer_identity', None) or self.addr_to_identity.get(addr, real_name)
+            self.sessions.update_session_identity(session, user_id)
+            
+            # Actualizar mapeos de direcciones
+            self.peer_addresses[user_id] = addr
+            self.addr_to_identity[addr] = user_id
+            
+            # Limpiar handshake pendiente
+            self.pending_handshakes.pop(user_id, None)
 
             if self.on_handshake_success:
                 self.on_handshake_success(addr, session.rs_pub, real_name)
 
-            user_id = None
-            if self.get_user_id_callback:
-                user_id = self.get_user_id_callback(addr)
-            if user_id and user_id in self.message_queues and self.message_queues[user_id]:
-                self.on_log(f"🚀 Handshake completado, liberando cola...")
+            # Enviar mensajes pendientes
+            if user_id in self.message_queues and self.message_queues[user_id]:
+                self.on_log(f"🚀 Handshake completado, liberando cola para {user_id}...")
                 asyncio.create_task(self._flush_pending_queue(user_id, session))
 
         except Exception as e:
             self.on_log(f"❌ Completado de Handshake fallido: {e}")
 
     def handle_data(self, data, addr):
-        """
-        Maneja paquetes de datos cifrados (Mensajes de chat).
-        Incluye lógica de Roaming para actualizar la UI si la IP cambió.
-        """
+        """Maneja paquetes de datos cifrados (Mensajes de chat)."""
         if len(data) < 4: return
         receiver_index = struct.unpack('<I', data[:4])[0]
         encrypted_payload = data[4:]
         session = self.sessions.get_session_by_id(receiver_index)
         if not session: return
         
-        # --- LOGICA DE ROAMING PROACTIVO ---
+        # Obtener identidad del peer
+        user_id = getattr(session, 'peer_identity', None)
+        
+        # Actualizar dirección si cambió (roaming)
         if session.current_addr != addr:
-             self.on_log(f"🚀 Roaming detectado: Peer movido de {session.current_addr} a {addr}")
-             
-             # 1. Obtener ID del usuario en la ubicación antigua
-             user_id = None
-             if self.get_user_id_callback and session.current_addr:
-                 user_id = self.get_user_id_callback(session.current_addr)
-             
-             # 2. Actualizar sesión de red
-             self.sessions.update_session_addr(session, addr)
-             
-             # 3. Notificar a UI (Simulando descubrimiento)
-             if user_id and self.discovery_service:
-                 pub_hex = ""
-                 if session.rs_pub:
-                     pub_hex = session.rs_pub.public_bytes(
-                        serialization.Encoding.Raw, 
-                        serialization.PublicFormat.Raw
-                     ).hex()
-                 
-                 self.on_log(f"🔄 Sincronizando UI: {user_id} -> {addr}")
-                 self.discovery_service.on_found(user_id, addr[0], addr[1], {'pub': pub_hex, 'roaming': 'true'})
-
-             if session.rs_pub:
-                 pub_bytes = session.rs_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-                 self.latest_peer_locations[pub_bytes] = addr
-        # -----------------------------------
+            self.on_log(f"🚀 Roaming detectado: {user_id} movido de {session.current_addr} a {addr}")
+            old_addr = session.current_addr
+            session.current_addr = addr
+            
+            # Actualizar mapeos
+            if user_id:
+                self.peer_addresses[user_id] = addr
+                if old_addr in self.addr_to_identity:
+                    del self.addr_to_identity[old_addr]
+                self.addr_to_identity[addr] = user_id
         
         try:
             plaintext = session.decrypt_message(encrypted_payload)
@@ -531,10 +555,6 @@ class UDPProtocol(asyncio.DatagramProtocol):
 
             if 'ack_id' in msg_struct:
                 ack_id = msg_struct['ack_id']
-                user_id = None
-                if self.get_user_id_callback:
-                    user_id = self.get_user_id_callback(addr)
-                
                 if user_id and user_id in self.message_queues:
                     queue = self.message_queues[user_id]
                     if queue and queue[0]['msg_id'] == ack_id:
@@ -580,36 +600,49 @@ class UDPProtocol(asyncio.DatagramProtocol):
         queue = self.message_queues[user_id]
         if not queue: return
         if not session or not session.encryptor: return
-        target_addr = session.current_addr
-        if not target_addr: return
         head = queue[0]
         try:
             head['last_retry'] = time.time()
             head['attempts'] += 1
-            await self._transmit_raw(target_addr, head['content'], head['msg_id'], timestamp=head['timestamp'])
-            self.on_log(f"📤 Mensaje pendiente volcado a {target_addr}")
+            await self._transmit_raw(user_id, head['content'], head['msg_id'], timestamp=head['timestamp'])
+            self.on_log(f"📤 Mensaje pendiente volcado a {user_id}")
         except Exception as e:
             self.on_log(f"❌ Volcado fallido: {e}")
 
     async def broadcast_disconnect(self):
-        """Anuncia desconexión cifrada."""
+        """Anuncia desconexión cifrada a todas las sesiones activas."""
         self.on_log("📡 Enviando desconexión cifrada...")
-        active_sessions = list(self.sessions.sessions_by_addr.values())
         tasks = []
-        for sess in active_sessions:
-            tasks.append(self._transmit_raw(sess.current_addr, None, str(uuid.uuid4()), is_disconnect=True))
+        for user_id, session in list(self.sessions.sessions.items()):
+            if session.encryptor and session.current_addr:
+                tasks.append(self._send_disconnect_to_session(session))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def send_message(self, addr, content, is_disconnect=False, forced_msg_id=None, user_id=None):
-        """Encola un mensaje para envío."""
+    async def _send_disconnect_to_session(self, session):
+        """Envía mensaje de desconexión a una sesión específica."""
+        try:
+            msg_struct = {"timestamp": time.time(), "disconnect": True}
+            payload = json.dumps(msg_struct).encode('utf-8')
+            full_packet_payload = session.encrypt_message(payload)
+            self.transport.sendto(b'\x03' + full_packet_payload, session.current_addr)
+        except Exception:
+            pass
+
+    async def send_message(self, user_id, content, is_disconnect=False, forced_msg_id=None):
+        """Encola un mensaje para envío a un usuario identificado por su DNIe."""
         msg_id = forced_msg_id if forced_msg_id else str(uuid.uuid4())
+        
         if is_disconnect:
-            await self._transmit_raw(addr, content, msg_id, is_disconnect=True)
+            session = self.sessions.get_session(user_id)
+            if session and session.encryptor:
+                await self._send_disconnect_to_session(session)
             return msg_id
+        
         if not user_id:
             self.on_log(f"❌ No se puede encolar: falta user_id")
             return None
+            
         if user_id not in self.message_queues:
             self.message_queues[user_id] = deque()
         queue = self.message_queues[user_id]
@@ -621,35 +654,46 @@ class UDPProtocol(asyncio.DatagramProtocol):
             'timestamp': time.time()
         })
         if len(queue) == 1:
-            await self._attempt_send_head(addr, queue[0])
+            await self._attempt_send_head(user_id, queue[0])
         return msg_id
 
-    async def _transmit_raw(self, addr, content, msg_id, is_disconnect=False, timestamp=None):
-        """Transmite un paquete por la red."""
-        session = self.sessions.get_session_by_addr(addr)
-        is_handshake_pending = addr in self.pending_handshakes and (time.time() - self.pending_handshakes[addr] < 5.0)
+    async def _transmit_raw(self, user_id, content, msg_id, is_disconnect=False, timestamp=None):
+        """Transmite un paquete por la red a un usuario identificado."""
+        # Obtener dirección actual del peer
+        target_addr = self.peer_addresses.get(user_id)
+        if not target_addr:
+            self.on_log(f"❌ No se conoce la dirección de {user_id}")
+            return
+        
+        # Buscar sesión por identidad
+        session = self.sessions.get_session(user_id)
+        is_handshake_pending = user_id in self.pending_handshakes and (time.time() - self.pending_handshakes[user_id] < 5.0)
 
+        # Si hay sesión pero sin encryptor válido
         if session and session.encryptor is None:
-            if not is_handshake_pending:
-                if session.current_addr in self.sessions.sessions_by_addr:
-                    del self.sessions.sessions_by_addr[session.current_addr]
-                session = None
-            else:
-                return 
+            if is_handshake_pending:
+                return  # Esperar a que termine el handshake
+            # Sesión obsoleta, no la borramos solo marcamos para nuevo handshake
+            session = None
 
-        if not session:
-            if is_handshake_pending: return
-            remote_pub = await self.sessions.db.get_pubkey_by_addr(addr[0], addr[1])
+        # Si no hay sesión válida, iniciar handshake
+        if not session or not session.encryptor:
+            if is_handshake_pending:
+                return
+            remote_pub = await self.sessions.db.get_pubkey_by_addr(target_addr[0], target_addr[1])
             if not remote_pub:
-                self.on_log(f"❌ No se puede enviar: Faltan claves públicas para {addr}")
+                self.on_log(f"❌ No se puede enviar a {user_id}: Faltan claves públicas")
                 return 
-            session = self.sessions.create_initiator_session(addr, remote_pub)
-            hs_msg = session.create_handshake_message()
-            self.transport.sendto(b'\x01' + hs_msg, addr)
-            self.pending_handshakes[addr] = time.time()
-            self.on_log(f"🔄 Iniciando handshake con {addr}")
+            
+            self.on_log(f"🔄 Iniciando handshake con {user_id} @ {target_addr}")
+            new_session = self.sessions.create_initiator_session(remote_pub, user_id)
+            new_session.current_addr = target_addr
+            hs_msg = new_session.create_handshake_message()
+            self.transport.sendto(b'\x01' + hs_msg, target_addr)
+            self.pending_handshakes[user_id] = time.time()
             return 
 
+        # Enviar mensaje cifrado
         try:
             if is_disconnect:
                 msg_struct = {"timestamp": time.time(), "disconnect": True}
@@ -666,7 +710,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
             full_packet_payload = session.encrypt_message(payload)
             self.transport.sendto(b'\x03' + full_packet_payload, session.current_addr)
         except Exception as e:
-            self.on_log(f"❌ Fallo envío raw: {e}")
+            self.on_log(f"❌ Fallo envío a {user_id}: {e}")
 
 # --- DESCUBRIMIENTO DE RED (mDNS) ---
 
@@ -759,8 +803,11 @@ class RawSniffer(asyncio.DatagramProtocol):
             props['stat'] = 'exit'
 
         if user_id_found:
-            # Filtrar loopback
+            # Filtrar loopback (tanto el propio como IPs localhost)
             if user_id_found == self.service.unique_instance_id and port_found == self.service.port:
+                return
+            # Ignorar paquetes que vienen desde localhost/loopback
+            if addr[0] == '127.0.0.1' or addr[0].startswith('127.'):
                 return
             self.service.on_found(user_id_found, addr[0], port_found, props)
 
@@ -833,15 +880,30 @@ class DiscoveryService:
         self._polling_task = asyncio.create_task(self._active_polling_loop())
 
     def on_found(self, user_id, ip, port, props):
-        """Callback al encontrar un par."""
+        """Callback al encontrar un par en la red."""
         if self.on_found_callback:
              self.on_found_callback(user_id, ip, port, props)
-             
-        if self.protocol_ref and 'pub' in props:
+        
+        # Manejar señal de desconexión (stat=exit)
+        if props.get('stat') == 'exit' and self.protocol_ref:
+            self.on_log(f"📴 Peer {user_id} anunció desconexión (stat=exit)")
+            # Marcar la sesión como inválida si existe
+            session = self.protocol_ref.sessions.get_session(user_id)
+            if session:
+                session.encryptor = None
+                session.decryptor = None
+            return
+        
+        # Actualizar ubicación del peer
+        if self.protocol_ref:
             try:
-                pub_hex = props['pub']
-                pub_bytes = bytes.fromhex(pub_hex)
-                self.protocol_ref.update_peer_location((ip, port), pub_bytes)
+                pub_key_obj = None
+                if 'pub' in props:
+                    pub_hex = props['pub']
+                    pub_bytes = bytes.fromhex(pub_hex)
+                    pub_key_obj = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
+                
+                self.protocol_ref.update_peer_location(user_id, (ip, port), pub_key_obj)
             except Exception as e:
                 self.on_log(f"❌ Fallo actualización mDNS: {e}")
 
@@ -894,8 +956,9 @@ class DiscoveryService:
                          self.on_log(f"🔄 IP de Red cambió: {current_ip}. Reiniciando Servicio mDNS...")
                          
                          if self.protocol_ref:
-                             old_count = len(self.protocol_ref.latest_peer_locations)
-                             self.protocol_ref.latest_peer_locations.clear()
+                             old_count = len(self.protocol_ref.peer_addresses)
+                             self.protocol_ref.peer_addresses.clear()
+                             self.protocol_ref.addr_to_identity.clear()
                              self.on_log(f"🗑️ Limpiadas {old_count} ubicaciones obsoletas de la red anterior")
                          
                          if self.sniffer_transport:

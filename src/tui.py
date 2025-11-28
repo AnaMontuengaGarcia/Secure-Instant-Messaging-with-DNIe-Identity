@@ -29,9 +29,9 @@ class QuitScreen(ModalScreen):
     
     def compose(self) -> ComposeResult:
         yield Container(
-            Label("Are you sure you want to quit?", id="question"),
-            Button("Quit", variant="error", id="quit"),
-            Button("Cancel", variant="primary", id="cancel"),
+            Label("¿Seguro que quieres salir?", id="question"),
+            Button("Salir", variant="error", id="quit"),
+            Button("Cancelar", variant="primary", id="cancel"),
             id="dialog",
         )
 
@@ -92,8 +92,8 @@ class ChatItem(ListItem):
 
 class ChatInput(TextArea):
     BINDINGS = [
-        Binding("enter", "submit_message", "Send Message", show=True, priority=True),
-        Binding("ctrl+n", "insert_newline", "Line Break (Ctrl+N)", show=True, priority=True),
+        Binding("enter", "submit_message", "Enviar Mensaje", show=True, priority=True),
+        Binding("ctrl+n", "insert_newline", "Salto de Línea (Ctrl+N)", show=True, priority=True),
     ]
 
     async def action_submit_message(self):
@@ -118,6 +118,14 @@ class MessageWidget(Static):
 
     def on_mount(self):
         self.update(self._create_panel())
+
+    def on_click(self):
+        """Copia el contenido del mensaje al portapapeles al hacer clic."""
+        try:
+            pyperclip.copy(self.text_content)
+            self.app.add_log("📋 Mensaje copiado al portapapeles")
+        except Exception as e:
+            self.app.add_log(f"⚠️ No se pudo copiar: {e}")
 
     def set_delivered(self):
         if not self.delivered:
@@ -176,7 +184,7 @@ class MessengerTUI(App):
     
     #chat_header_label {
         width: 100%;
-        text-align: center;
+        text-align: left;
         text-style: bold;
         color: $text;
         padding-top: 1;
@@ -198,12 +206,18 @@ class MessengerTUI(App):
         background: $primary-darken-2;
         color: $text;
     }
+    
+    MessageWidget {
+        /* Indicador visual de que es clickeable */
+    }
+    MessageWidget:hover {
+        opacity: 0.85;
+    }
     """
     
     BINDINGS = [
-        Binding("ctrl+q", "request_quit", "Quit"),
-        Binding("l", "copy_logs", "Copy Logs"),
-        Binding("r", "refresh_peers", "Refresh Network"),
+        Binding("ctrl+q", "request_quit", "Salir"),
+        Binding("l", "copy_logs", "Copiar Logs"),
     ]
 
     def __init__(self, udp_protocol, discovery, storage, user_id, bind_ip=None):
@@ -254,11 +268,13 @@ class MessengerTUI(App):
         
         self.proto.get_peer_addr_callback = self._get_peer_addr_from_list
         self.proto.get_user_id_callback = self._get_user_id_for_addr
+        self.proto.is_peer_online_callback = self._is_peer_online
         
-        self.discovery.on_found = self.add_peer
+        # Usar on_found_callback para no sobreescribir el método on_found que actualiza el protocolo
+        self.discovery.on_found_callback = self.add_peer
         self.discovery.on_log = self.add_log 
         
-        self.add_log(f"System initializing for {self.user_id}...")
+        self.add_log(f"Sistema inicializando para {self.user_id}...")
         
         username = f"User-{self.user_id}"
         await self.discovery.start(username, bind_ip=self.bind_ip)
@@ -292,7 +308,7 @@ class MessengerTUI(App):
                     lst.append(item)
                     loaded_count += 1
         
-        self.add_log(f"📚 {loaded_count} Contactos cargados.")
+        self.add_log(f"📚 {loaded_count} contactos cargados.")
 
     def check_peer_status(self):
         now = time.time()
@@ -303,6 +319,12 @@ class MessengerTUI(App):
                 last_seen = self.peer_last_seen.get(child.user_id, 0)
                 is_online = (now - last_seen) < 20.0
                 child.set_online_status(is_online)
+
+    def _is_peer_online(self, user_id: str) -> bool:
+        """Verifica si un peer está online basándose en peer_last_seen."""
+        now = time.time()
+        last_seen = self.peer_last_seen.get(user_id, 0)
+        return (now - last_seen) < 20.0
 
     def _get_peer_addr_from_list(self, user_id):
         try:
@@ -334,10 +356,6 @@ class MessengerTUI(App):
 
     def action_request_quit(self):
         self.push_screen(QuitScreen())
-
-    def action_refresh_peers(self):
-        self.add_log("🔄 Manual refresh...")
-        self.discovery.refresh()
 
     def action_copy_logs(self):
         if self.log_buffer:
@@ -413,7 +431,7 @@ class MessengerTUI(App):
                     found_item.update_address(ip, port)
                     if self.current_chat_addr and (self.current_chat_addr[0] == old_addr.split(':')[0]):
                         self.current_chat_addr = (ip, port)
-                        self.add_log("⚡ Active chat session rerouted to new IP.")
+                        self.add_log("⚡ Sesión de chat redirigida a nueva IP.")
                     was_offline = True
                 found_item.set_online_status(True)
                 if not found_item.real_name:
@@ -425,10 +443,10 @@ class MessengerTUI(App):
                 display_name = self.known_names.get(user_id)
                 item = ChatItem(user_id, display_name, ip, port, verified=False, online=True)
                 lst.append(item)
-                log_msg = f"🔎 Peer Found: {user_id}"
+                log_msg = f"🔎 Peer encontrado: {user_id}"
                 self.add_log(log_msg)
         except Exception as e: 
-            self.add_log(f"Error updating UI peer: {e}")
+            self.add_log(f"Error actualizando peer en UI: {e}")
 
     def on_new_peer_handshake(self, addr, pub_key, real_name=None):
         self._update_peer_identity_safe(addr, real_name)
@@ -436,18 +454,19 @@ class MessengerTUI(App):
     def _update_peer_identity_safe(self, addr, real_name):
         if not real_name: return
         lst = self.query_one("#contact_list", ListView)
-        found = False
         for child in lst.children:
             if isinstance(child, ChatItem) and child.contact_ip == addr[0] and child.contact_port == addr[1]:
                 child.set_verified_identity(real_name)
                 self.known_names[child.user_id] = real_name
-                found = True
+                
+                # Solo actualizar el header si estamos en ese chat, NO recargar todo
                 if self.current_chat_addr == (child.contact_ip, child.contact_port):
-                    self.call_later(self._load_and_refresh_chat_history, child)
+                    target_name = child.real_name
+                    status = "(Verificado)" if child.verified else "(No verificado)"
+                    conn_status = "[green]EN LÍNEA[/]" if child.online else "[grey]DESCONECTADO[/]"
+                    header_text = f"Chateando con {target_name} {status} - {conn_status}"
+                    self.query_one("#chat_header_label", Label).update(header_text)
                 break
-        if not found:
-            self._add_peer_safe(f"Unknown_{addr[0]}", addr[0], addr[1], {})
-            self._update_peer_identity_safe(addr, real_name)
 
     async def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
@@ -464,8 +483,8 @@ class MessengerTUI(App):
         self.current_chat_offset = 0
         
         target_name = item.real_name if item.real_name else item.user_id
-        status = "(Verified)" if item.verified else "(Unverified)"
-        conn_status = "[green]ONLINE[/]" if item.online else "[grey]OFFLINE[/]"
+        status = "(Verificado)" if item.verified else "(No verificado)"
+        conn_status = "[green]EN LÍNEA[/]" if item.online else "[grey]DESCONECTADO[/]"
         
         # ACTUALIZAR HEADER FIJO
         header_text = f"Chateando con {target_name} {status} - {conn_status}"
@@ -478,7 +497,7 @@ class MessengerTUI(App):
         
         # Si hemos llenado el límite, probablemente hay más atrás -> Botón Cargar Más
         if len(history) == self.current_chat_limit:
-            widgets_to_mount.append(Button("⬆ Load Older Messages", id="btn_load_older", classes="load-more-btn"))
+            widgets_to_mount.append(Button("⬆ Cargar mensajes anteriores", id="btn_load_older", classes="load-more-btn"))
 
         # Preparar mensajes
         last_read_ts = self.peer_last_read.get(item.user_id, 0)
@@ -492,19 +511,17 @@ class MessengerTUI(App):
                 current_day = msg_date
                 widgets_to_mount.append(DateSeparator(ts))
             
-            if not rule_drawn and ts > last_read_ts:
+            # Solo mostrar "Nuevos Mensajes" para mensajes RECIBIDOS (direction == "in")
+            direction = msg.get('direction')
+            if not rule_drawn and ts > last_read_ts and direction == "in":
                 widgets_to_mount.append(Static(Rule(style="red", title="Nuevos Mensajes")))
                 rule_drawn = True
 
             text = msg.get('content')
-            direction = msg.get('direction')
             is_me = (direction == "out")
-            sender_name = "You" if is_me else target_name
+            sender_name = "Tú" if is_me else target_name
             
             widgets_to_mount.append(MessageWidget(text, sender_name, is_me, ts, delivered=True))
-
-        if not rule_drawn and history:
-            widgets_to_mount.append(Static(Rule(style="dim")))
             
         # Pendientes
         pending_list = [v for k, v in self.pending_acks.items() if v['user_id'] == item.user_id]
@@ -518,7 +535,7 @@ class MessengerTUI(App):
                     break
             
             widgets_to_mount.append(MessageWidget(
-                p_data['text'], "You", is_me=True, timestamp=p_data['timestamp'], 
+                p_data['text'], "Tú", is_me=True, timestamp=p_data['timestamp'], 
                 delivered=False, msg_id=original_msg_id 
             ))
         
@@ -556,7 +573,7 @@ class MessengerTUI(App):
         
         if not older_history:
             btn.remove()
-            self.add_log("No older messages found.")
+            self.add_log("No hay mensajes más antiguos.")
             return
 
         new_widgets = []
@@ -574,7 +591,7 @@ class MessengerTUI(App):
             text = msg.get('content')
             direction = msg.get('direction')
             is_me = (direction == "out")
-            sender_name = "You" if is_me else target_name
+            sender_name = "Tú" if is_me else target_name
             
             new_widgets.append(MessageWidget(text, sender_name, is_me, ts, delivered=True))
             
@@ -589,7 +606,7 @@ class MessengerTUI(App):
         text = ta.text.strip()
         if not text: return
         if not self.current_chat_addr:
-            self.add_log("⚠️ Select a contact first!")
+            self.add_log("⚠️ ¡Selecciona un contacto primero!")
             return
             
         target_item = None
@@ -601,17 +618,18 @@ class MessengerTUI(App):
         
         if target_item:
             if not target_item.online:
-                self.add_log(f"⛔ Cannot send: {target_item.real_name or target_item.user_id} is OFFLINE.")
+                self.add_log(f"⛔ No se puede enviar: {target_item.real_name or target_item.user_id} está DESCONECTADO.")
                 return
             self.peer_last_read[target_item.user_id] = time.time()
         else:
-             self.add_log("❌ Error: Contact not found context.")
+             self.add_log("❌ Error: Contacto no encontrado.")
              return
 
         ta.text = "" 
         now_ts = time.time()
         
-        msg_id = await self.proto.send_message(self.current_chat_addr, text, user_id=target_item.user_id)
+        # Enviar mensaje usando el user_id (identidad DNIe)
+        msg_id = await self.proto.send_message(target_item.user_id, text)
         
         if msg_id:
             self.pending_acks[msg_id] = {
@@ -620,7 +638,7 @@ class MessengerTUI(App):
                 'user_id': target_item.user_id
             }
             chat_box = self.query_one("#chat_box", VerticalScroll)
-            new_widget = MessageWidget(text, "You", is_me=True, timestamp=now_ts, delivered=False, msg_id=msg_id)
+            new_widget = MessageWidget(text, "Tú", is_me=True, timestamp=now_ts, delivered=False, msg_id=msg_id)
             chat_box.mount(new_widget)
             chat_box.scroll_end(animate=True)
 
@@ -722,7 +740,7 @@ class MessengerTUI(App):
             else:
                 self.add_log(f"⬇️ Nuevo mensaje de {peer_name} (Recibido abajo)")
         else: 
-            self.add_log(f"📨 New message from {peer_name}")
+            self.add_log(f"📨 Nuevo mensaje de {peer_name}")
 
 class DNIeLoginApp(App):
     CSS = """
@@ -734,7 +752,7 @@ class DNIeLoginApp(App):
         background: $surface-lighten-1;
         padding: 2;
     }
-    #title { text-align: center; color: $secondary; text-style: bold; margin-bottom: 2; }
+    #title { text-align: center; color: $accent; text-style: bold; margin-bottom: 2; }
     #status { text-align: center; color: $text-muted; margin-bottom: 1; }
     #card-status { text-align: center; margin-bottom: 2; text-style: bold; }
     .card-missing { color: $error; }
@@ -755,7 +773,7 @@ class DNIeLoginApp(App):
 
     def compose(self) -> ComposeResult:
         with Container(classes="login-box"):
-            yield Label("🔐 DNIe Identity Access", id="title")
+            yield Label("🔐 INICIO DE SESIÓN CON DNIe", id="title")
             yield Label("Buscando lector...", id="card-status", classes="card-missing")
             yield Label("Introduzca su PIN:", id="status")
             yield LoadingIndicator(id="loading")
