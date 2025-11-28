@@ -1,3 +1,15 @@
+"""
+Interfaz de Usuario en Terminal (TUI)
+-------------------------------------
+Implementada usando la librería `Textual` (Modern Python TUI).
+Este módulo gestiona toda la presentación visual, pantallas modales y bucle de eventos UI.
+
+Componentes:
+1. MessengerTUI: La aplicación principal de chat.
+2. DNIeLoginApp: La pantalla inicial de login y PIN.
+3. Widgets personalizados para mensajes y listas de contactos.
+"""
+
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll, Center, Middle
 from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, Label, Button, RichLog, TextArea, LoadingIndicator
@@ -20,6 +32,7 @@ from smartcard_dnie import DNIeCard
 # --- PANTALLAS MODALES ---
 
 class QuitScreen(ModalScreen):
+    """Pantalla modal de confirmación para salir de la aplicación."""
     CSS = """
     QuitScreen { align: center middle; }
     #dialog { grid-size: 2; grid-gutter: 1 2; grid-rows: 1fr 3; padding: 0 1; width: 60; height: 11; border: thick $background 80%; background: $surface; }
@@ -42,6 +55,10 @@ class QuitScreen(ModalScreen):
 # --- WIDGETS CHAT ---
 
 class ChatItem(ListItem):
+    """
+    Elemento de la lista de contactos.
+    Muestra estado de conexión (punto verde/gris), nombre verificado e IP.
+    """
     def __init__(self, user_id, real_name, ip, port, verified=False, online=False):
         super().__init__()
         self.user_id = user_id
@@ -53,6 +70,7 @@ class ChatItem(ListItem):
         self.update_label()
 
     def set_online_status(self, is_online):
+        """Actualiza visualmente si el contacto está conectado."""
         if self.online != is_online:
             self.online = is_online
             self.update_label()
@@ -63,6 +81,7 @@ class ChatItem(ListItem):
         self.update_label()
 
     def update_label(self):
+        """Re-renderiza el texto del widget usando Rich text."""
         if self.online:
             status_icon = "[green]●[/]" 
         else:
@@ -83,6 +102,7 @@ class ChatItem(ListItem):
         except: pass
 
     def set_verified_identity(self, new_real_name):
+        """Llamado cuando el handshake criptográfico confirma la identidad DNIe."""
         self.real_name = new_real_name
         self.verified = True
         self.update_label()
@@ -91,6 +111,7 @@ class ChatItem(ListItem):
         yield Label(self.display_label)
 
 class ChatInput(TextArea):
+    """Área de texto personalizada con manejo de Enter para enviar."""
     BINDINGS = [
         Binding("enter", "submit_message", "Enviar Mensaje", show=True, priority=True),
         Binding("ctrl+n", "insert_newline", "Salto de Línea (Ctrl+N)", show=True, priority=True),
@@ -105,7 +126,10 @@ class ChatInput(TextArea):
 # --- WIDGET DE MENSAJE MUTABLE ---
 
 class MessageWidget(Static):
-    """Widget individual para cada mensaje con soporte de actualizaciones."""
+    """
+    Burbuja de mensaje individual.
+    Soporta copiar al portapapeles al hacer clic y cambios de estado (Entregado).
+    """
     def __init__(self, text, title, is_me, timestamp, delivered=True, msg_id=None, **kwargs):
         css_id = f"msg-{msg_id}" if msg_id else None
         super().__init__(**kwargs, id=css_id)
@@ -120,7 +144,7 @@ class MessageWidget(Static):
         self.update(self._create_panel())
 
     def on_click(self):
-        """Copia el contenido del mensaje al portapapeles al hacer clic."""
+        """Copia el contenido del mensaje al portapapeles."""
         try:
             pyperclip.copy(self.text_content)
             self.app.add_log("📋 Mensaje copiado al portapapeles")
@@ -128,6 +152,7 @@ class MessageWidget(Static):
             self.app.add_log(f"⚠️ No se pudo copiar: {e}")
 
     def set_delivered(self):
+        """Cambia el color de la hora para indicar que llegó (ACK recibido)."""
         if not self.delivered:
             self.delivered = True
             self.update(self._create_panel())
@@ -158,6 +183,7 @@ class MessageWidget(Static):
         )
 
 class DateSeparator(Static):
+    """Línea divisoria para separar mensajes de días diferentes."""
     def __init__(self, timestamp, **kwargs):
         super().__init__(**kwargs)
         self.timestamp = timestamp
@@ -169,6 +195,7 @@ class DateSeparator(Static):
 # --- APP PRINCIPAL DE CHAT ---
 
 class MessengerTUI(App):
+    """Aplicación principal de Terminal."""
     CSS = """
     Screen { layout: grid; grid-size: 2; grid-columns: 30% 70%; }
     .sidebar { background: $surface; border-right: solid $primary; }
@@ -207,9 +234,6 @@ class MessengerTUI(App):
         color: $text;
     }
     
-    MessageWidget {
-        /* Indicador visual de que es clickeable */
-    }
     MessageWidget:hover {
         opacity: 0.85;
     }
@@ -232,6 +256,7 @@ class MessengerTUI(App):
         self.log_buffer = []
         self.known_names = {} 
         self.peer_last_seen = {}
+        self.peer_known_pubkeys = {}  # user_id -> bytes de clave pública (para detectar reconexiones)
         self.recently_disconnected = {}
         self.pending_acks = {}
         self.peer_last_read = {}
@@ -241,12 +266,12 @@ class MessengerTUI(App):
         self.current_chat_limit = 50
 
     def compose(self) -> ComposeResult:
+        """Define la estructura visual inicial."""
         yield Header(show_clock=True)
         with Vertical(classes="sidebar"):
             yield Label("  📡 Contactos", id="lbl_peers")
             yield ListView(id="contact_list")
         with Vertical(classes="chat-area"):
-            # Header fijo dentro de un contenedor centrado
             with Container(id="chat_header_container"):
                 yield Label("Selecciona un contacto", id="chat_header_label")
             yield VerticalScroll(id="chat_box", classes="messages")
@@ -257,10 +282,12 @@ class MessengerTUI(App):
         yield Footer()
 
     async def on_mount(self):
+        """Inicialización asíncrona tras montar la UI."""
         self.title = "DNIe Secure Messenger"
         
         await self.load_saved_contacts()
         
+        # Conectar callbacks del protocolo a métodos de la UI
         self.proto.on_log = self.add_log
         self.proto.on_message = self.receive_message
         self.proto.on_handshake_success = self.on_new_peer_handshake
@@ -270,7 +297,6 @@ class MessengerTUI(App):
         self.proto.get_user_id_callback = self._get_user_id_for_addr
         self.proto.is_peer_online_callback = self._is_peer_online
         
-        # Usar on_found_callback para no sobreescribir el método on_found que actualiza el protocolo
         self.discovery.on_found_callback = self.add_peer
         self.discovery.on_log = self.add_log 
         
@@ -279,9 +305,11 @@ class MessengerTUI(App):
         username = f"User-{self.user_id}"
         await self.discovery.start(username, bind_ip=self.bind_ip)
         
+        # Timer para verificar desconexiones por timeout
         self.set_interval(5.0, self.check_peer_status)
 
     async def load_saved_contacts(self):
+        """Carga contactos persistidos en DB al inicio."""
         contacts = await self.storage.get_all_contacts()
         lst = self.query_one("#contact_list", ListView)
         
@@ -311,6 +339,7 @@ class MessengerTUI(App):
         self.add_log(f"📚 {loaded_count} contactos cargados.")
 
     def check_peer_status(self):
+        """Verifica si los peers siguen vivos (Heartbeat timeout 20s)."""
         now = time.time()
         lst = self.query_one("#contact_list", ListView)
         
@@ -320,8 +349,17 @@ class MessengerTUI(App):
                 is_online = (now - last_seen) < 20.0
                 child.set_online_status(is_online)
 
+    def _invalidate_session_for_user(self, user_id: str, reason: str = "desconexión"):
+        """Invalida la sesión criptográfica de un usuario para forzar un nuevo handshake."""
+        session = self.proto.sessions.get_session(user_id)
+        if session and session.encryptor:
+            self.add_log(f"🔒 Sesión invalidada para {user_id} ({reason})")
+            # Invalidar los cifradores para forzar un nuevo handshake
+            session.encryptor = None
+            session.decryptor = None
+
     def _is_peer_online(self, user_id: str) -> bool:
-        """Verifica si un peer está online basándose en peer_last_seen."""
+        """Helper para el protocolo: ¿Debemos reintentar enviar?"""
         now = time.time()
         last_seen = self.peer_last_seen.get(user_id, 0)
         return (now - last_seen) < 20.0
@@ -371,8 +409,10 @@ class MessengerTUI(App):
         except: pass
 
     def add_peer(self, user_id, ip, port, props):
+        """Callback cuando mDNS encuentra a alguien."""
         if ip == "127.0.0.1": return
         stable_id = user_id.strip()
+        # Ignorar reconexiones muy rápidas tras una desconexión explícita
         if stable_id in self.recently_disconnected:
             if time.time() - self.recently_disconnected[stable_id] < 5.0: return
             else: del self.recently_disconnected[stable_id]
@@ -385,7 +425,7 @@ class MessengerTUI(App):
             if user_id not in self.peer_last_read:
                 self.peer_last_read[user_id] = 0
 
-            # --- MANEJO DE DESCONEXIÓN MDNS ---
+            # Manejo de señal de salida 'stat=exit'
             if props.get('stat') == 'exit':
                 self.add_log(f"💤 Salida detectada: {user_id}")
                 target_child = None
@@ -395,14 +435,16 @@ class MessengerTUI(App):
                         break
                 
                 if target_child:
-                    # FIX: Comprobar si ya estaba desconectado para evitar duplicados
                     was_online = target_child.online
-                    
                     self.recently_disconnected[user_id] = time.time()
                     self.peer_last_seen[user_id] = 0 
                     target_child.set_online_status(False)
                     
-                    # Solo mostrar mensaje si antes estaba online
+                    # Invalidar la sesión criptográfica cuando se detecta desconexión explícita
+                    self._invalidate_session_for_user(user_id, "desconexión explícita")
+                    # Limpiar la clave pública conocida para que al reconectar se acepte la nueva
+                    self.peer_known_pubkeys.pop(user_id, None)
+                    
                     if was_online and self.current_chat_addr == (ip, port):
                         chat_box = self.query_one("#chat_box", VerticalScroll)
                         msg_widget = Static(Align(Panel(Text(f"{target_child.real_name or user_id} se ha desconectado."), style="dim white"), align="left"))
@@ -410,11 +452,22 @@ class MessengerTUI(App):
                         chat_box.scroll_end(animate=True)
                 return
 
+            # Si trae clave pública en mDNS, registrarla y verificar si cambió
             pub_hex = props.get('pub', '')
             if pub_hex:
                 try:
                     pub_bytes = bytes.fromhex(pub_hex)
                     pub_key = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
+                    
+                    # Detectar cambio de clave pública (indica reconexión del peer)
+                    old_pub_bytes = self.peer_known_pubkeys.get(user_id)
+                    if old_pub_bytes is not None and old_pub_bytes != pub_bytes:
+                        # El peer se reconectó con una nueva clave, invalidar sesión antigua
+                        self._invalidate_session_for_user(user_id, "cambio de clave pública - reconexión detectada")
+                    
+                    # Actualizar la clave conocida
+                    self.peer_known_pubkeys[user_id] = pub_bytes
+                    
                     asyncio.create_task(self.storage.register_contact(ip, port, pub_key, user_id=user_id, real_name=None))
                 except Exception: pass
 
@@ -426,9 +479,11 @@ class MessengerTUI(App):
             
             if found_item:
                 was_offline = not found_item.online
+                # Actualizar si cambió de IP (Roaming)
                 if found_item.contact_ip != ip or found_item.contact_port != port:
                     old_addr = f"{found_item.contact_ip}:{found_item.contact_port}"
                     found_item.update_address(ip, port)
+                    self.add_log(f"📍 Peer {user_id} cambió de {old_addr} a {ip}:{port}")
                     if self.current_chat_addr and (self.current_chat_addr[0] == old_addr.split(':')[0]):
                         self.current_chat_addr = (ip, port)
                         self.add_log("⚡ Sesión de chat redirigida a nueva IP.")
@@ -459,7 +514,6 @@ class MessengerTUI(App):
                 child.set_verified_identity(real_name)
                 self.known_names[child.user_id] = real_name
                 
-                # Solo actualizar el header si estamos en ese chat, NO recargar todo
                 if self.current_chat_addr == (child.contact_ip, child.contact_port):
                     target_name = child.real_name
                     status = "(Verificado)" if child.verified else "(No verificado)"
@@ -479,27 +533,22 @@ class MessengerTUI(App):
         chat_box = self.query_one("#chat_box", VerticalScroll)
         await chat_box.remove_children()
         
-        # Reset de paginación
         self.current_chat_offset = 0
         
         target_name = item.real_name if item.real_name else item.user_id
         status = "(Verificado)" if item.verified else "(No verificado)"
         conn_status = "[green]EN LÍNEA[/]" if item.online else "[grey]DESCONECTADO[/]"
         
-        # ACTUALIZAR HEADER FIJO
         header_text = f"Chateando con {target_name} {status} - {conn_status}"
         self.query_one("#chat_header_label", Label).update(header_text)
         
-        # Cargar primera página (Offset 0)
         history = await self.storage.get_chat_history(item.user_id, limit=self.current_chat_limit, offset=0)
         
         widgets_to_mount = []
         
-        # Si hemos llenado el límite, probablemente hay más atrás -> Botón Cargar Más
         if len(history) == self.current_chat_limit:
             widgets_to_mount.append(Button("⬆ Cargar mensajes anteriores", id="btn_load_older", classes="load-more-btn"))
 
-        # Preparar mensajes
         last_read_ts = self.peer_last_read.get(item.user_id, 0)
         rule_drawn = False
         current_day = None 
@@ -511,7 +560,6 @@ class MessengerTUI(App):
                 current_day = msg_date
                 widgets_to_mount.append(DateSeparator(ts))
             
-            # Solo mostrar "Nuevos Mensajes" para mensajes RECIBIDOS (direction == "in")
             direction = msg.get('direction')
             if not rule_drawn and ts > last_read_ts and direction == "in":
                 widgets_to_mount.append(Static(Rule(style="red", title="Nuevos Mensajes")))
@@ -523,7 +571,7 @@ class MessengerTUI(App):
             
             widgets_to_mount.append(MessageWidget(text, sender_name, is_me, ts, delivered=True))
             
-        # Pendientes
+        # Añadir mensajes pendientes de envío
         pending_list = [v for k, v in self.pending_acks.items() if v['user_id'] == item.user_id]
         pending_list.sort(key=lambda x: x['timestamp'])
 
@@ -546,7 +594,7 @@ class MessengerTUI(App):
         self.call_later(chat_box.scroll_end, animate=False)
 
     async def action_load_older_messages(self):
-        """Acción disparada por el botón de cargar más."""
+        """Paginación: Carga mensajes históricos más antiguos."""
         if not self.current_chat_addr: return
         
         current_uid = None
@@ -578,7 +626,6 @@ class MessengerTUI(App):
 
         new_widgets = []
         current_day = None 
-        
         target_name = self.known_names.get(current_uid, current_uid)
 
         for msg in older_history:
@@ -602,6 +649,7 @@ class MessengerTUI(App):
             chat_box.mount(Label("[dim]--- Fin del historial ---[/dim]"), after=new_widgets[-1] if new_widgets else None)
 
     async def submit_message(self):
+        """Envía el mensaje escrito en el input."""
         ta = self.query_one("#msg_input", ChatInput)
         text = ta.text.strip()
         if not text: return
@@ -628,10 +676,11 @@ class MessengerTUI(App):
         ta.text = "" 
         now_ts = time.time()
         
-        # Enviar mensaje usando el user_id (identidad DNIe)
+        # Enviar mensaje usando el protocolo UDP
         msg_id = await self.proto.send_message(target_item.user_id, text)
         
         if msg_id:
+            # Añadir a lista de espera de ACK
             self.pending_acks[msg_id] = {
                 'text': text,
                 'timestamp': now_ts,
@@ -646,8 +695,10 @@ class MessengerTUI(App):
         self._handle_ack_safe(addr, ack_id)
 
     def _handle_ack_safe(self, addr, ack_id):
+        """Maneja la confirmación de recepción."""
         if ack_id in self.pending_acks:
             data = self.pending_acks.pop(ack_id)
+            # Persistir mensaje solo cuando sabemos que llegó
             asyncio.create_task(
                 self.storage.save_chat_message(
                     user_id=data['user_id'],
@@ -686,12 +737,10 @@ class MessengerTUI(App):
             self._add_peer_safe(f"Peer_{ip}", ip, port, {})
             if lst.children: target_child = lst.children[-1]
 
-        # --- MANEJO DE DESCONEXIÓN UDP ---
+        # Manejo de desconexión UDP
         if msg.get('disconnect') is True:
             if target_child:
-                # FIX: Check para evitar duplicados
                 was_online = target_child.online
-                
                 self.peer_last_seen[target_child.user_id] = 0
                 target_child.set_online_status(False)
                 
@@ -726,6 +775,7 @@ class MessengerTUI(App):
                 )
             )
 
+        # Si el chat está abierto, mostrar mensaje, si no, notificar log
         curr_ip = self.current_chat_addr[0] if self.current_chat_addr else None
         
         if curr_ip == ip: 
@@ -743,6 +793,11 @@ class MessengerTUI(App):
             self.add_log(f"📨 Nuevo mensaje de {peer_name}")
 
 class DNIeLoginApp(App):
+    """
+    Aplicación independiente para el Login.
+    Se ejecuta ANTES de MessengerTUI.
+    Maneja la lectura del DNIe, PIN y firmas iniciales.
+    """
     CSS = """
     Screen { align: center middle; background: $surface; }
     .login-box { 
@@ -782,11 +837,13 @@ class DNIeLoginApp(App):
             yield Label("", id="error-msg")
 
     def on_mount(self):
+        # Polling para detectar inserción de tarjeta
         self.set_interval(1.5, self.check_card_presence)
         self.check_card_presence()
 
     @work(thread=True)
     def check_card_presence(self):
+        """Verifica en hilo secundario si hay tarjeta en el lector."""
         if self.is_logging_in: return
         is_present = False
         try:
@@ -829,6 +886,7 @@ class DNIeLoginApp(App):
             self.action_login()
     
     def action_login(self):
+        """Inicia el proceso de autenticación."""
         pin = self.query_one("#pin", Input).value
         if not pin:
             self.show_error("⚠️ El PIN no puede estar vacío.")
@@ -845,6 +903,15 @@ class DNIeLoginApp(App):
 
     @work(exclusive=True, thread=True)
     def run_dnie_operation(self, pin):
+        """
+        Operación bloqueante con el hardware del DNIe.
+        Se ejecuta en un Worker Thread para no congelar la UI.
+        
+        Pasos:
+        1. Conectar y autenticar PIN.
+        2. Obtener certificado y firmar la clave de red efímera.
+        3. Obtener número de serie, hashearlo y firmarlo para la clave de storage.
+        """
         try:
             card = DNIeCard()
             self.call_from_thread(lambda: self.query_one("#status", Label).update("Autenticando PIN..."))
@@ -853,12 +920,14 @@ class DNIeLoginApp(App):
             
             self.call_from_thread(lambda: self.query_one("#status", Label).update("Firmando identidad de red..."))
             cert_der = card.get_certificate()
+            # Firma A: Autoriza a esta clave efímera a actuar en nombre del DNIe en la red
             network_signature = card.sign_data(self.key_to_sign_bytes)
             user_id = card.get_serial_hash()[:8]
             proofs = {'cert': cert_der.hex(), 'sig': network_signature.hex()}
 
             self.call_from_thread(lambda: self.query_one("#status", Label).update("Generando clave de cifrado..."))
             
+            # Firma B: Genera la clave de cifrado para la base de datos local
             serial_raw = card.get_serial()
             serial_bytes = serial_raw.encode('utf-8') if isinstance(serial_raw, str) else serial_raw
             separator_bytes = self.DOMAIN_SEPARATOR.encode('utf-8')
@@ -881,6 +950,7 @@ class DNIeLoginApp(App):
         self.exit(result=self.return_data)
 
     def show_error(self, msg):
+        """Resetea la UI en caso de error para permitir reintento."""
         self.is_logging_in = False
         self.query_one("#loading", LoadingIndicator).display = False
         self.query_one("#status", Label).update("Introduzca su PIN:")

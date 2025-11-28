@@ -1,3 +1,15 @@
+"""
+Módulo de Almacenamiento Persistente (Storage)
+----------------------------------------------
+Gestiona la base de datos local (SQLite) de forma asíncrona.
+Garantiza la privacidad mediante cifrado en reposo (Encryption at Rest).
+
+Características:
+1. **Cifrado Total:** Todo el contenido sensible (nombres y mensajes) se cifra con Fernet (AES).
+2. **Asincronía:** Usa `aiosqlite` para no bloquear el bucle de eventos principal.
+3. **Esquema Relacional:** Tablas para contactos y mensajes.
+"""
+
 import os
 import base64
 import aiosqlite
@@ -6,46 +18,54 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 
 class Storage:
-    """
-    Sistema de almacenamiento persistente, cifrado y escalable basado en SQLite.
-    """
-    
     def __init__(self, key_bytes, data_dir="data"):
+        """
+        Args:
+            key_bytes (bytes): Clave de cifrado derivada del DNIe (32 bytes).
+            data_dir (str): Directorio para el archivo .db.
+        """
         self.data_dir = data_dir
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
         
         self.db_path = os.path.join(data_dir, "storage.db")
+        # Inicializar motor de cifrado Fernet (Symmetric Auth Encryption)
         self.fernet = Fernet(base64.urlsafe_b64encode(key_bytes))
         self.db = None
+        # Cache en memoria de claves efímeras de contactos (no persistidas)
         self.ephemeral_keys = {} 
 
     async def init(self):
+        """Conecta a SQLite y crea las tablas si no existen."""
         self.db = await aiosqlite.connect(self.db_path)
+        # Activar modo WAL (Write Ahead Log) para mejor concurrencia
         await self.db.execute("PRAGMA journal_mode=WAL;")
         
+        # Tabla de Contactos
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
                 user_id TEXT PRIMARY KEY,
-                real_name BLOB,
+                real_name BLOB,       -- Cifrado
                 ip TEXT,
                 port INTEGER,
-                pub_key BLOB,
+                pub_key BLOB,         -- Clave pública estática
                 trusted INTEGER DEFAULT 0
             )
         """)
         
+        # Tabla de Mensajes
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT,
-                direction TEXT,
-                content BLOB,
+                direction TEXT,       -- 'in' (entrante) o 'out' (saliente)
+                content BLOB,         -- Cifrado
                 timestamp REAL,
                 FOREIGN KEY(user_id) REFERENCES contacts(user_id)
             )
         """)
         
+        # Índices para velocidad
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_msg_userid ON messages(user_id)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(timestamp)")
         
@@ -58,10 +78,12 @@ class Storage:
             print("💾 Database connection closed.")
 
     def _encrypt(self, text: str) -> bytes:
+        """Helper para cifrar texto plano antes de insertar en SQL."""
         if text is None: return b''
         return self.fernet.encrypt(text.encode('utf-8'))
 
     def _decrypt(self, data: bytes) -> str:
+        """Helper para descifrar BLOBs al leer de SQL."""
         if not data: return ""
         try:
             return self.fernet.decrypt(data).decode('utf-8')
@@ -69,6 +91,7 @@ class Storage:
             return f"🚫 [Error Descifrando]"
 
     async def get_all_contacts(self):
+        """Retorna todos los contactos conocidos, descifrando sus nombres."""
         query = "SELECT user_id, real_name, ip, port, pub_key, trusted FROM contacts"
         async with self.db.execute(query) as cursor:
             rows = await cursor.fetchall()
@@ -83,6 +106,7 @@ class Storage:
                 "port": r[3],
                 "trusted": r[5]
             })
+            # Cachear clave pública si existe
             if r[4]: 
                 try:
                     key_obj = x25519.X25519PublicKey.from_public_bytes(r[4])
@@ -92,6 +116,14 @@ class Storage:
         return contacts
 
     async def register_contact(self, ip, port, pubkey_obj, user_id=None, real_name=None):
+        """
+        Registra o actualiza un contacto (Upsert).
+        
+        Lógica:
+        - Si conocemos el user_id, actualizamos.
+        - Si no, intentamos buscar por IP/Puerto.
+        - Si no existe, insertamos nuevo.
+        """
         self.ephemeral_keys[(ip, port)] = pubkey_obj
         pub_bytes = pubkey_obj.public_bytes(
             encoding=serialization.Encoding.Raw,
@@ -100,6 +132,7 @@ class Storage:
         encrypted_real_name = self._encrypt(real_name) if real_name else None
         target_uuid = None
 
+        # 1. Intentar encontrar ID existente
         if user_id:
             async with self.db.execute("SELECT user_id FROM contacts WHERE user_id = ?", (user_id,)) as cursor:
                 row = await cursor.fetchone()
@@ -110,6 +143,7 @@ class Storage:
                 row = await cursor.fetchone()
                 if row: target_uuid = row[0]
 
+        # 2. Update o Insert
         if target_uuid:
             update_sql = "UPDATE contacts SET ip=?, port=?, pub_key=?"
             params = [ip, port, pub_bytes]
@@ -129,9 +163,11 @@ class Storage:
         await self.db.commit()
 
     async def get_pubkey_by_addr(self, ip, port):
+        """Recupera clave pública efímera desde caché."""
         return self.ephemeral_keys.get((ip, port))
 
     async def save_chat_message(self, user_id, direction, text, timestamp):
+        """Persiste un mensaje cifrado."""
         if not user_id: return
         encrypted_blob = self._encrypt(text)
         await self.db.execute("""
@@ -144,16 +180,12 @@ class Storage:
         """
         Recupera el historial de chat con soporte para paginación.
         
-        Args:
-            limit (int): Número máximo de mensajes a recuperar.
-            offset (int): Número de mensajes a saltar (desde el más reciente hacia atrás).
+        Estrategia SQL:
+        1. Subconsulta: Obtiene los N mensajes más recientes (ORDER BY timestamp DESC).
+        2. Consulta Externa: Reordena esos resultados cronológicamente (ASC) para mostrarlos correctamente.
         """
         if not user_id: return []
         
-        # SQL Optimizado:
-        # 1. Obtenemos los 'limit' mensajes saltando 'offset' ordenados por DESC (del más nuevo al más viejo).
-        # 2. La subconsulta nos da el lote correcto del pasado.
-        # 3. La consulta externa los reordena ASC (cronológicamente) para pintarlos en el chat.
         query = """
             SELECT direction, content, timestamp 
             FROM (

@@ -1,3 +1,17 @@
+"""
+Interfaz de Hardware DNIe (PKCS#11)
+-----------------------------------
+Este módulo abstrae la comunicación compleja con la tarjeta inteligente.
+Utiliza la librería `opensc-pkcs11` para interactuar con el DNIe.
+
+Responsabilidades:
+1. Cargar dinámicamente el driver PKCS#11 correcto según el SO.
+2. Gestionar la conexión/desconexión física con la tarjeta.
+3. Solicitar el PIN y abrir sesión segura.
+4. Localizar el certificado específico de "AUTENTICACIÓN" (no Firma).
+5. Realizar firmas criptográficas hardware (SHA256-RSA).
+"""
+
 import platform
 import pkcs11
 import sys
@@ -7,29 +21,27 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 class DNIeCardError(Exception):
+    """Excepción personalizada para errores específicos del DNIe."""
     pass
 
 class DNIeCard:
-    """Interfaz para operaciones con DNIe (PKCS#11)"""
+    """Clase controladora para operaciones PKCS#11 con el DNIe."""
     
-    # OPTIMIZACIÓN: Variable de clase para almacenar la referencia a la librería cargada.
-    # Esto actúa como un Singleton, evitando que 'pkcs11.lib(path)' cargue la DLL/SO
-    # desde el disco cada vez que se instancia la clase.
+    # Patrón Singleton para la librería cargada. Evita recargar la DLL/SO
+    # múltiples veces, lo cual puede causar crashes en OpenSC.
     _shared_lib = None
     
     def __init__(self):
         """
-        Inicializa la instancia detectando el sistema operativo.
-        
-        Cómo lo hace:
-        Verifica si se ejecuta en Windows, Linux o macOS y define la ruta
-        a la librería dinámica 'opensc-pkcs11' correspondiente.
+        Inicializa la configuración de rutas según el Sistema Operativo.
+        No conecta con la tarjeta todavía.
         """
         self.lib = None
         self.token = None
         self.session = None
         
         system = platform.system()
+        # Rutas estándar de OpenSC
         if system == "Windows":
             self.lib_path = r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll"
         elif system == "Linux":
@@ -37,67 +49,51 @@ class DNIeCard:
         elif system == "Darwin":
             self.lib_path = "/usr/local/lib/opensc-pkcs11.so"
         else:
-            raise DNIeCardError(f"SO no soportado: {system}")
+            raise DNIeCardError(f"Sistema Operativo no soportado: {system}")
 
     @classmethod
     def _get_library_singleton(cls, lib_path):
         """
-        Gestiona la carga única de la librería PKCS#11 (Singleton).
-        
-        Cómo lo hace:
-        Si _shared_lib es None, carga la librería desde disco.
-        Si ya existe, devuelve la referencia en memoria.
-        Esto es vital para el rendimiento en bucles de chequeo (polling).
+        Carga la librería dinámica PKCS#11 de forma segura (Singleton).
         """
         if cls._shared_lib is None:
             try:
                 cls._shared_lib = pkcs11.lib(lib_path)
             except Exception as e:
-                # Si falla la carga inicial, permitimos reintentar en el futuro
-                # (quizás el usuario instale el driver mientras la app corre)
-                raise DNIeCardError(f"No se pudo cargar la librería OpenSC en {lib_path}. Asegúrese de tener los drivers del DNIe instalados. Error: {e}")
+                raise DNIeCardError(f"No se pudo cargar OpenSC en {lib_path}. ¿Drivers instalados? Error: {e}")
         return cls._shared_lib
     
     def connect(self):
         """
-        Establece conexión con el lector de tarjetas inteligentes.
+        Intenta conectar con una tarjeta insertada en el lector.
         
-        Cómo lo hace:
-        1. Obtiene la librería (usando el Singleton optimizado).
-        2. Busca slots con token presente (tarjeta insertada).
-        3. Abre una sesión inicial de solo lectura sin PIN.
+        Returns:
+            bool: True si hay tarjeta y conexión exitosa.
         """
         try:
-            # Usamos el getter del Singleton en lugar de pkcs11.lib() directo
             self.lib = self._get_library_singleton(self.lib_path)
             
+            # Buscar slots con token presente
             slots = list(self.lib.get_slots(token_present=True))
             if not slots:
-                raise DNIeCardError("No se detectó tarjeta inteligente.")
+                raise DNIeCardError("No se detectó ninguna tarjeta inteligente insertada.")
+            
             self.token = slots[0].get_token()
+            # Abrimos sesión inicial (Pública/Lectura)
             self.session = self.token.open(rw=False)
             return True
         except Exception as e:
-            # Relanzamos como error propio para manejo limpio en UI
-            raise DNIeCardError(f"Conexión fallida: {e}")
+            raise DNIeCardError(f"Error de conexión con lector: {e}")
 
     def get_serial(self):
-        """
-        Obtiene el número de serie físico de la tarjeta.
-        
-        Cómo lo hace:
-        Lee el atributo 'serial' del token conectado.
-        """
+        """Obtiene el número de serie físico del chip."""
         if not self.token: raise DNIeCardError("No conectado")
         return self.token.serial
 
     def get_serial_hash(self):
         """
-        Genera un identificador único anonimizado para la tarjeta.
-        
-        Cómo lo hace:
-        Calcula el hash SHA-256 del número de serie de la tarjeta.
-        Esto se usa como 'User ID' en la red.
+        Genera un identificador anonimizado (Hash SHA256) del número de serie.
+        Este hash se usa como ID público en la red, protegiendo el número real.
         """
         if not self.token: raise DNIeCardError("No conectado")
         digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
@@ -108,43 +104,35 @@ class DNIeCard:
 
     def authenticate(self, pin):
         """
-        Autentica al usuario frente a la tarjeta (Login).
-        
-        Cómo lo hace:
-        Cierra la sesión pública anterior y abre una nueva sesión protegida
-        proporcionando el PIN del usuario.
+        Realiza el 'Login' en la tarjeta usando el PIN del usuario.
+        Esto eleva privilegios para permitir operaciones de firma.
         """
         try:
             if self.session: self.session.close()
+            # Abrir sesión autenticada
             self.session = self.token.open(user_pin=pin)
         except pkcs11.exceptions.PinIncorrect:
             raise DNIeCardError("PIN Incorrecto.")
         except Exception as e:
-            raise DNIeCardError(f"Error de Auth: {e}")
+            raise DNIeCardError(f"Error de Autenticación: {e}")
 
     def _get_label(self, obj):
-        """
-        Helper para obtener la etiqueta (Label) de un objeto PKCS#11.
-        
-        Cómo lo hace:
-        Lee el atributo LABEL y lo decodifica de bytes a string UTF-8 de forma segura.
-        """
+        """Decodifica de forma segura la etiqueta (Label) de un objeto PKCS#11."""
         val = obj[Attribute.LABEL]
-        if val is None:
-            return ""
+        if val is None: return ""
         if isinstance(val, bytes):
             return val.decode('utf-8', 'ignore')
         return str(val)
 
     def get_certificate(self):
         """
-        Extrae el certificado público de AUTENTICACIÓN del DNIe.
+        Busca y retorna el certificado X.509 de AUTENTICACIÓN.
         
-        Cómo lo hace:
-        1. Busca todos los objetos de clase CERTIFICATE en la tarjeta.
-        2. Filtra buscando palabras clave como "Autenticacion", "Authentication" o "Kpub" en la etiqueta.
-        3. Si no encuentra uno específico, usa el primero disponible como fallback.
-        4. Retorna los bytes del certificado en formato DER.
+        El DNIe tiene varios certificados (Firma, Autenticación, CA Intermedia).
+        Filtramos por etiqueta (Label) para encontrar el correcto.
+        
+        Returns:
+            bytes: Certificado en formato DER.
         """
         if not self.session: raise DNIeCardError("Sesión no abierta")
         
@@ -156,26 +144,31 @@ class DNIeCard:
         
         for cert in certs:
             label = self._get_label(cert)
+            # Palabras clave comunes en las versiones del DNIe (3.0, 4.0)
             if "Autenticacion" in label or "Authentication" in label or "Kpub" in label:
                 target_cert = cert
                 break
         
+        # Fallback: Si no encontramos etiqueta conocida, tomamos el primero
         if not target_cert and certs:
             target_cert = certs[0]
             
         if target_cert:
             return target_cert[Attribute.VALUE]
             
-        raise DNIeCardError("No se encontró certificado en la tarjeta")
+        raise DNIeCardError("No se encontró certificado válido en la tarjeta")
 
     def sign_data(self, data_bytes):
         """
-        Genera una firma digital utilizando la clave privada del DNIe.
+        Firma datos arbitrarios usando la clave privada de Autenticación.
+        La operación criptográfica ocurre DENTRO del chip del DNIe. La clave privada
+        nunca sale de la tarjeta.
         
-        Cómo lo hace:
-        1. Busca la clave privada (PRIVATE_KEY) correspondiente al certificado de Autenticación.
-        2. Invoca la operación de firma hardware usando el mecanismo SHA256_RSA_PKCS.
-        3. Retorna la firma en bytes.
+        Args:
+            data_bytes (bytes): Datos a firmar.
+            
+        Returns:
+            bytes: Firma digital RSA.
         """
         if not self.session: raise DNIeCardError("Sesión no abierta")
         
@@ -196,8 +189,9 @@ class DNIeCard:
             target_key = priv_keys[0]
             
         if not target_key:
-            raise DNIeCardError("No se encontró clave privada")
+            raise DNIeCardError("No se encontró clave privada adecuada")
             
+        # Firmar usando PKCS#1 v1.5 padding y SHA256
         signature = target_key.sign(
             data_bytes,
             mechanism=Mechanism.SHA256_RSA_PKCS
@@ -205,9 +199,7 @@ class DNIeCard:
         return bytes(signature)
     
     def disconnect(self):
-        """
-        Cierra la sesión con la tarjeta de forma segura.
-        """
+        """Cierra la sesión y libera recursos."""
         try:
             if self.session: self.session.close()
         except: pass
