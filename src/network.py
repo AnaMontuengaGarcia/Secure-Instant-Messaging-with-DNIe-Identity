@@ -1,11 +1,16 @@
 """
-Módulo de Red y Comunicaciones (Networking)
--------------------------------------------
-Gestiona toda la comunicación de bajo nivel, incluyendo:
-1. Sockets UDP asíncronos.
-2. Descubrimiento de pares mediante mDNS (Multicast DNS).
-3. Verificación de certificados X.509 del DNIe.
-4. Gestión de retransmisiones (Reliability layer sobre UDP).
+Módulo de Red y Comunicaciones (Networking) - Versión QUIC
+----------------------------------------------------------
+Gestiona toda la comunicación de bajo nivel usando QUIC/TLS 1.3, incluyendo:
+1. Conexiones QUIC con aioquic (transporte fiable y cifrado).
+2. Handshake Noise IK sobre QUIC para autenticación DNIe.
+3. Descubrimiento de pares mediante mDNS (Multicast DNS).
+4. Verificación de certificados X.509 del DNIe.
+
+Arquitectura Híbrida:
+- QUIC (TLS 1.3 Autofirmado) para el transporte fiable y cifrado base.
+- Noise IK corriendo DENTRO de QUIC únicamente para autenticar 
+  que "el dueño de este túnel tiene el DNIe X".
 """
 
 import asyncio
@@ -20,6 +25,17 @@ import netifaces
 import re
 from collections import deque
 from datetime import datetime, timezone
+from typing import Dict, Optional, Callable, Any
+
+from aioquic.asyncio import QuicConnectionProtocol, serve, connect
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import (
+    StreamDataReceived, 
+    HandshakeCompleted, 
+    ConnectionTerminated,
+    StreamReset
+)
+from aioquic.quic.connection import QuicConnection
 
 from zeroconf import ServiceInfo, IPVersion, InterfaceChoice
 from zeroconf.asyncio import AsyncZeroconf
@@ -30,8 +46,25 @@ from cryptography.hazmat.primitives.asymmetric import padding, x25519
 
 # --- CONFIGURACIÓN Y CONSTANTES ---
 
+def normalize_addr(addr: tuple) -> tuple:
+    """
+    Normaliza una dirección de red.
+    Convierte IPv6-mapped IPv4 (::ffff:x.x.x.x) a IPv4 puro (x.x.x.x).
+    Convierte tuplas de 4 elementos (IPv6) a tuplas de 2 elementos (IPv4).
+    """
+    if not addr:
+        return addr
+    
+    ip = addr[0]
+    port = addr[1]
+    
+    # Convertir IPv6-mapped IPv4 a IPv4 puro
+    if ip.startswith('::ffff:'):
+        ip = ip[7:]  # Quitar el prefijo '::ffff:'
+    
+    return (ip, port)
+
 # Expresiones regulares para parsing manual de paquetes mDNS.
-# Se usa regex en lugar de librerías completas para extraer datos de paquetes malformados o crudos.
 RE_USER_PORT = re.compile(rb'User-([^_\x00]+)_(\d+)')
 RE_USER_PROP = re.compile(rb'user=([^\x00]+)')
 RE_STAT_EXIT = re.compile(rb'stat=exit')
@@ -39,26 +72,27 @@ RE_STAT_EXIT = re.compile(rb'stat=exit')
 # Identificador del servicio mDNS
 MDNS_TYPE = "_dni-im._udp.local."
 
-# Paquete de consulta mDNS pre-construido (para hacer polling activo)
+# Paquete de consulta mDNS pre-construido
 RAW_MDNS_QUERY = (
-    b'\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00' # Header
-    b'\x07_dni-im\x04_udp\x05local\x00'                # QNAME: _dni-im._udp.local
-    b'\x00\x0c'                                        # QTYPE: PTR (12)
-    b'\x00\x01'                                        # QCLASS: IN (1)
+    b'\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+    b'\x07_dni-im\x04_udp\x05local\x00'
+    b'\x00\x0c'
+    b'\x00\x01'
 )
+
 TRUSTED_CERTS_DIR = "certs"
+
+# --- Tipos de Paquete para el Stream de Señalización (Stream 0) ---
+SIGNAL_NOISE_INIT = 0x01      # Handshake Noise: Mensaje inicial
+SIGNAL_NOISE_RESPONSE = 0x02  # Handshake Noise: Respuesta
+SIGNAL_DISCONNECT = 0x03      # Notificación de desconexión
+SIGNAL_MSG_ACK = 0x04         # ACK de mensaje recibido
 
 # --- UTILIDADES DE CERTIFICADOS ---
 
 def load_trusted_cas():
     """
     Carga los certificados de Autoridad de Certificación (CA) de confianza desde el disco.
-    
-    Esta función es vital para establecer la Cadena de Confianza. Sin estos certificados,
-    no podemos verificar que el DNIe del otro usuario sea legítimo.
-    
-    Returns:
-        list: Lista de objetos Certificate (x509) cargados.
     """
     trusted_cas = []
     if not os.path.exists(TRUSTED_CERTS_DIR):
@@ -69,7 +103,6 @@ def load_trusted_cas():
             try:
                 with open(os.path.join(TRUSTED_CERTS_DIR, filename), "rb") as f:
                     cert_data = f.read()
-                    # Intentamos cargar formato PEM, si falla, probamos DER (binario)
                     try:
                         cert = x509.load_pem_x509_certificate(cert_data)
                     except:
@@ -79,14 +112,10 @@ def load_trusted_cas():
                 print(f"⚠️ Fallo al cargar CA {filename}: {e}")
     return trusted_cas
 
-# Cargamos el almacén de confianza al iniciar el módulo
 GLOBAL_TRUST_STORE = load_trusted_cas()
 
 def get_common_name(cert):
-    """
-    Extrae el Nombre Común (CN) de un certificado X.509.
-    El CN suele contener el nombre completo del titular en el DNIe.
-    """
+    """Extrae el Nombre Común (CN) de un certificado X.509."""
     for attribute in cert.subject:
         if attribute.oid == x509.NameOID.COMMON_NAME:
             return attribute.value
@@ -97,23 +126,10 @@ def verify_peer_identity(x25519_pub_key, proofs):
     Verifica criptográficamente la identidad de un par remoto.
     
     Pasos de verificación:
-    1. **Validez Temporal:** Verifica que el certificado no haya caducado.
-    2. **Uso de Clave:** Verifica que el certificado sirva para Firma Digital o No Repudio.
-    3. **Cadena de Confianza:** Verifica que el certificado haya sido firmado por una CA
-       confiable (Cuerpo Nacional de Policía) presente en `GLOBAL_TRUST_STORE`.
-    4. **Firma de Propiedad:** Verifica que la firma adjunta (`sig`) sobre la clave pública
-       de sesión (`x25519_pub_key`) sea válida usando la clave pública RSA del certificado.
-       Esto demuestra que el dueño del DNIe autorizó esta sesión.
-
-    Args:
-        x25519_pub_key: La clave pública efímera de la sesión Noise.
-        proofs (dict): Diccionario con 'cert' (hex) y 'sig' (hex).
-
-    Returns:
-        tuple: (Nombre Real, Nombre del Emisor)
-    
-    Raises:
-        Exception: Si alguna validación falla.
+    1. Validez Temporal
+    2. Uso de Clave
+    3. Cadena de Confianza
+    4. Firma de Propiedad
     """
     if not proofs or 'cert' not in proofs or 'sig' not in proofs:
         raise Exception("No se proporcionaron pruebas de identidad")
@@ -131,28 +147,26 @@ def verify_peer_identity(x25519_pub_key, proofs):
         if now > peer_cert.not_valid_after_utc:
             raise Exception("El certificado ha CADUCADO")
 
-        # 2. Verificación de Uso de Clave (Key Usage)
+        # 2. Verificación de Uso de Clave
         try:
             key_usage_ext = peer_cert.extensions.get_extension_for_class(x509.KeyUsage)
             usage = key_usage_ext.value
             if not (usage.digital_signature or usage.content_commitment):
                 raise Exception("Certificado no permitido para Firma Digital/Autenticación")
         except x509.ExtensionNotFound:
-            pass # Si no tiene la extensión, asumimos permisividad (aunque es raro en DNIe)
+            pass
 
-        # 3. Verificación de Cadena de Confianza (Chain of Trust)
+        # 3. Verificación de Cadena de Confianza
         issuer_name = "CA Desconocida (Sin Verificación)"
         is_trusted = False
         
         if not GLOBAL_TRUST_STORE:
-             issuer_name = "NO-CONFIABLE/SIN-ALMACEN"
-             # Permitimos continuar sin validación CA solo si no hay CAs cargadas (Modo inseguro)
-             is_trusted = True 
+            issuer_name = "NO-CONFIABLE/SIN-ALMACEN"
+            is_trusted = True
         else:
             for ca_cert in GLOBAL_TRUST_STORE:
                 try:
                     ca_public_key = ca_cert.public_key()
-                    # Verificamos la firma criptográfica del certificado del par con la clave de la CA
                     ca_public_key.verify(
                         peer_cert.signature,
                         peer_cert.tbs_certificate_bytes,
@@ -162,9 +176,9 @@ def verify_peer_identity(x25519_pub_key, proofs):
                     is_trusted = True
                     issuer_name = get_common_name(ca_cert)
                     print(f"🔐 [SEGURIDAD] Certificado DNIe verificado correctamente por: {issuer_name}")
-                    break 
+                    break
                 except Exception:
-                    continue # Probamos con la siguiente CA
+                    continue
 
             if not is_trusted:
                 raise Exception("El emisor del certificado NO ES DE CONFIANZA (No está en certs/)")
@@ -195,34 +209,39 @@ class SessionManager:
     Gestor central de sesiones criptográficas Noise IK.
     
     Mantiene el estado de todas las conexiones activas.
-    Utiliza dos índices:
-    1. Por Identidad (DNIe): Para enviar mensajes a una persona específica.
-    2. Por ID de Sesión (Index): Para enrutar paquetes entrantes a la sesión correcta.
+    En la arquitectura QUIC híbrida, Noise IK se usa SOLO para autenticación,
+    no para cifrar datos (eso lo hace TLS 1.3 de QUIC).
     """
     def __init__(self, local_static_key, db, local_proofs):
         self.local_static_key = local_static_key
         self.local_proofs = local_proofs
-        # Diccionario principal: real_name (DNIe) -> session object
-        self.sessions = {}
-        # Índice secundario: local_index (int) -> session object (para multiplexación UDP)
-        self.sessions_by_id = {}
+        self.sessions = {}           # real_name (DNIe) -> session object
+        self.sessions_by_id = {}     # local_index (int) -> session object
         self.db = db
-        self.transport = None
 
-    def get_session(self, identity):
-        """Busca una sesión activa por identidad DNIe (real_name)."""
+    def get_session(self, identity: str):
+        """
+        Busca una sesión activa por identidad DNIe.
+        
+        Args:
+            identity: Nombre real del titular del DNIe (ej: "JUAN GARCÍA PÉREZ").
+            
+        Returns:
+            NoiseIKSession si existe una sesión activa, None en caso contrario.
+        """
         return self.sessions.get(identity)
-    
-    def get_session_by_id(self, idx):
-        """Busca una sesión por su ID numérico local (necesario para recibir paquetes)."""
-        return self.sessions_by_id.get(idx)
 
-    def register_session(self, session, identity=None):
+    def register_session(self, session, identity: str = None):
         """
-        Registra una nueva sesión en los índices.
-        Si ya existe una sesión para esa identidad, la reemplaza (re-keying).
+        Registra una nueva sesión Noise IK en los índices del gestor.
+        
+        Si ya existe una sesión con la misma identidad, la reemplaza
+        y elimina la sesión antigua de los índices.
+        
+        Args:
+            session: Instancia de NoiseIKSession a registrar.
+            identity: Nombre real del titular (opcional, puede asociarse después).
         """
-        # Limpiar sesión anterior si existe
         if identity and identity in self.sessions:
             old_session = self.sessions[identity]
             if old_session.local_index in self.sessions_by_id:
@@ -234,11 +253,17 @@ class SessionManager:
             self.sessions[identity] = session
             session.peer_identity = identity
 
-    def update_session_identity(self, session, identity):
+    def update_session_identity(self, session, identity: str):
         """
         Asocia una sesión anónima con una identidad tras verificar el handshake.
+        
+        Se llama después de que la verificación DNIe confirme la identidad
+        del peer remoto.
+        
+        Args:
+            session: Sesión Noise IK ya establecida.
+            identity: Nombre real verificado del titular del DNIe.
         """
-        # Limpieza defensiva
         if identity in self.sessions:
             old_session = self.sessions[identity]
             if old_session is not session:
@@ -249,8 +274,15 @@ class SessionManager:
         session.peer_identity = identity
 
     def remove_session(self, session):
-        """Elimina una sesión de todos los registros y borra sus claves de forma segura."""
-        # Borrado seguro de claves de la sesión
+        """
+        Elimina una sesión de todos los registros y borra sus claves criptográficas.
+        
+        Realiza zeroización segura de las claves de la sesión antes de
+        eliminarla de los índices.
+        
+        Args:
+            session: Sesión Noise IK a eliminar.
+        """
         if hasattr(session, 'zeroize_session'):
             session.zeroize_session()
         
@@ -263,17 +295,26 @@ class SessionManager:
                 del self.sessions[identity]
 
     def zeroize_all_sessions(self):
-        """Borra de forma segura todas las sesiones activas. Llamar al cerrar la aplicación."""
+        """Borra de forma segura todas las sesiones activas."""
         for session in list(self.sessions_by_id.values()):
             if hasattr(session, 'zeroize_session'):
                 session.zeroize_session()
         self.sessions.clear()
         self.sessions_by_id.clear()
 
-    def create_initiator_session(self, remote_pub_key, identity=None):
+    def create_initiator_session(self, remote_pub_key, identity: str = None):
         """
-        Crea una sesión en modo INICIADOR (Cliente).
-        Prepara el estado Noise para enviar el primer mensaje.
+        Crea una sesión Noise IK en modo INICIADOR (Cliente).
+        
+        El iniciador conoce la clave pública del servidor de antemano
+        (obtenida vía mDNS) y puede enviar datos cifrados desde el primer mensaje.
+        
+        Args:
+            remote_pub_key: Clave pública X25519 del peer remoto.
+            identity: Identidad DNIe del peer (opcional, puede ser None inicialmente).
+            
+        Returns:
+            NoiseIKState: Sesión inicializada lista para crear mensaje de handshake.
         """
         session = NoiseIKState(
             self.local_static_key, 
@@ -288,8 +329,13 @@ class SessionManager:
 
     def create_responder_session(self):
         """
-        Crea una sesión en modo RESPONDEDOR (Servidor).
-        Espera recibir un mensaje inicial.
+        Crea una sesión Noise IK en modo RESPONDEDOR (Servidor).
+        
+        El respondedor no conoce al iniciador hasta recibir el primer mensaje.
+        La identidad se asociará después de verificar las pruebas DNIe.
+        
+        Returns:
+            NoiseIKState: Sesión inicializada esperando mensaje de handshake.
         """
         session = NoiseIKState(
             self.local_static_key, 
@@ -298,449 +344,1191 @@ class SessionManager:
         )
         session.initialize()
         session.peer_identity = None
-        # Solo registramos por ID, la identidad se desconoce hasta procesar el handshake
         self.sessions_by_id[session.local_index] = session
         return session
 
-# --- PROTOCOLO UDP ---
 
-class UDPProtocol(asyncio.DatagramProtocol):
+# --- PROTOCOLO QUIC ---
+
+class MeshQuicProtocol(QuicConnectionProtocol):
     """
-    Implementación del protocolo de red sobre UDP.
+    Protocolo QUIC para la malla de mensajería.
     
-    Características:
-    - Asíncrono (asyncio).
-    - Multiplexación de sesiones.
-    - Soporte para Roaming (cambio de IP del par).
-    - Sistema de ACK y retransmisión (Reliability).
+    Maneja eventos de la conexión QUIC y coordina el handshake Noise IK
+    para autenticación de identidad DNIe.
+    
+    Streams:
+    - Stream 0: Señalización (Handshake Noise)
+    - Streams pares (2, 4, 6...): Datos de chat (iniciados por cliente)
     """
-    def __init__(self, session_manager, on_message_received, on_log, on_handshake_success=None, on_ack_received=None):
-        self.sessions = session_manager
-        self.on_message = on_message_received
-        self.on_log = on_log
-        self.on_handshake_success = on_handshake_success
-        self.on_ack_received = on_ack_received
-        self.transport = None
-        
-        # Colas de mensajes pendientes por usuario
-        self.message_queues = {}
-        # Mapeo de identidad -> (IP, Puerto)
-        self.peer_addresses = {}
-        # Mapeo inverso (IP, Puerto) -> identidad
-        self.addr_to_identity = {}
-        
-        self.pending_handshakes = {}
-        # Buffer circular para deduplicación de mensajes recibidos
-        self.dedup_buffer = deque(maxlen=200)
-        
-        # Callbacks UI
-        self.get_peer_addr_callback = None
-        self.get_user_id_callback = None
-        self.is_peer_online_callback = None
-        self.discovery_service = None 
-        
-        self._retry_task_handle = None
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.network_manager: Optional['QuicNetworkManager'] = None
+        self.noise_session: Optional[NoiseIKState] = None
+        self.peer_identity: Optional[str] = None
+        self.is_authenticated = False
+        self.target_pub_key = None  # Clave pública del peer (para iniciadores)
+        self.target_user_id = None  # user_id mDNS del peer (para recovery_queue)
+        self._pending_messages = []  # Mensajes pendientes hasta autenticación
+        self._unacked_messages = {}  # msg_id -> msg_struct (enviados pero sin ACK)
+        self._signal_buffer = b""    # Buffer para Stream 0
 
-    def connection_made(self, transport):
-        """Callback llamado cuando el socket UDP está listo."""
-        self.transport = transport
-        self.sessions.transport = transport
-        try:
-            sock = transport.get_extra_info('socket')
-            addr = sock.getsockname()
-            self.on_log(f"✅ UDP Vinculado a {addr[0]}:{addr[1]}")
-        except: pass
-        # Iniciar tarea de retransmisión en segundo plano
-        self._retry_task_handle = asyncio.create_task(self._retry_worker())
+    def set_network_manager(self, manager: 'QuicNetworkManager'):
+        """Inyecta referencia al gestor de red."""
+        self.network_manager = manager
 
-    def update_peer_location(self, user_id, new_addr, pub_key_obj=None):
-        """
-        Actualiza la tabla de rutas cuando un usuario cambia de IP/Puerto (Roaming).
-        """
-        old_addr = self.peer_addresses.get(user_id)
-        
-        if old_addr == new_addr:
-            return  # No hay cambio
-        
-        self.on_log(f"📡 Ubicación de {user_id}: {old_addr} -> {new_addr}")
-        
-        # Actualización de mapas
-        if old_addr and old_addr in self.addr_to_identity:
-            del self.addr_to_identity[old_addr]
-        
-        self.peer_addresses[user_id] = new_addr
-        self.addr_to_identity[new_addr] = user_id
-        
-        # Guardar clave pública efímera (necesaria si queremos iniciar un handshake nosotros)
-        if pub_key_obj:
-            self.sessions.db.ephemeral_keys[new_addr] = pub_key_obj
-        
-        # Notificar a la sesión activa sobre el cambio de dirección
-        session = self.sessions.get_session(user_id)
-        if session:
-            session.current_addr = new_addr
-            # Si cambió la IP, invalidamos la sesión porque la seguridad de la clave efímera podría estar comprometida
-            # o el par podría haberse reiniciado.
-            if pub_key_obj and session.rs_pub:
-                old_pub = session.rs_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-                new_pub = pub_key_obj.public_bytes_raw() if hasattr(pub_key_obj, 'public_bytes_raw') else pub_key_obj.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-                if old_pub != new_pub:
-                    self.on_log(f"🔄 {user_id} reconectó con nueva clave, invalidando sesión criptográfica.")
-                    session.encryptor = None
-                    session.decryptor = None
+    def set_target_pub_key(self, pub_key):
+        """Establece la clave pública objetivo (para conexiones salientes)."""
+        self.target_pub_key = pub_key
 
-    async def _retry_worker(self):
-        """
-        Hilo de fondo que reenvía mensajes no confirmados (ACK).
-        Implementa un mecanismo simple de "Stop-and-Wait" por usuario.
-        """
-        while True:
-            await asyncio.sleep(5.0) # Check cada 5 segundos
-            now = time.time()
-            for user_id in list(self.message_queues.keys()):
-                queue = self.message_queues[user_id]
-                if not queue: continue
-                
-                # Solo reintentamos el primer mensaje de la cola (Head-of-Line Blocking intencional para orden)
-                head = queue[0]
-                target_addr = self.peer_addresses.get(user_id)
-                if not target_addr: continue
-                
-                session = self.sessions.get_session(user_id)
-                
-                if session and session.encryptor:
-                    try:
-                        head['last_retry'] = now
-                        head['attempts'] += 1
-                        await self._transmit_raw(user_id, head['content'], head['msg_id'], timestamp=head['timestamp'])
-                    except Exception as e:
-                        self.on_log(f"❌ Retry fallido: {e}")
-                else:
-                    # Si no hay sesión cifrada, intentamos handshake
-                    if self.is_peer_online_callback and not self.is_peer_online_callback(user_id):
-                        continue
-                    
-                    # Control de flood de handshakes (max 1 cada 5s)
-                    last_hs = self.pending_handshakes.get(user_id, 0)
-                    if now - last_hs > 5.0:
-                        try:
-                            remote_pub = await self.sessions.db.get_pubkey_by_addr(target_addr[0], target_addr[1])
-                            if remote_pub:
-                                self.on_log(f"🔄 Retry: Iniciando handshake con {user_id} @ {target_addr}")
-                                new_session = self.sessions.create_initiator_session(remote_pub, user_id)
-                                new_session.current_addr = target_addr
-                                hs_msg = new_session.create_handshake_message()
-                                self.transport.sendto(b'\x01' + hs_msg, target_addr)
-                                self.pending_handshakes[user_id] = now
-                        except Exception as e:
-                            self.on_log(f"❌ Error en retry handshake: {e}")
-
-    async def _send_next_in_queue(self, user_id):
-        """Envía el siguiente mensaje en la cola tras recibir un ACK del anterior."""
-        if user_id not in self.message_queues: return
-        queue = self.message_queues[user_id]
-        if not queue: return
-        head = queue[0]
+    def quic_event_received(self, event):
+        """Manejador principal de eventos QUIC."""
         
-        session = self.sessions.get_session(user_id)
-        if session and session.encryptor:
-            try:
-                head['last_retry'] = time.time()
-                head['attempts'] += 1
-                await self._transmit_raw(user_id, head['content'], head['msg_id'], timestamp=head['timestamp'])
-            except Exception: pass
+        # 1. Conexión TLS establecida
+        if isinstance(event, HandshakeCompleted):
+            self._handle_tls_handshake_complete()
+        
+        # 2. Datos recibidos en un Stream
+        elif isinstance(event, StreamDataReceived):
+            if event.stream_id == 0:
+                # Stream de señalización
+                self._handle_signal_data(event.data, event.end_stream)
+            else:
+                # Stream de datos de chat
+                self._handle_chat_data(event.stream_id, event.data, event.end_stream)
+        
+        # 3. Conexión terminada
+        elif isinstance(event, ConnectionTerminated):
+            self._handle_connection_closed(event)
+        
+        # 4. Stream reseteado
+        elif isinstance(event, StreamReset):
+            self._log(f"⚠️ Stream {event.stream_id} reseteado: {event.error_code}")
 
-    def datagram_received(self, data, addr):
+    def _handle_tls_handshake_complete(self):
+        """Callback cuando TLS 1.3 se establece."""
+        # Detectar si somos cliente (iniciador de conexión)
+        # En aioquic, el cliente tiene _quic._is_client = True
+        is_client = self._quic._is_client
+        
+        if is_client:
+            # Como clientes, iniciamos el handshake Noise
+            self._initiate_noise_handshake()
+
+    def _initiate_noise_handshake(self):
+        """Inicia Noise IK sobre el Stream 0 de QUIC (lado cliente)."""
+        if not self.target_pub_key:
+            self._log("❌ No hay clave pública objetivo para Noise handshake")
+            return
+        
+        if not self.network_manager:
+            self._log("❌ NetworkManager no configurado")
+            return
+        
+        # Crear sesión Noise como iniciador
+        self.noise_session = self.network_manager.sessions.create_initiator_session(
+            self.target_pub_key,
+            identity=None  # Se sabrá tras verificar el handshake
+        )
+        
+        # Crear y enviar mensaje A de Noise
+        msg_a = self.noise_session.create_handshake_message()
+        self._send_signal(SIGNAL_NOISE_INIT, msg_a)
+
+    def _handle_signal_data(self, data: bytes, end_stream: bool):
+        """Procesa datos del Stream 0 (señalización/handshake).
+        
+        Formato de paquete: [tipo 1B][longitud 4B][payload NB]
         """
-        Manejador principal de paquetes UDP entrantes.
-        Despacha según el byte de cabecera.
-        """
-        if len(data) < 1: return
-        try:
-            packet_type = data[0]
-            payload = data[1:]
+        self._signal_buffer += data
+        
+        # Necesitamos al menos 5 bytes para tipo + longitud
+        while len(self._signal_buffer) >= 5:
+            packet_type = self._signal_buffer[0]
+            payload_len = struct.unpack('<I', self._signal_buffer[1:5])[0]
             
-            if packet_type == 0x01: # Handshake Initial
-                self.handle_handshake_init(payload, addr)
-            elif packet_type == 0x02: # Handshake Response
-                self.handle_handshake_resp(payload, addr)
-            elif packet_type == 0x03: # Data Packet (Cifrado)
-                self.handle_data(payload, addr)
-        except Exception as e:
-            self.on_log(f"❌ Paquete erróneo desde {addr}: {e}")
+            # Verificar que tenemos el mensaje completo
+            total_len = 5 + payload_len
+            if len(self._signal_buffer) < total_len:
+                # Esperar más datos
+                break
+            
+            payload = self._signal_buffer[5:total_len]
+            self._signal_buffer = self._signal_buffer[total_len:]  # Consumir paquete
+            
+            if packet_type == SIGNAL_NOISE_INIT:
+                self._handle_noise_init(payload)
+            
+            elif packet_type == SIGNAL_NOISE_RESPONSE:
+                self._handle_noise_response(payload)
+            
+            elif packet_type == SIGNAL_DISCONNECT:
+                self._handle_peer_disconnect()
+            
+            elif packet_type == SIGNAL_MSG_ACK:
+                self._handle_msg_ack(payload)
+            
+            else:
+                self._log(f"⚠️ Tipo de señal desconocido: {packet_type}")
+                break
 
-    def handle_handshake_init(self, data, addr):
-        """
-        Procesa el inicio de un handshake (Rol: Respondedor).
-        Verifica la identidad del iniciador y responde.
-        """
-        self.on_log(f"🔄 Handshake Init desde {addr}")
-        session = self.sessions.create_responder_session()
-        session.current_addr = addr
+    def _handle_noise_init(self, data: bytes):
+        """Procesa mensaje inicial de Noise (lado servidor/respondedor)."""
+        if not self.network_manager:
+            self._log("❌ NetworkManager no disponible en _handle_noise_init")
+            return
+        
         try:
-            # Procesar criptografía Noise
-            remote_pub = session.consume_handshake_message(data)
+            # Crear sesión Noise como respondedor
+            self.noise_session = self.network_manager.sessions.create_responder_session()
+            
+            # Procesar mensaje A
+            remote_pub = self.noise_session.consume_handshake_message(data)
             
             # Verificar identidad DNIe
             try:
-                real_name, issuer = verify_peer_identity(remote_pub, session.remote_proofs)
-                self.on_log(f"✅ Identidad Verificada: {real_name} | Emisor: {issuer}")
+                real_name, issuer = verify_peer_identity(remote_pub, self.noise_session.remote_proofs)
+                self._log(f"✅ Conectado con: {real_name} (Firmado por: {issuer})")
+                self.peer_identity = real_name
             except Exception as e:
-                self.on_log(f"⛔ ALERTA DE SEGURIDAD: Identidad inválida ({e})")
-                self.sessions.remove_session(session)
+                self._log(f"⛔ ALERTA DE SEGURIDAD: Identidad inválida ({e})")
+                self.network_manager.sessions.remove_session(self.noise_session)
+                self.close()
                 return
-
-            # Registrar sesión
-            user_id = self.addr_to_identity.get(addr, real_name)
-            self.sessions.update_session_identity(session, user_id)
-            self.peer_addresses[user_id] = addr
-            self.addr_to_identity[addr] = user_id
             
-            # Enviar respuesta
-            resp_data = session.create_handshake_response()
-            self.transport.sendto(b'\x02' + resp_data, addr)
-            self.on_log(f"🤝 Handshake Respuesta enviado a {addr}")
+            # Registrar sesión con identidad
+            self.network_manager.sessions.update_session_identity(self.noise_session, real_name)
             
-            # Persistir contacto y notificar UI
-            asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], remote_pub, real_name=real_name))
-            if self.on_handshake_success:
-                self.on_handshake_success(addr, remote_pub, real_name)
+            # Crear y enviar respuesta (Mensaje B)
+            resp_data = self.noise_session.create_handshake_response()
+            self._send_signal(SIGNAL_NOISE_RESPONSE, resp_data)
             
-            # Si teníamos mensajes en cola para este usuario, enviarlos ahora
-            if user_id in self.message_queues and self.message_queues[user_id]:
-                asyncio.create_task(self._flush_pending_queue(user_id, session))
+            # Marcar como autenticado
+            self.is_authenticated = True
+            self._register_connection()
+            
+            # Obtener dirección de conexión (puede ser puerto efímero)
+            raw_peer_addr = normalize_addr(self._quic._network_paths[0].addr) if self._quic._network_paths else None
+            
+            # Buscar la dirección correcta (puerto anunciado) del peer
+            announced_addr = None
+            if self.network_manager:
+                # Buscar por identidad primero
+                announced_addr = self.network_manager.peer_addresses.get(real_name)
+                if not announced_addr and raw_peer_addr:
+                    # Buscar por IP (normalizada)
+                    for uid, addr in self.network_manager.peer_addresses.items():
+                        if addr[0] == raw_peer_addr[0]:  # Misma IP
+                            announced_addr = addr
+                            # Actualizar mapeo de identidad
+                            self.network_manager.peer_addresses[real_name] = addr
+                            self.network_manager.addr_to_identity[addr] = real_name
+                            break
+            
+            # Usar dirección anunciada si existe, sino la de conexión
+            peer_addr = announced_addr or raw_peer_addr
+            
+            # Registrar clave pública en memoria (NO en DB, cambia cada sesión)
+            if peer_addr and self.network_manager:
+                # Buscar user_id por dirección
+                uid = self.network_manager.addr_to_identity.get(peer_addr)
+                if uid:
+                    self.network_manager.peer_pubkeys[uid] = remote_pub
+            
+            # Notificar a UI si hay callback
+            if self.network_manager.on_handshake_success:
+                self.network_manager.on_handshake_success(peer_addr, remote_pub, real_name)
                 
         except Exception as e:
-            self.on_log(f"❌ Handshake fallido: {e}")
-            self.sessions.remove_session(session)
-
-    def handle_handshake_resp(self, data, addr):
-        """
-        Procesa la respuesta de un handshake (Rol: Iniciador).
-        Completa el establecimiento de claves.
-        """
-        if len(data) < 8: return
-        receiver_index = struct.unpack('<I', data[4:8])[0]
-        session = self.sessions.get_session_by_id(receiver_index)
-        if not session: return
-
-        try:
-            session.current_addr = addr
-            session.consume_handshake_response(data)
+            import traceback
+            self._log(f"❌ Error de autenticación: {type(e).__name__}")
             
-            # Verificación de identidad del servidor/respondedor
-            try:
-                real_name, issuer = verify_peer_identity(session.rs_pub, session.remote_proofs)
-                self.on_log(f"✅ Identidad del Par Verificada: {real_name} | Emisor: {issuer}")
-                asyncio.create_task(self.sessions.db.register_contact(addr[0], addr[1], session.rs_pub, real_name=real_name))
-            except Exception as e:
-                self.on_log(f"⛔ SEGURIDAD: Fallo verificación par: {e}")
-                self.sessions.remove_session(session)
-                return
-
-            user_id = getattr(session, 'peer_identity', None) or self.addr_to_identity.get(addr, real_name)
-            self.sessions.update_session_identity(session, user_id)
-            self.peer_addresses[user_id] = addr
-            self.addr_to_identity[addr] = user_id
+            # Si el error es InvalidTag, probablemente el peer tiene una clave diferente
+            # a la que usó para cifrar el mensaje. Esto puede pasar si:
+            # 1. El peer usó nuestra clave pública antigua (nosotros nos reconectamos)
+            # 2. Hay corrupción de datos
             
-            self.pending_handshakes.pop(user_id, None)
+            if self.noise_session:
+                self.network_manager.sessions.remove_session(self.noise_session)
+            self.close()
 
-            if self.on_handshake_success:
-                self.on_handshake_success(addr, session.rs_pub, real_name)
-
-            # Liberar cola de mensajes
-            if user_id in self.message_queues and self.message_queues[user_id]:
-                self.on_log(f"🚀 Canal seguro establecido, enviando cola...")
-                asyncio.create_task(self._flush_pending_queue(user_id, session))
-
-        except Exception as e:
-            self.on_log(f"❌ Error completando handshake: {e}")
-
-    def handle_data(self, data, addr):
-        """
-        Maneja paquetes de datos cifrados (Type 0x03).
-        """
-        if len(data) < 4: return
-        receiver_index = struct.unpack('<I', data[:4])[0]
-        encrypted_payload = data[4:]
-        
-        session = self.sessions.get_session_by_id(receiver_index)
-        if not session: return
-        
-        # Si la sesión fue invalidada (zeroizada), ignorar el paquete silenciosamente
-        # Esto ocurre cuando el peer envía desconexión por mDNS y luego llega el paquete UDP
-        if not session.decryptor:
+    def _handle_noise_response(self, data: bytes):
+        """Procesa respuesta de Noise (lado cliente/iniciador)."""
+        if not self.noise_session:
+            self._log("❌ No hay sesión Noise activa")
             return
         
-        user_id = getattr(session, 'peer_identity', None)
-        
-        # Detección de Roaming (Cambio de IP)
-        if session.current_addr != addr:
-            self.on_log(f"🚀 Roaming detectado: {user_id} movido de {session.current_addr} a {addr}")
-            session.current_addr = addr
-            if user_id:
-                self.peer_addresses[user_id] = addr
-                self.addr_to_identity[addr] = user_id
+        try:
+            # Consumir respuesta
+            self.noise_session.consume_handshake_response(data)
+            
+            # Verificar identidad del servidor
+            try:
+                real_name, issuer = verify_peer_identity(
+                    self.noise_session.rs_pub, 
+                    self.noise_session.remote_proofs
+                )
+                self.peer_identity = real_name
+            except Exception as e:
+                self._log(f"⛔ SEGURIDAD: Fallo verificación par: {e}")
+                self.network_manager.sessions.remove_session(self.noise_session)
+                self.close()
+                return
+            
+            # Actualizar sesión con identidad
+            self.network_manager.sessions.update_session_identity(self.noise_session, real_name)
+            
+            # Marcar como autenticado
+            self.is_authenticated = True
+            self._register_connection()
+            self._log(f"🎉 Canal seguro establecido con {real_name} (Firmado por: {issuer})")
+            
+            # Registrar clave pública en memoria (NO en DB, cambia cada sesión)
+            peer_addr = normalize_addr(self._quic._network_paths[0].addr) if self._quic._network_paths else None
+            if peer_addr and self.network_manager:
+                # Buscar user_id por dirección o identidad
+                uid = self.network_manager.addr_to_identity.get(peer_addr)
+                if uid:
+                    self.network_manager.peer_pubkeys[uid] = self.noise_session.rs_pub
+            
+            # Notificar a UI
+            if self.network_manager.on_handshake_success:
+                self.network_manager.on_handshake_success(
+                    peer_addr, self.noise_session.rs_pub, real_name
+                )
+            
+            # NO llamar a _flush_pending_messages() aquí - lo hará _connect_and_send
+            # para evitar race conditions
+            
+        except Exception as e:
+            import traceback
+            self._log(f"❌ Error de autenticación: {type(e).__name__}")
+            
+            # Si el error es InvalidTag, la clave del peer cambió
+            # Debemos invalidar la clave que tenemos y esperar nueva vía mDNS
+            # Marcar que necesitamos actualizar la clave de este peer
+            if self.network_manager and self.target_pub_key:
+                # Buscar qué user_id tiene esta clave
+                for uid, pub in list(self.network_manager.peer_pubkeys.items()):
+                    try:
+                        if pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw) == \
+                           self.target_pub_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw):
+                            # Marcar para que se actualice con la próxima clave de mDNS
+                            if not hasattr(self.network_manager, '_stale_keys'):
+                                self.network_manager._stale_keys = set()
+                            self.network_manager._stale_keys.add(uid)
+                            break
+                    except:
+                        pass
+            
+            if self.noise_session:
+                self.network_manager.sessions.remove_session(self.noise_session)
+            self.close()
+
+    def _handle_peer_disconnect(self):
+        """Maneja notificación de desconexión del peer."""
+        if self.peer_identity:
+            self._log(f"📴 {self.peer_identity} se desconectó")
+        self._cleanup()
+
+    def _handle_chat_data(self, stream_id: int, data: bytes, end_stream: bool):
+        """Procesa datos de chat recibidos."""
+        if not self.is_authenticated:
+            return
         
         try:
-            plaintext = session.decrypt_message(encrypted_payload)
-            msg_struct = json.loads(plaintext.decode('utf-8'))
-
-            # Manejo de ACKs (Confirmaciones de recepción)
-            if 'ack_id' in msg_struct:
-                ack_id = msg_struct['ack_id']
-                if user_id and user_id in self.message_queues:
-                    queue = self.message_queues[user_id]
-                    # Si el ACK coincide con el mensaje que estamos intentando enviar, lo quitamos
-                    if queue and queue[0]['msg_id'] == ack_id:
-                        queue.popleft() 
-                        if queue:
-                            asyncio.create_task(self._send_next_in_queue(user_id))
-                if self.on_ack_received:
-                    self.on_ack_received(addr, ack_id)
-                return 
-
+            # Los datos vienen en JSON plano (QUIC/TLS ya descifró)
+            msg_struct = json.loads(data.decode('utf-8'))
+            
             # Verificación de integridad del mensaje (Hash Check)
             if 'text' in msg_struct and 'hash' in msg_struct:
                 content = msg_struct['text']
                 local_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
                 msg_struct['integrity'] = (local_hash == msg_struct['hash'])
             
-            # Enviar ACK automático y deduplicar
-            if 'id' in msg_struct and not msg_struct.get('disconnect'):
-                incoming_id = msg_struct['id']
-                asyncio.create_task(self.send_ack(session, incoming_id))
+            # Añadir identidad del remitente
+            msg_struct['sender_identity'] = self.peer_identity
+            
+            # Notificar a la capa superior
+            # IMPORTANTE: Usar la dirección del servidor del peer (puerto anunciado),
+            # no el puerto efímero de la conexión entrante
+            if self.network_manager and self.network_manager.on_message:
+                # Buscar la dirección correcta usando peer_identity
+                correct_addr = self.network_manager.peer_addresses.get(self.peer_identity)
+                if not correct_addr:
+                    # Fallback: usar la IP de la conexión pero con puerto del servidor
+                    raw_addr = normalize_addr(self._quic._network_paths[0].addr) if self._quic._network_paths else None
+                    if raw_addr:
+                        # Intentar buscar por IP (normalizada)
+                        for uid, addr in self.network_manager.peer_addresses.items():
+                            if addr[0] == raw_addr[0]:  # Misma IP
+                                correct_addr = addr
+                                break
+                        if not correct_addr:
+                            correct_addr = raw_addr
                 
-                if incoming_id in self.dedup_buffer:
-                    return # Mensaje duplicado ignorado
-                self.dedup_buffer.append(incoming_id)
-
-            self.on_message(addr, msg_struct)
+                self.network_manager.on_message(correct_addr, msg_struct)
+                
+                # Enviar ACK al emisor
+                if 'id' in msg_struct:
+                    self._send_msg_ack(msg_struct['id'])
+                
+        except json.JSONDecodeError as e:
+            self._log(f"❌ Error en mensaje recibido")
         except Exception as e:
-            self.on_log(f"❌ Error descifrando mensaje: {e}")
+            self._log(f"❌ Error procesando mensaje: {e}")
 
-    async def send_ack(self, session, msg_id):
-        """Envía un paquete de confirmación (ACK) cifrado."""
-        if not session or not session.encryptor: return
-        try:
-            ack_payload = {"timestamp": time.time(), "ack_id": msg_id}
-            json_bytes = json.dumps(ack_payload).encode('utf-8')
-            full_packet_payload = session.encrypt_message(json_bytes)
-            self.transport.sendto(b'\x03' + full_packet_payload, session.current_addr)
-        except Exception: pass
-
-    async def _transmit_raw(self, user_id, content, msg_id, is_disconnect=False, timestamp=None):
-        """
-        Función interna para construir y enviar paquetes.
-        Inicia handshakes automáticamente si no hay sesión cifrada.
-        """
-        target_addr = self.peer_addresses.get(user_id)
-        if not target_addr: return
+    def _handle_connection_closed(self, event: ConnectionTerminated):
+        """Maneja el cierre de conexión."""
+        # Si la conexión se cerró sin completar autenticación y éramos cliente,
+        # puede ser que usamos una clave obsoleta del peer
+        if not self.is_authenticated and self._quic._is_client and self.target_pub_key:
+            pass  # Silencioso - se reintentará automáticamente
+            # Buscar qué user_id tiene esta clave
+            if self.network_manager:
+                for uid, pub in list(self.network_manager.peer_pubkeys.items()):
+                    try:
+                        if pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw) == \
+                           self.target_pub_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw):
+                            if not hasattr(self.network_manager, '_stale_keys'):
+                                self.network_manager._stale_keys = set()
+                            self.network_manager._stale_keys.add(uid)
+                            break
+                    except:
+                        pass
         
-        session = self.sessions.get_session(user_id)
-        
-        # Lógica de inicio de sesión bajo demanda
-        if not session or not session.encryptor:
-            remote_pub = await self.sessions.db.get_pubkey_by_addr(target_addr[0], target_addr[1])
-            if remote_pub:
-                self.on_log(f"🔄 Handshake automático al enviar a {user_id}")
-                new_session = self.sessions.create_initiator_session(remote_pub, user_id)
-                new_session.current_addr = target_addr
-                hs_msg = new_session.create_handshake_message()
-                self.transport.sendto(b'\x01' + hs_msg, target_addr)
-                self.pending_handshakes[user_id] = time.time()
-            return 
+        self._cleanup()
 
-        # Envío cifrado
+    def _cleanup(self):
+        """Limpia recursos de la conexión."""
+        # Recuperar mensajes sin ACK para reenvío
+        # IMPORTANTE: Usar user_id (mDNS ID), no peer_identity (nombre certificado)
+        # para que coincida con las claves usadas en update_peer_location
+        
+        # Prioridad 1: usar target_user_id si fue asignado explícitamente
+        cleanup_user_id = self.target_user_id
+        
+        # Prioridad 2: buscar en active_connections
+        if not cleanup_user_id and self.network_manager:
+            for uid, proto in list(self.network_manager.active_connections.items()):
+                if proto is self:
+                    cleanup_user_id = uid
+                    break
+        
+        # Prioridad 3: buscar por clave pública
+        if not cleanup_user_id and self.target_pub_key and self.network_manager:
+            for uid, pub in list(self.network_manager.peer_pubkeys.items()):
+                try:
+                    if pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw) == \
+                       self.target_pub_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw):
+                        cleanup_user_id = uid
+                        break
+                except:
+                    pass
+        
+        # Prioridad 4: usar peer_identity si es un user_id corto (no un nombre)
+        if not cleanup_user_id and self.peer_identity:
+            # peer_identity cortos (ej: f2fd0120) son user_ids, nombres largos no
+            if len(self.peer_identity) <= 16 and ' ' not in self.peer_identity:
+                cleanup_user_id = self.peer_identity
+        
+        if self.network_manager and cleanup_user_id:
+            unacked_msgs = list(self._unacked_messages.values())
+            pending_msgs = list(self._pending_messages)
+            all_pending = unacked_msgs + pending_msgs
+            
+            if all_pending:
+                # Guardar en la cola global del NetworkManager para reenvío
+                if not hasattr(self.network_manager, '_recovery_queue'):
+                    self.network_manager._recovery_queue = {}
+                if cleanup_user_id not in self.network_manager._recovery_queue:
+                    self.network_manager._recovery_queue[cleanup_user_id] = []
+                self.network_manager._recovery_queue[cleanup_user_id].extend(all_pending)
+            
+            # Remover de conexiones activas
+            if cleanup_user_id in self.network_manager.active_connections:
+                del self.network_manager.active_connections[cleanup_user_id]
+        
+        if self.peer_identity and self.network_manager:
+            if self.peer_identity in self.network_manager.active_connections:
+                del self.network_manager.active_connections[self.peer_identity]
+        
+        if self.noise_session and self.network_manager:
+            self.network_manager.sessions.remove_session(self.noise_session)
+        
+        self._unacked_messages.clear()
+        self._pending_messages.clear()
+        self.is_authenticated = False
+        self.peer_identity = None
+
+    def _register_connection(self):
+        """Registra esta conexión como activa en el NetworkManager."""
+        if self.network_manager and self.peer_identity:
+            self.network_manager.active_connections[self.peer_identity] = self
+
+    def _send_signal(self, signal_type: int, payload: bytes):
+        """Envía un paquete de señalización por Stream 0.
+        
+        Formato: [tipo 1B][longitud 4B][payload NB]
+        """
+        header = bytes([signal_type]) + struct.pack('<I', len(payload))
+        data = header + payload
+        self._quic.send_stream_data(0, data, end_stream=False)
+        self.transmit()
+
+    def send_chat_message(self, msg_struct: dict) -> bool:
+        """
+        Envía un mensaje de chat.
+        
+        El mensaje va en JSON plano porque QUIC/TLS ya cifra.
+        """
+        if not self.is_authenticated:
+            # Encolar para cuando se autentique
+            self._pending_messages.append(msg_struct)
+            return False
+        
         try:
-            if is_disconnect:
-                msg_struct = {"timestamp": time.time(), "disconnect": True}
-            else:
-                text_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
-                final_ts = timestamp if timestamp is not None else time.time()
-                msg_struct = {
-                    "id": msg_id,
-                    "timestamp": final_ts, 
-                    "text": content,
-                    "hash": text_hash
-                }
-            payload = json.dumps(msg_struct).encode('utf-8')
-            full_packet_payload = session.encrypt_message(payload)
-            self.transport.sendto(b'\x03' + full_packet_payload, session.current_addr)
+            json_bytes = json.dumps(msg_struct).encode('utf-8')
+            stream_id = self._quic.get_next_available_stream_id()
+            self._quic.send_stream_data(stream_id, json_bytes, end_stream=True)
+            self.transmit()
+            
+            # Guardar mensaje como pendiente de ACK
+            if 'id' in msg_struct:
+                self._unacked_messages[msg_struct['id']] = msg_struct.copy()
+            
+            return True
         except Exception as e:
-            self.on_log(f"❌ Fallo transmisión: {e}")
+            self._log(f"❌ Error enviando mensaje: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
-    async def send_message(self, user_id, content, is_disconnect=False, forced_msg_id=None):
-        """Interfaz pública para encolar mensajes."""
-        msg_id = forced_msg_id if forced_msg_id else str(uuid.uuid4())
+    def _send_msg_ack(self, msg_id: str):
+        """Envía ACK de recepción de mensaje."""
+        self._send_signal(SIGNAL_MSG_ACK, msg_id.encode('utf-8'))
+
+    def _handle_msg_ack(self, payload: bytes):
+        """Procesa ACK de mensaje recibido del peer."""
+        try:
+            msg_id = payload.decode('utf-8')
+            
+            # Remover de mensajes sin ACK
+            if msg_id in self._unacked_messages:
+                del self._unacked_messages[msg_id]
+            
+            # Notificar a la capa superior
+            if self.network_manager and self.network_manager.on_ack_received:
+                # Obtener dirección correcta del peer
+                peer_addr = None
+                if self.peer_identity:
+                    peer_addr = self.network_manager.peer_addresses.get(self.peer_identity)
+                if not peer_addr:
+                    raw_addr = normalize_addr(self._quic._network_paths[0].addr) if self._quic._network_paths else None
+                    if raw_addr:
+                        for uid, addr in self.network_manager.peer_addresses.items():
+                            if addr[0] == raw_addr[0]:
+                                peer_addr = addr
+                                break
+                        if not peer_addr:
+                            peer_addr = raw_addr
+                
+                self.network_manager.on_ack_received(peer_addr, msg_id)
+        except Exception as e:
+            pass  # ACK fallido, el mensaje se reenviará si es necesario
+
+    def send_disconnect_notification(self):
+        """Envía notificación de desconexión al peer."""
+        self._send_signal(SIGNAL_DISCONNECT, b"")
+
+    def _flush_pending_messages(self):
+        """Envía mensajes que estaban esperando autenticación."""
+        if not self._pending_messages:
+            return
+        
+        for msg in self._pending_messages:
+            self.send_chat_message(msg)
+        self._pending_messages.clear()
+
+    def _log(self, message: str):
+        """Envía mensaje de log al NetworkManager."""
+        if self.network_manager and self.network_manager.on_log:
+            self.network_manager.on_log(message)
+        else:
+            print(message)
+
+
+class QuicNetworkManager:
+    """
+    Gestor central de conexiones QUIC.
+    
+    Orquesta:
+    1. Servidor QUIC para conexiones entrantes.
+    2. Conexiones salientes a peers descubiertos.
+    3. Enrutamiento de mensajes a las conexiones correctas.
+    """
+    
+    def __init__(
+        self,
+        session_manager: SessionManager,
+        cert_path: str,
+        key_path: str,
+        on_message: Callable = None,
+        on_log: Callable = None,
+        on_handshake_success: Callable = None,
+        on_ack_received: Callable = None
+    ):
+        self.sessions = session_manager
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.on_message = on_message
+        self.on_log = on_log or (lambda x: None)
+        self.on_handshake_success = on_handshake_success
+        self.on_ack_received = on_ack_received  # Callback para ACKs (compatibilidad TUI)
+        
+        # Conexiones activas: user_id -> MeshQuicProtocol
+        self.active_connections: Dict[str, MeshQuicProtocol] = {}
+        
+        # Direcciones conocidas: user_id -> (ip, port)
+        self.peer_addresses: Dict[str, tuple] = {}
+        self.addr_to_identity: Dict[tuple, str] = {}
+        
+        # Claves públicas conocidas: user_id -> X25519PublicKey
+        self.peer_pubkeys: Dict[str, Any] = {}
+        
+        # Servidor QUIC
+        self._server = None
+        self._server_task = None
+        
+        # Configuraciones TLS
+        self._server_config = None
+        self._client_config = None
+        
+        # Buffer de deduplicación
+        self.dedup_buffer = deque(maxlen=200)
+        
+        # Referencia al servicio de descubrimiento
+        self.discovery_service = None
+        
+        # Tareas de conexión pendientes
+        self._pending_connections: Dict[str, asyncio.Task] = {}
+        
+        # Callbacks de compatibilidad con la TUI (se configuran externamente)
+        self.get_peer_addr_callback = None
+        self.get_user_id_callback = None
+        self.is_peer_online_callback = None
+
+    def _create_server_config(self) -> QuicConfiguration:
+        """Crea configuración TLS para el servidor."""
+        config = QuicConfiguration(
+            alpn_protocols=["dnie-mesh-v1"],
+            is_client=False,
+            max_datagram_frame_size=65536,
+            idle_timeout=300.0,  # 5 minutos de timeout
+        )
+        config.load_cert_chain(self.cert_path, self.key_path)
+        return config
+
+    def _create_client_config(self) -> QuicConfiguration:
+        """Crea configuración TLS para el cliente."""
+        config = QuicConfiguration(
+            alpn_protocols=["dnie-mesh-v1"],
+            is_client=True,
+            max_datagram_frame_size=65536,
+            idle_timeout=300.0,  # 5 minutos de timeout
+        )
+        # No verificamos el certificado del servidor (usamos Noise para eso)
+        config.verify_mode = False
+        return config
+
+    async def start_server(self, host: str, port: int):
+        """Inicia el servidor QUIC."""
+        self._server_config = self._create_server_config()
+        self._client_config = self._create_client_config()
+        
+        self._server = await serve(
+            host,
+            port,
+            configuration=self._server_config,
+            create_protocol=self._create_server_protocol,
+        )
+        
+        self.on_log(f"✅ Servidor QUIC iniciado en {host}:{port}")
+
+    def _create_server_protocol(self, *args, **kwargs) -> MeshQuicProtocol:
+        """Factory para crear protocolos de servidor."""
+        proto = MeshQuicProtocol(*args, **kwargs)
+        proto.set_network_manager(self)
+        return proto
+
+    async def connect_to(self, ip: str, port: int, target_pub_key, user_id: str = None) -> Optional[MeshQuicProtocol]:
+        """
+        Conecta activamente a un peer y mantiene la conexión.
+        
+        Args:
+            ip: Dirección IP del peer
+            port: Puerto del peer
+            target_pub_key: Clave pública X25519 del peer (necesaria para Noise IK)
+            user_id: Identificador opcional del usuario
+            
+        Returns:
+            MeshQuicProtocol si la conexión se establece, None en caso contrario
+        """
+        if not self._client_config:
+            self._client_config = self._create_client_config()
+        
+        try:
+            # Crear protocolo con la clave pública inyectada
+            def protocol_factory(*args, **kwargs):
+                proto = MeshQuicProtocol(*args, **kwargs)
+                proto.set_network_manager(self)
+                proto.set_target_pub_key(target_pub_key)
+                proto.target_user_id = user_id  # Guardar user_id para recovery_queue
+                return proto
+            
+            # Usar connect de aioquic (devuelve un protocolo)
+            async with connect(
+                ip,
+                port,
+                configuration=self._client_config,
+                create_protocol=protocol_factory,
+            ) as protocol:
+                # Mantener la conexión viva esperando que se cierre
+                # El handshake Noise se iniciará automáticamente en HandshakeCompleted
+                
+                # Esperar un poco para que el handshake Noise se complete
+                for _ in range(50):  # 5 segundos máximo
+                    await asyncio.sleep(0.1)
+                    if protocol.is_authenticated:
+                        # Mantener la conexión viva (el context manager la cerrará al salir)
+                        # Para conexiones persistentes, necesitamos evitar que salga del context
+                        while protocol.is_authenticated:
+                            await asyncio.sleep(1)
+                        break
+                
+                return protocol
+                
+        except asyncio.CancelledError:
+            return None
+        except Exception as e:
+            return None
+
+    def update_peer_location(self, user_id: str, new_addr: tuple, pub_key_obj=None):
+        """Actualiza la ubicación de un peer (llamado desde mDNS discovery)."""
+        old_addr = self.peer_addresses.get(user_id)
+        old_pub = self.peer_pubkeys.get(user_id)
+        
+        # Verificar si la clave estaba marcada como obsoleta (por un error InvalidTag previo)
+        key_was_stale = hasattr(self, '_stale_keys') and user_id in self._stale_keys
+        if key_was_stale and pub_key_obj:
+            self._stale_keys.discard(user_id)
+        
+        # Detectar si la clave pública cambió (peer se reconectó con nueva sesión)
+        pub_key_changed = False
+        pub_key_is_new = pub_key_obj and not old_pub  # Primera vez que recibimos clave
+        if pub_key_obj and old_pub:
+            try:
+                old_pub_bytes = old_pub.public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw
+                )
+                new_pub_bytes = pub_key_obj.public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw
+                )
+                pub_key_changed = old_pub_bytes != new_pub_bytes
+            except:
+                pub_key_changed = True
+        
+        # Detectar cambio de IP
+        ip_changed = old_addr and old_addr != new_addr
+        
+        # Los cambios de clave o IP se manejan silenciosamente
+        
+        # Si cambió IP o clave pública O la clave estaba obsoleta, invalidar conexiones y reencolar mensajes
+        if pub_key_changed or ip_changed or key_was_stale:
+            # Recopilar mensajes pendientes antes de cerrar
+            pending_msgs = []
+            
+            # Mensajes en la cola global
+            if hasattr(self, '_message_queue') and user_id in self._message_queue:
+                pending_msgs.extend(self._message_queue[user_id])
+                del self._message_queue[user_id]
+            
+            # Mensajes sin ACK recuperados de conexiones cerradas
+            if hasattr(self, '_recovery_queue') and user_id in self._recovery_queue:
+                pending_msgs.extend(self._recovery_queue[user_id])
+                del self._recovery_queue[user_id]
+            
+            # Cerrar conexión antigua si existe
+            if user_id in self.active_connections:
+                old_proto = self.active_connections[user_id]
+                # Recuperar mensajes pendientes de la conexión
+                if old_proto._pending_messages:
+                    pending_msgs.extend(old_proto._pending_messages)
+                    old_proto._pending_messages.clear()
+                # Recuperar mensajes sin ACK
+                if old_proto._unacked_messages:
+                    pending_msgs.extend(old_proto._unacked_messages.values())
+                    old_proto._unacked_messages.clear()
+                try:
+                    if old_proto.noise_session:
+                        old_proto.noise_session.zeroize_session()
+                    old_proto.close()
+                except:
+                    pass
+                del self.active_connections[user_id]
+            
+            # Cancelar conexión pendiente si existe
+            if user_id in self._pending_connections:
+                # Recuperar mensajes de la cola de reenvío pendiente
+                if hasattr(self, '_pending_resend_messages') and user_id in self._pending_resend_messages:
+                    resend_msgs = self._pending_resend_messages[user_id]
+                    pending_msgs.extend(resend_msgs)
+                    del self._pending_resend_messages[user_id]
+                self._pending_connections[user_id].cancel()
+                del self._pending_connections[user_id]
+            
+            # Deduplicar mensajes por ID
+            seen_ids = set()
+            unique_msgs = []
+            for msg in pending_msgs:
+                msg_id = msg.get('id')
+                if msg_id and msg_id not in seen_ids:
+                    seen_ids.add(msg_id)
+                    unique_msgs.append(msg)
+                elif not msg_id:
+                    unique_msgs.append(msg)
+            pending_msgs = unique_msgs
+            
+            # Si hay mensajes pendientes, decidir qué hacer
+            if pending_msgs:
+                # IMPORTANTE: Si cambió la IP pero NO tenemos nueva clave pública,
+                # NO intentar reenviar aún - la clave antigua ya no es válida.
+                # Guardar mensajes y esperar a que llegue la nueva clave vía mDNS.
+                if ip_changed and not pub_key_obj:
+                    # Guardar en _message_queue para cuando llegue la nueva clave
+                    if not hasattr(self, '_message_queue'):
+                        self._message_queue = {}
+                    if user_id not in self._message_queue:
+                        self._message_queue[user_id] = []
+                    self._message_queue[user_id].extend(pending_msgs)
+                    # Invalidar la clave antigua
+                    if user_id in self.peer_pubkeys:
+                        del self.peer_pubkeys[user_id]
+                else:
+                    # Tenemos la nueva clave, podemos reenviar
+                    # Guardar mensajes para recuperación si se cancela
+                    if not hasattr(self, '_pending_resend_messages'):
+                        self._pending_resend_messages = {}
+                    self._pending_resend_messages[user_id] = pending_msgs.copy()
+                    # Programar reenvío de mensajes a la nueva dirección
+                    asyncio.create_task(self._resend_pending_messages(user_id, new_addr, pub_key_obj, pending_msgs))
+        
+        # Si nada cambió (misma dirección, misma clave o sin clave nueva), verificar si hay mensajes pendientes
+        if old_addr == new_addr and not pub_key_changed and not pub_key_is_new:
+            # Aunque no cambió nada, verificar si hay mensajes en recovery_queue para este peer
+            # (pueden haber quedado de una conexión cerrada por timeout)
+            if pub_key_obj and hasattr(self, '_recovery_queue') and user_id in self._recovery_queue:
+                pending_msgs = self._recovery_queue[user_id]
+                del self._recovery_queue[user_id]
+                if pending_msgs:
+                    if not hasattr(self, '_pending_resend_messages'):
+                        self._pending_resend_messages = {}
+                    self._pending_resend_messages[user_id] = pending_msgs.copy()
+                    asyncio.create_task(self._resend_pending_messages(user_id, new_addr, pub_key_obj, pending_msgs))
+            # También verificar _message_queue
+            if pub_key_obj and hasattr(self, '_message_queue') and user_id in self._message_queue:
+                pending_msgs = self._message_queue[user_id]
+                del self._message_queue[user_id]
+                if pending_msgs:
+                    if not hasattr(self, '_pending_resend_messages'):
+                        self._pending_resend_messages = {}
+                    self._pending_resend_messages[user_id] = pending_msgs.copy()
+                    asyncio.create_task(self._resend_pending_messages(user_id, new_addr, pub_key_obj, pending_msgs))
+            return
+        
+        if old_addr and old_addr in self.addr_to_identity:
+            del self.addr_to_identity[old_addr]
+        
+        self.peer_addresses[user_id] = new_addr
+        self.addr_to_identity[new_addr] = user_id
+        
+        # Actualizar clave pública en memoria (NO en DB, cambia cada sesión)
+        if pub_key_obj:
+            self.peer_pubkeys[user_id] = pub_key_obj
+            
+            # Recopilar todos los mensajes pendientes de las diferentes colas
+            all_pending = []
+            
+            # Mensajes en _message_queue (esperando clave)
+            if hasattr(self, '_message_queue') and user_id in self._message_queue:
+                all_pending.extend(self._message_queue[user_id])
+                del self._message_queue[user_id]
+            
+            # Mensajes en _recovery_queue (de conexiones cerradas)
+            if hasattr(self, '_recovery_queue') and user_id in self._recovery_queue:
+                all_pending.extend(self._recovery_queue[user_id])
+                del self._recovery_queue[user_id]
+            
+            # Deduplicar por ID
+            if all_pending:
+                seen_ids = set()
+                unique_msgs = []
+                for msg in all_pending:
+                    msg_id = msg.get('id')
+                    if msg_id and msg_id not in seen_ids:
+                        seen_ids.add(msg_id)
+                        unique_msgs.append(msg)
+                    elif not msg_id:
+                        unique_msgs.append(msg)
+                
+                if unique_msgs:
+                    if not hasattr(self, '_pending_resend_messages'):
+                        self._pending_resend_messages = {}
+                    self._pending_resend_messages[user_id] = unique_msgs.copy()
+                    asyncio.create_task(self._resend_pending_messages(user_id, new_addr, pub_key_obj, unique_msgs))
+
+    async def _resend_pending_messages(self, user_id: str, new_addr: tuple, pub_key, messages: list):
+        """Reenvía mensajes pendientes a la nueva dirección del peer."""
+        if not messages:
+            return
+        
+        # Esperar un momento para que la nueva conexión se estabilice
+        await asyncio.sleep(0.5)
+        
+        # Usar la nueva dirección y clave pública
+        if pub_key:
+            self.peer_pubkeys[user_id] = pub_key
+        
+        # Crear nueva conexión y enviar mensajes
+        try:
+            if not self._client_config:
+                self._client_config = self._create_client_config()
+            
+            target_pub = self.peer_pubkeys.get(user_id)
+            if not target_pub:
+                return
+            
+            def protocol_factory(*args, **kwargs):
+                proto = MeshQuicProtocol(*args, **kwargs)
+                proto.set_network_manager(self)
+                proto.set_target_pub_key(target_pub)
+                proto.target_user_id = user_id  # Guardar user_id para recovery_queue
+                # Pre-encolar todos los mensajes pendientes
+                for msg in messages:
+                    proto._pending_messages.append(msg)
+                return proto
+            
+            task = asyncio.create_task(self._connect_and_send_with_factory(
+                user_id, new_addr[0], new_addr[1], protocol_factory
+            ))
+            self._pending_connections[user_id] = task
+            
+        except Exception as e:
+            pass  # Se reintentará automáticamente
+
+    async def _connect_and_send_with_factory(self, user_id: str, ip: str, port: int, protocol_factory):
+        """Conecta usando una factory de protocolo personalizada."""
+        try:
+            async with connect(
+                ip,
+                port,
+                configuration=self._client_config,
+                create_protocol=protocol_factory,
+            ) as protocol:
+                # Esperar autenticación (max 5 segundos)
+                auth_timeout = 50
+                for i in range(auth_timeout):
+                    await asyncio.sleep(0.1)
+                    if protocol.is_authenticated:
+                        break
+                
+                if not protocol.is_authenticated:
+                    return
+                
+                # Registrar conexión activa
+                self.active_connections[user_id] = protocol
+                
+                # Forzar envío de mensajes pendientes
+                if protocol._pending_messages:
+                    protocol._flush_pending_messages()
+                    # Limpiar _pending_resend_messages ya que los mensajes se enviaron
+                    if hasattr(self, '_pending_resend_messages') and user_id in self._pending_resend_messages:
+                        del self._pending_resend_messages[user_id]
+                
+                # Mantener conexión viva
+                while protocol.is_authenticated:
+                    await asyncio.sleep(1)
+                    
+                    # Verificar si hay mensajes nuevos encolados
+                    if hasattr(self, '_message_queue') and user_id in self._message_queue:
+                        for msg in self._message_queue[user_id]:
+                            protocol._pending_messages.append(msg)
+                        del self._message_queue[user_id]
+                        if protocol._pending_messages:
+                            protocol._flush_pending_messages()
+                    
+        except Exception as e:
+            pass
+        finally:
+            if user_id in self._pending_connections:
+                del self._pending_connections[user_id]
+            if user_id in self.active_connections:
+                del self.active_connections[user_id]
+
+    async def send_message(self, user_id: str, content: str, is_disconnect: bool = False, forced_msg_id: str = None) -> Optional[str]:
+        """
+        Envía un mensaje a un usuario.
+        
+        Si no hay conexión activa, intenta establecerla.
+        """
+        msg_id = forced_msg_id or str(uuid.uuid4())
         
         if is_disconnect:
-            # Los mensajes de desconexión no se encolan, se intentan enviar una vez ("Best Effort")
-            session = self.sessions.get_session(user_id)
-            if session and session.encryptor:
-                await self._send_disconnect_to_session(session)
+            # Mensaje de desconexión - enviar a todas las conexiones activas
+            if user_id in self.active_connections:
+                try:
+                    self.active_connections[user_id].send_disconnect_notification()
+                except:
+                    pass
             return msg_id
         
-        if user_id not in self.message_queues:
-            self.message_queues[user_id] = deque()
+        # Verificar si tenemos conexión activa y autenticada
+        proto = self.active_connections.get(user_id)
+        if proto and proto.is_authenticated:
+            # Enviar mensaje directamente
+            msg_struct = {
+                "id": msg_id,
+                "timestamp": time.time(),
+                "text": content,
+                "hash": hashlib.sha256(content.encode('utf-8')).hexdigest()
+            }
             
-        queue = self.message_queues[user_id]
-        queue.append({
-            'msg_id': msg_id,
-            'content': content,
-            'attempts': 0,
-            'last_retry': 0,
-            'timestamp': time.time()
-        })
-        # Si es el único mensaje, intentar enviarlo inmediatamente
-        if len(queue) == 1:
-            await self._attempt_send_head(user_id, queue[0])
+            if proto.send_chat_message(msg_struct):
+                return msg_id
+            else:
+                # Limpiar conexión fallida
+                del self.active_connections[user_id]
+                proto = None
+        
+        # No hay conexión activa, necesitamos establecer una
+        target_addr = self.peer_addresses.get(user_id)
+        target_pub = self.peer_pubkeys.get(user_id)
+        
+        # Si la clave está marcada como obsoleta, no la usamos
+        if hasattr(self, '_stale_keys') and user_id in self._stale_keys:
+            target_pub = None
+        
+        # Si no tenemos los datos en memoria, intentar obtenerlos del callback de la TUI
+        if not target_addr and self.get_peer_addr_callback:
+            target_addr = self.get_peer_addr_callback(user_id)
+            if target_addr:
+                self.peer_addresses[user_id] = target_addr
+        
+        # Las claves públicas solo vienen de mDNS, NO de la DB (cambian cada sesión)
+        
+        if not target_addr or not target_pub:
+            missing = []
+            if not target_addr:
+                missing.append("dirección")
+            if not target_pub:
+                # Encolar el mensaje para cuando llegue la clave vía mDNS
+                if not hasattr(self, '_message_queue'):
+                    self._message_queue = {}
+                if user_id not in self._message_queue:
+                    self._message_queue[user_id] = []
+                self._message_queue[user_id].append({
+                    "id": msg_id,
+                    "timestamp": time.time(),
+                    "text": content,
+                    "hash": hashlib.sha256(content.encode('utf-8')).hexdigest()
+                })
+                return msg_id  # Retornamos el ID aunque no se haya enviado aún
+            return None
+        
+        # Verificar si ya hay una conexión pendiente
+        if user_id in self._pending_connections:
+            # La conexión pendiente tiene los mensajes en su cola
+            task = self._pending_connections[user_id]
+            if not task.done():
+                # Añadir el mensaje a una cola global temporal
+                if not hasattr(self, '_message_queue'):
+                    self._message_queue = {}
+                if user_id not in self._message_queue:
+                    self._message_queue[user_id] = []
+                self._message_queue[user_id].append({
+                    "id": msg_id,
+                    "timestamp": time.time(),
+                    "text": content,
+                    "hash": hashlib.sha256(content.encode('utf-8')).hexdigest()
+                })
+                return msg_id
+        
+        # Crear mensaje para encolar
+        msg_struct = {
+            "id": msg_id,
+            "timestamp": time.time(),
+            "text": content,
+            "hash": hashlib.sha256(content.encode('utf-8')).hexdigest()
+        }
+        
+        # Lanzar conexión en background
+        task = asyncio.create_task(self._connect_and_send(
+            user_id, target_addr[0], target_addr[1], target_pub, msg_struct
+        ))
+        self._pending_connections[user_id] = task
+        
         return msg_id
 
-    async def _attempt_send_head(self, user_id, item):
-        item['last_retry'] = time.time()
-        item['attempts'] += 1
-        await self._transmit_raw(user_id, item['content'], item['msg_id'], timestamp=item['timestamp'])
-    
-    async def broadcast_disconnect(self):
-        """Informa a todos los pares conectados que nos vamos."""
-        tasks = []
-        for user_id, session in list(self.sessions.sessions.items()):
-            if session.encryptor and session.current_addr:
-                tasks.append(self._send_disconnect_to_session(session))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+    async def _connect_and_send(self, user_id: str, ip: str, port: int, pub_key, initial_message: dict):
+        """
+        Conecta a un peer, realiza handshake y envía mensajes pendientes.
+        Mantiene la conexión abierta para futuros mensajes.
+        """
+        try:
+            if not self._client_config:
+                self._client_config = self._create_client_config()
+            
+            # Crear protocolo con mensaje inicial
+            pending_messages = [initial_message]
+            
+            def protocol_factory(*args, **kwargs):
+                proto = MeshQuicProtocol(*args, **kwargs)
+                proto.set_network_manager(self)
+                proto.set_target_pub_key(pub_key)
+                proto.target_user_id = user_id  # Guardar user_id para recovery_queue
+                # Pre-encolar mensajes
+                for msg in pending_messages:
+                    proto._pending_messages.append(msg)
+                return proto
+            
+            # Conectar con timeout
+            try:
+                # Usar wait_connected=True (valor por defecto) para que aioquic
+                # llame a transmit() automáticamente y envíe el Client Hello.
+                # Envolvemos todo en un timeout para no bloquear indefinidamente.
+                connection = connect(
+                    ip,
+                    port,
+                    configuration=self._client_config,
+                    create_protocol=protocol_factory,
+                    wait_connected=True,  # IMPORTANTE: Debe ser True para que se transmita el handshake
+                )
+                
+                # Timeout de 10 segundos para establecer conexión TLS completa
+                protocol = await asyncio.wait_for(
+                    connection.__aenter__(),
+                    timeout=10.0
+                )
+                self.on_log(f"🔗 Conexión QUIC/TLS establecida con {ip}:{port}")
+                
+            except asyncio.TimeoutError:
+                self.on_log(f"⏰ Timeout conectando a {ip}:{port} (10s)")
+                return
+            except Exception as conn_err:
+                self.on_log(f"❌ Error conectando a {ip}:{port}: {conn_err}")
+                return
+            
+            try:
+                
+                # Esperar autenticación Noise (max 5 segundos)
+                auth_timeout = 50
+                for i in range(auth_timeout):
+                    await asyncio.sleep(0.1)
+                    if protocol.is_authenticated:
+                        self.on_log(f"✅ Conexión autenticada con {user_id}")
+                        break
+                
+                if not protocol.is_authenticated:
+                    self.on_log(f"⏰ Timeout esperando autenticación Noise con {user_id}")
+                    await connection.__aexit__(None, None, None)
+                    return
+                
+                # Registrar conexión activa
+                self.active_connections[user_id] = protocol
+                
+                # IMPORTANTE: Forzar envío de mensajes pendientes ahora
+                if protocol._pending_messages:
+                    self.on_log(f"📤 Enviando {len(protocol._pending_messages)} mensajes pendientes...")
+                    protocol._flush_pending_messages()
+                
+                # Añadir cualquier mensaje que se haya encolado mientras conectábamos
+                if hasattr(self, '_message_queue') and user_id in self._message_queue:
+                    for msg in self._message_queue[user_id]:
+                        protocol._pending_messages.append(msg)
+                    del self._message_queue[user_id]
+                    if protocol._pending_messages:
+                        protocol._flush_pending_messages()
+                
+                # Mantener conexión viva mientras esté autenticada
+                while protocol.is_authenticated:
+                    await asyncio.sleep(1)
+                    
+                    # Verificar si hay mensajes nuevos encolados
+                    if hasattr(self, '_message_queue') and user_id in self._message_queue:
+                        for msg in self._message_queue[user_id]:
+                            protocol._pending_messages.append(msg)
+                        del self._message_queue[user_id]
+                        if protocol._pending_messages:
+                            protocol._flush_pending_messages()
+                
+                self.on_log(f"🔌 Conexión con {user_id} cerrada")
+                
+            finally:
+                # Cerrar la conexión
+                try:
+                    await connection.__aexit__(None, None, None)
+                except:
+                    pass
+                    
+        except Exception as e:
+            self.on_log(f"❌ Error en connect_and_send a {user_id}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Limpiar estado
+            if user_id in self._pending_connections:
+                del self._pending_connections[user_id]
+            if user_id in self.active_connections:
+                del self.active_connections[user_id]
 
-    async def _send_disconnect_to_session(self, session):
-        try:
-            msg_struct = {"timestamp": time.time(), "disconnect": True}
-            payload = json.dumps(msg_struct).encode('utf-8')
-            full_packet_payload = session.encrypt_message(payload)
-            self.transport.sendto(b'\x03' + full_packet_payload, session.current_addr)
-        except: pass
-    
-    async def _flush_pending_queue(self, user_id, session):
-        # Helper para vaciar cola
-        if user_id not in self.message_queues: return
-        queue = self.message_queues[user_id]
-        if not queue: return
-        head = queue[0]
-        try:
-            head['last_retry'] = time.time()
-            head['attempts'] += 1
-            await self._transmit_raw(user_id, head['content'], head['msg_id'], timestamp=head['timestamp'])
-        except Exception: pass
+    async def broadcast_disconnect(self):
+        """Notifica a todos los peers que nos desconectamos."""
+        for user_id, proto in list(self.active_connections.items()):
+            try:
+                proto.send_disconnect_notification()
+            except Exception:
+                pass
+
+    async def close(self):
+        """Cierra el servidor y todas las conexiones."""
+        # Cancelar conexiones pendientes
+        for task in self._pending_connections.values():
+            task.cancel()
+        self._pending_connections.clear()
+        
+        # Cerrar conexiones activas
+        for proto in list(self.active_connections.values()):
+            try:
+                proto.close()
+            except Exception:
+                pass
+        
+        self.active_connections.clear()
+        
+        # Cerrar servidor
+        if self._server:
+            self._server.close()
+            self._server = None
+
 
 # --- DESCUBRIMIENTO DE RED (mDNS) ---
 
 class RawSniffer(asyncio.DatagramProtocol):
     """
     Protocolo de escucha mDNS de bajo nivel optimizado.
-    
-    Por qué una clase dedicada:
-    Las librerías estándar de mDNS a veces fallan al procesar paquetes no estándar 
-    o malformados. Esta clase inspecciona los bytes crudos para garantizar que 
-    detectamos a otros usuarios incluso si el paquete no es perfecto.
     """
     def __init__(self, service):
         self.service = service
@@ -751,74 +1539,72 @@ class RawSniffer(asyncio.DatagramProtocol):
         self.transport = transport
         self.sock = transport.get_extra_info('socket')
         try:
-            # Permitir reutilización de puertos para convivir con Avahi/Bonjour
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if hasattr(socket, 'SO_REUSEPORT'):
                 self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except: pass
+        except:
+            pass
         self.join_multicast_groups()
 
     def join_multicast_groups(self):
         """Se une al grupo multicast 224.0.0.251 para escuchar tráfico mDNS."""
-        if not self.sock: return
+        if not self.sock:
+            return
         group = socket.inet_aton('224.0.0.251')
         try:
-            # Unirse en interfaz por defecto
             mreq = struct.pack('4sL', group, socket.INADDR_ANY)
             self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        except: pass
+        except:
+            pass
         
-        # Intentar unirse en todas las interfaces detectadas
         try:
             for iface in netifaces.interfaces():
                 addrs = netifaces.ifaddresses(iface)
                 if netifaces.AF_INET in addrs:
                     for addr_info in addrs[netifaces.AF_INET]:
                         ip = addr_info['addr']
-                        if ip == '127.0.0.1': continue
+                        if ip == '127.0.0.1':
+                            continue
                         try:
                             local = socket.inet_aton(ip)
                             mreq = struct.pack('4s4s', group, local)
                             self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-                        except: pass
-        except Exception: pass
+                        except:
+                            pass
+        except Exception:
+            pass
 
     def datagram_received(self, data, addr):
-        """
-        Analiza paquetes mDNS.
-        
-        Estrategia de Optimización:
-        1. Fail-Fast: Si no contiene "_dni-im", descartar inmediatamente.
-        2. Slicing directo: Buscar "pub=" y extraer 64 bytes fijos es más rápido que regex.
-        3. Fallback a Regex: Solo para campos variables como el nombre de usuario.
-        """
-        if b"_dni-im" not in data: return
+        """Analiza paquetes mDNS."""
+        if b"_dni-im" not in data:
+            return
         
         user_id_found = None
         port_found = 0
         props = {}
         
-        # Extracción rápida de clave pública (64 bytes hex)
+        # Extracción rápida de clave pública
         pub_idx = data.find(b'pub=')
         if pub_idx != -1:
             if pub_idx + 4 + 64 <= len(data):
                 try:
-                    props['pub'] = data[pub_idx+4 : pub_idx+4+64].decode('utf-8')
-                except: pass
+                    props['pub'] = data[pub_idx + 4: pub_idx + 4 + 64].decode('utf-8')
+                except:
+                    pass
         
-        # Extracción de usuario y puerto (Variable)
+        # Extracción de usuario y puerto
         match_name = RE_USER_PORT.search(data)
         if match_name:
             try:
                 user_id_found = match_name.group(1).decode('utf-8', errors='ignore')
                 port_found = int(match_name.group(2).decode('utf-8'))
-            except: pass
+            except:
+                pass
         
         if RE_STAT_EXIT.search(data):
             props['stat'] = 'exit'
 
         if user_id_found:
-            # Ignorarnos a nosotros mismos
             if user_id_found == self.service.unique_instance_id and port_found == self.service.port:
                 return
             if addr[0].startswith('127.'):
@@ -830,27 +1616,33 @@ class DiscoveryService:
     """
     Servicio de Alto Nivel para Descubrimiento de Pares.
     
-    Orquesta:
-    1. AsyncZeroconf: Para ANUNCIAR nuestra presencia de forma estándar.
-    2. RawSniffer: Para ESCUCHAR a otros de forma robusta.
-    3. Monitorización de IP: Reinicia el servicio si cambia la red (WiFi -> Ethernet).
+    Adaptado para trabajar con QuicNetworkManager.
     """
     def __init__(self, port, pubkey_bytes, on_service_found, on_log=None):
-        self.aiozc = None 
+        self.aiozc = None
         self.port = port
         self.pubkey_b64 = pubkey_bytes.hex()
-        self.on_found_callback = on_service_found 
+        self.on_found_callback = on_service_found
         self.on_log = on_log if on_log else lambda x: None
         self.loop = None
         self.sniffer_transport = None
-        self.sniffer_protocol = None 
+        self.sniffer_protocol = None
         self.bind_ip = None
-        self.unique_instance_id = None 
-        self.protocol_ref = None
+        self.unique_instance_id = None
+        self.network_manager: Optional[QuicNetworkManager] = None
 
-    def set_protocol(self, proto):
-        self.protocol_ref = proto
-        proto.discovery_service = self
+    def set_network_manager(self, manager: QuicNetworkManager):
+        """
+        Vincula el servicio de descubrimiento con el gestor de red QUIC.
+        
+        Establece una referencia bidireccional para que el descubrimiento
+        pueda actualizar las direcciones de los peers en el NetworkManager.
+        
+        Args:
+            manager: Instancia de QuicNetworkManager.
+        """
+        self.network_manager = manager
+        manager.discovery_service = self
 
     async def start(self, username, bind_ip=None):
         """Inicia el anuncio y la escucha."""
@@ -859,24 +1651,27 @@ class DiscoveryService:
         clean_username = username.replace("User-", "")
         self.unique_instance_id = clean_username
         
-        # Iniciar Sniffer (Escucha)
+        # Iniciar Sniffer
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try: sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except: pass
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except:
+                pass
             sock.bind(('', 5353))
             
             self.sniffer_transport, self.sniffer_protocol = await self.loop.create_datagram_endpoint(
                 lambda: RawSniffer(self), sock=sock
             )
-            self.on_log("👂 Sniffer Activo")
+            self.on_log("👂 Sniffer mDNS Activo")
         except Exception as e:
             self.on_log(f"⚠️ Fallo al iniciar Sniffer: {e}")
 
-        # Iniciar Zeroconf (Anuncio)
+        # Iniciar Zeroconf
         interfaces = InterfaceChoice.All
-        if bind_ip and bind_ip != "0.0.0.0": interfaces = [bind_ip]
+        if bind_ip and bind_ip != "0.0.0.0":
+            interfaces = [bind_ip]
         try:
             self.aiozc = AsyncZeroconf(interfaces=interfaces, ip_version=IPVersion.V4Only)
         except:
@@ -894,80 +1689,82 @@ class DiscoveryService:
         self.on_log(f"📢 Anunciando: {service_name} @ {local_ip}")
         await self.aiozc.async_register_service(self.info)
         
-        # Tarea periódica para detectar cambios de red
         self._polling_task = asyncio.create_task(self._active_polling_loop())
 
     def on_found(self, user_id, ip, port, props):
         """Callback invocado por el Sniffer cuando detecta un par."""
         if self.on_found_callback:
-             self.on_found_callback(user_id, ip, port, props)
+            self.on_found_callback(user_id, ip, port, props)
         
         # Manejar desconexión voluntaria
         if props.get('stat') == 'exit':
             self.on_log(f"📴 Peer {user_id} anunció desconexión (stat=exit)")
-            if self.protocol_ref:
-                session = self.protocol_ref.sessions.get_session(user_id)
-                if session:
-                    # Borrado seguro de claves de la sesión
-                    if hasattr(session, 'zeroize_session'):
-                        session.zeroize_session()
-                    else:
-                        session.encryptor = None
+            if self.network_manager:
+                if user_id in self.network_manager.active_connections:
+                    proto = self.network_manager.active_connections[user_id]
+                    if proto.noise_session:
+                        proto.noise_session.zeroize_session()
+                    del self.network_manager.active_connections[user_id]
             return
         
-        # Actualizar dirección IP en el protocolo
-        if self.protocol_ref:
+        # Actualizar dirección IP en el NetworkManager
+        if self.network_manager:
             try:
                 pub_key_obj = None
                 if 'pub' in props:
                     pub_bytes = bytes.fromhex(props['pub'])
                     pub_key_obj = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
                 
-                self.protocol_ref.update_peer_location(user_id, (ip, port), pub_key_obj)
+                self.network_manager.update_peer_location(user_id, (ip, port), pub_key_obj)
                 
-                # También registrar la clave en storage para que esté disponible para handshakes
-                if pub_key_obj:
-                    import asyncio
-                    asyncio.create_task(self.protocol_ref.sessions.db.register_contact(ip, port, pub_key_obj, user_id=user_id, real_name=None))
-            except Exception as e:
-                self.on_log(f"⚠️ Error actualizando ubicación de peer: {e}")
+            except Exception:
+                pass
 
     def broadcast_exit(self):
-        """Envía manualmente un paquete mDNS 'stat=exit' para despedirse rápido."""
-        if not self.sniffer_transport: return
+        """Envía manualmente un paquete mDNS 'stat=exit' para despedirse."""
+        if not self.sniffer_transport:
+            return
         try:
-            # Construcción manual de paquete para ser rápido
             fake_payload = (
-                b'\x00' * 12 +     
-                b'_dni-im' +       
-                f'User-{self.unique_instance_id}_{self.port}'.encode('utf-8') + 
-                b'\x00fake\x00' +  
-                b'stat=exit'       
+                b'\x00' * 12 +
+                b'_dni-im' +
+                f'User-{self.unique_instance_id}_{self.port}'.encode('utf-8') +
+                b'\x00fake\x00' +
+                b'stat=exit'
             )
             self.sniffer_transport.sendto(fake_payload, ('224.0.0.251', 5353))
-        except: pass
+        except:
+            pass
 
     async def stop(self):
+        """Detiene el servicio de descubrimiento."""
         self.broadcast_exit()
-        if hasattr(self, '_polling_task'): self._polling_task.cancel()
-        if self.sniffer_transport: self.sniffer_transport.close()
-        if hasattr(self, 'info') and hasattr(self, 'aiozc'): 
+        if hasattr(self, '_polling_task'):
+            self._polling_task.cancel()
+        if self.sniffer_transport:
+            self.sniffer_transport.close()
+        if hasattr(self, 'info') and hasattr(self, 'aiozc'):
             await self.aiozc.async_unregister_service(self.info)
-        if hasattr(self, 'aiozc'): await self.aiozc.async_close()
+        if hasattr(self, 'aiozc'):
+            await self.aiozc.async_close()
 
     def get_local_ip(self):
-        """Truco para obtener la IP real usada para salir a Internet."""
+        """Obtiene la IP local usada para conexiones externas."""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try: s.connect(('8.8.8.8', 80)); IP = s.getsockname()[0]
-        except: IP = '127.0.0.1'
-        finally: s.close()
+        try:
+            s.connect(('8.8.8.8', 80))
+            IP = s.getsockname()[0]
+        except:
+            IP = '127.0.0.1'
+        finally:
+            s.close()
         return IP
 
     async def _active_polling_loop(self):
         """Monitoriza cambios de IP y mantiene viva la escucha."""
         while True:
             await asyncio.sleep(5)
-            # Re-unirse al grupo multicast para evitar timeout del switch/router
+            
             if self.sniffer_protocol:
                 self.sniffer_protocol.join_multicast_groups()
             
@@ -978,49 +1775,44 @@ class DiscoveryService:
                 registered_ip_bytes = self.info.addresses[0] if self.info.addresses else b''
 
                 if registered_ip_bytes != current_ip_bytes and current_ip != '127.0.0.1':
-                     self.on_log(f"🔄 IP de Red cambió: {current_ip}. Reiniciando Servicio mDNS...")
-                     try:
-                         # Cerrar completamente el Zeroconf antiguo
-                         try:
-                             await self.aiozc.async_unregister_service(self.info)
-                         except: pass
-                         try:
-                             await self.aiozc.async_close()
-                         except: pass
-                         
-                         # Crear nuevo AsyncZeroconf con la nueva interfaz
-                         interfaces = [current_ip] if current_ip != "0.0.0.0" else InterfaceChoice.All
-                         try:
-                             self.aiozc = AsyncZeroconf(interfaces=interfaces, ip_version=IPVersion.V4Only)
-                         except:
-                             self.aiozc = AsyncZeroconf(interfaces=InterfaceChoice.All)
-                         
-                         # Actualizar ServiceInfo con la nueva IP
-                         self.info.addresses = [current_ip_bytes]
-                         
-                         # Registrar el servicio en el nuevo Zeroconf
-                         await self.aiozc.async_register_service(self.info)
-                         self.on_log(f"✅ Servicio mDNS reiniciado completamente en {current_ip}")
-                         
-                         # Rejoin al grupo multicast en la nueva interfaz
-                         if self.sniffer_protocol:
-                             self.sniffer_protocol.join_multicast_groups()
-                             self.on_log(f"✅ Multicast re-unido en nueva interfaz")
-                         
-                         # Enviar varias queries para que los otros nos descubran rápido
-                         if self.sniffer_transport:
-                             for _ in range(3):
-                                 self.sniffer_transport.sendto(RAW_MDNS_QUERY, ('224.0.0.251', 5353))
-                                 await asyncio.sleep(0.5)
-                             self.on_log(f"📡 Queries mDNS enviadas para redescubrimiento")
-                             
-                     except Exception as e:
-                         import traceback
-                         self.on_log(f"⚠️ Error reiniciando mDNS: {type(e).__name__}: {e}")
-                         self.on_log(f"   Traceback: {traceback.format_exc()}")
-            except: pass
+                    self.on_log(f"🔄 IP de Red cambió: {current_ip}. Reiniciando Servicio mDNS...")
+                    try:
+                        try:
+                            await self.aiozc.async_unregister_service(self.info)
+                        except:
+                            pass
+                        try:
+                            await self.aiozc.async_close()
+                        except:
+                            pass
+                        
+                        interfaces = [current_ip] if current_ip != "0.0.0.0" else InterfaceChoice.All
+                        try:
+                            self.aiozc = AsyncZeroconf(interfaces=interfaces, ip_version=IPVersion.V4Only)
+                        except:
+                            self.aiozc = AsyncZeroconf(interfaces=InterfaceChoice.All)
+                        
+                        self.info.addresses = [current_ip_bytes]
+                        await self.aiozc.async_register_service(self.info)
+                        self.on_log(f"✅ Servicio mDNS reiniciado en {current_ip}")
+                        
+                        if self.sniffer_protocol:
+                            self.sniffer_protocol.join_multicast_groups()
+                        
+                        if self.sniffer_transport:
+                            for _ in range(3):
+                                self.sniffer_transport.sendto(RAW_MDNS_QUERY, ('224.0.0.251', 5353))
+                                await asyncio.sleep(0.5)
+                                
+                    except Exception as e:
+                        import traceback
+                        self.on_log(f"⚠️ Error reiniciando mDNS: {type(e).__name__}: {e}")
+            except:
+                pass
             
-            # Enviar query activa para despertar a otros
+            # Enviar query activa
             if self.sniffer_transport:
-                 try: self.sniffer_transport.sendto(RAW_MDNS_QUERY, ('224.0.0.251', 5353))
-                 except: pass
+                try:
+                    self.sniffer_transport.sendto(RAW_MDNS_QUERY, ('224.0.0.251', 5353))
+                except:
+                    pass

@@ -14,21 +14,84 @@ import sys
 import asyncio
 import argparse
 import os
+import datetime
+import ipaddress
+
+# IMPORTANTE: En Windows, asyncio usa ProactorEventLoop por defecto que tiene
+# problemas con UDP/datagram endpoints. Forzamos SelectorEventLoop para QUIC.
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from zeroize import zeroize1
-from network import UDPProtocol, SessionManager, DiscoveryService
+from network import QuicNetworkManager, SessionManager, DiscoveryService
 from storage import Storage
 from tui import MessengerTUI, DNIeLoginApp
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.asymmetric import x25519, rsa
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography import x509
+from cryptography.x509.oid import NameOID
 
 # --- Configuración de Argumentos ---
 parser = argparse.ArgumentParser(description="DNIe Secure Messenger")
-parser.add_argument('-p', '--port', type=int, default=443, help="Puerto UDP para escuchar conexiones (Default: 443)")
+parser.add_argument('-p', '--port', type=int, default=443, help="Puerto QUIC para escuchar conexiones (Default: 443)")
 parser.add_argument('-b', '--bind', type=str, default="0.0.0.0", help="Dirección IP de escucha (Default: 0.0.0.0 para todas las interfaces)")
 parser.add_argument('-d', '--data', type=str, default="data", help="Directorio para almacenar la base de datos cifrada")
 parser.add_argument('--mock', type=str, help="Modo de prueba: Simula un DNIe con el nombre de usuario dado (Ej: --mock User1)")
 args = parser.parse_args()
+
+def generate_quic_tls_cert(data_dir):
+    """
+    Genera un certificado autofirmado y clave privada para el transporte QUIC.
+    
+    Estos certificados son efímeros (válidos 1 día) y solo sirven para establecer
+    el túnel TLS 1.3 de QUIC. La autenticación real de identidad la realiza
+    el protocolo Noise IK con el DNIe.
+    
+    Args:
+        data_dir: Directorio donde guardar los archivos de certificado.
+        
+    Returns:
+        tuple: (ruta_certificado, ruta_clave_privada)
+    """
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, u"DNIe-Mesh-Node")])
+    
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName(u"localhost"),
+                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+            ]),
+            critical=False
+        )
+        .sign(key, hashes.SHA256())
+    )
+    
+    # Asegurar que existe el directorio
+    os.makedirs(data_dir, exist_ok=True)
+    
+    cert_path = os.path.join(data_dir, "quic_cert.pem")
+    key_path = os.path.join(data_dir, "quic_key.pem")
+    
+    with open(key_path, "wb") as f:
+        f.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()
+        ))
+    
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    
+    return cert_path, key_path
 
 def ensure_cert_structure():
     """
@@ -83,23 +146,27 @@ async def main_async(identity_data):
     # Gestor de sesiones criptográficas Noise
     sessions = SessionManager(local_static_key, storage, local_proofs=proofs)
     
-    # Inicialización del protocolo de red
-    # Usamos un callback lambda simple para logs antes de que la UI arranque
-    proto = UDPProtocol(sessions, lambda a,m: None, lambda t: print(f"LOG: {t}"), on_ack_received=None)
+    # Generar certificados TLS efímeros para QUIC
+    print("🔑 Generando certificados TLS efímeros para transporte QUIC...")
+    cert_path, key_path = generate_quic_tls_cert(args.data)
     
-    loop = asyncio.get_running_loop()
-    transport = None
+    # Inicialización del gestor de red QUIC
+    network_manager = QuicNetworkManager(
+        session_manager=sessions,
+        cert_path=cert_path,
+        key_path=key_path,
+        on_message=lambda a, m: None,  # Se vinculará con la TUI después
+        on_log=lambda t: print(f"LOG: {t}")
+    )
+    
     discovery = None
 
     try:
-        print(f"🔌 Vinculando socket UDP a {args.bind}:{args.port}...")
-        # Creamos el endpoint UDP
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: proto,
-            local_addr=(args.bind, args.port)
-        )
+        print(f"🔌 Iniciando servidor QUIC en {args.bind}:{args.port}...")
+        await network_manager.start_server(args.bind, args.port)
+        print(f"✅ Servidor QUIC activo en {args.bind}:{args.port}")
     except Exception as e:
-        print(f"❌ Error de Socket: {e}")
+        print(f"❌ Error de Socket QUIC: {e}")
         print("💡 Consejo: Si usas el puerto 443 en Linux, necesitas permisos de root (sudo). O usa -p 5000.")
         return
 
@@ -114,10 +181,10 @@ async def main_async(identity_data):
         discovery = DiscoveryService(args.port, pub_bytes, lambda n,i,p,pr: None)
         
         # Vinculación cruzada: El descubrimiento necesita acceder al protocolo para actualizar rutas
-        discovery.set_protocol(proto) 
+        discovery.set_network_manager(network_manager) 
         
         # Lanzamos la Interfaz de Usuario (TUI)
-        app = MessengerTUI(proto, discovery, storage, user_id=user_id, bind_ip=args.bind)
+        app = MessengerTUI(network_manager, discovery, storage, user_id=user_id, bind_ip=args.bind)
         await app.run_async()
         
     finally:
@@ -132,16 +199,14 @@ async def main_async(identity_data):
         # 2. Cerrar conexión a base de datos (incluye borrado de clave)
         await storage.close()
 
-        if proto:
-            # 3. Enviar mensaje de "Desconexión" cifrado a los pares activos
-            await proto.broadcast_disconnect()
+        if network_manager:
+            # 3. Enviar mensaje de "Desconexión" cifrado a los pares activos y cerrar conexiones QUIC
+            await network_manager.broadcast_disconnect()
+            await network_manager.close()
 
         if discovery:
             # 4. Detener anuncios mDNS y salir del grupo multicast
             await discovery.stop()
-            
-        if transport: 
-            transport.close()
         
         # 5. Borrar la clave de almacenamiento derivada (ya es bytearray)
         if storage_key:

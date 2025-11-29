@@ -28,6 +28,7 @@ build/
 
 # Certificates
 src/certs
+*.pem
 
 # Test scripts
 networkcorrupted.py

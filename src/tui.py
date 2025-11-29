@@ -251,7 +251,8 @@ class MessengerTUI(App):
         self.storage = storage
         self.user_id = user_id 
         self.bind_ip = bind_ip 
-        self.current_chat_addr = None 
+        self.current_chat_addr = None
+        self.current_chat_user_id = None  # user_id del chat actualmente abierto
         
         self.log_buffer = []
         self.known_names = {} 
@@ -369,14 +370,14 @@ class MessengerTUI(App):
         return (now - last_seen) < 20.0
 
     def _get_peer_addr_from_list(self, user_id):
+        """Obtiene la dirección de un peer desde la lista de contactos."""
         try:
             lst = self.query_one("#contact_list", ListView)
             for child in lst.children:
                 if isinstance(child, ChatItem) and child.user_id == user_id:
-                    if child.online:
-                        return (child.contact_ip, child.contact_port)
-                    else:
-                        return None 
+                    # Devolver la dirección aunque esté offline
+                    # QUIC fallará si el peer no está disponible
+                    return (child.contact_ip, child.contact_port)
         except: pass
         return None
 
@@ -449,7 +450,7 @@ class MessengerTUI(App):
                     # Limpiar la clave pública conocida para que al reconectar se acepte la nueva
                     self.peer_known_pubkeys.pop(user_id, None)
                     
-                    if was_online and self.current_chat_addr == (ip, port):
+                    if was_online and self.current_chat_user_id == user_id:
                         chat_box = self.query_one("#chat_box", VerticalScroll)
                         msg_widget = Static(Align(Panel(Text(f"{target_child.real_name or user_id} se ha desconectado."), style="dim white"), align="left"))
                         chat_box.mount(msg_widget)
@@ -472,7 +473,7 @@ class MessengerTUI(App):
                     # Actualizar la clave conocida
                     self.peer_known_pubkeys[user_id] = pub_bytes
                     
-                    asyncio.create_task(self.storage.register_contact(ip, port, pub_key, user_id=user_id, real_name=None))
+                    asyncio.create_task(self.storage.register_contact(ip, port, user_id=user_id, real_name=None))
                 except Exception: pass
 
             found_item = None
@@ -518,7 +519,10 @@ class MessengerTUI(App):
                 child.set_verified_identity(real_name)
                 self.known_names[child.user_id] = real_name
                 
-                if self.current_chat_addr == (child.contact_ip, child.contact_port):
+                # Guardar real_name cifrado en la base de datos
+                asyncio.create_task(self.storage.update_contact_real_name(child.user_id, real_name))
+                
+                if self.current_chat_user_id == child.user_id:
                     target_name = child.real_name
                     status = "(Verificado)" if child.verified else "(No verificado)"
                     conn_status = "[green]EN LÍNEA[/]" if child.online else "[grey]DESCONECTADO[/]"
@@ -530,6 +534,7 @@ class MessengerTUI(App):
         item = event.item
         if not isinstance(item, ChatItem): return
         self.current_chat_addr = (item.contact_ip, item.contact_port)
+        self.current_chat_user_id = item.user_id  # Guardar user_id del chat abierto
         await self._load_and_refresh_chat_history(item)
 
     async def _load_and_refresh_chat_history(self, item: ChatItem):
@@ -712,7 +717,8 @@ class MessengerTUI(App):
                 )
             )
             
-            if self.current_chat_addr == addr:
+            # Comparar por user_id, no por dirección (que puede ser puerto efímero)
+            if self.current_chat_user_id == data['user_id']:
                 try:
                     css_id = f"#msg-{ack_id}"
                     widget = self.query_one(css_id, MessageWidget)
@@ -728,13 +734,43 @@ class MessengerTUI(App):
         known = False
         peer_name = f"Peer_{ip}"
         target_child = None
-
-        for child in lst.children:
-             if isinstance(child, ChatItem) and child.contact_ip == ip and child.contact_port == port:
-                 known = True
-                 peer_name = child.real_name if child.real_name else child.user_id
-                 target_child = child
-                 break
+        
+        # IMPORTANTE: Usar sender_identity del mensaje para identificar al peer
+        # Esto permite que los mensajes lleguen al chat correcto independientemente
+        # del puerto de origen (que puede ser efímero)
+        sender_identity = msg.get('sender_identity')
+        
+        # Buscar primero por sender_identity (nombre real del DNIe)
+        if sender_identity:
+            for child in lst.children:
+                if isinstance(child, ChatItem):
+                    # Coincidir por nombre real o por user_id si el nombre coincide
+                    if child.real_name == sender_identity:
+                        known = True
+                        peer_name = child.real_name
+                        target_child = child
+                        break
+        
+        # Si no se encontró por identidad, buscar por user_id en known_names
+        if not known and sender_identity:
+            for uid, name in self.known_names.items():
+                if name == sender_identity:
+                    for child in lst.children:
+                        if isinstance(child, ChatItem) and child.user_id == uid:
+                            known = True
+                            peer_name = child.real_name if child.real_name else child.user_id
+                            target_child = child
+                            break
+                    break
+        
+        # Fallback: buscar por IP (para compatibilidad)
+        if not known:
+            for child in lst.children:
+                if isinstance(child, ChatItem) and child.contact_ip == ip:
+                    known = True
+                    peer_name = child.real_name if child.real_name else child.user_id
+                    target_child = child
+                    break
         
         if not known and msg.get('disconnect'): return
         if not known: 
@@ -748,7 +784,7 @@ class MessengerTUI(App):
                 self.peer_last_seen[target_child.user_id] = 0
                 target_child.set_online_status(False)
                 
-                if was_online and self.current_chat_addr == (ip, port):
+                if was_online and self.current_chat_user_id == target_child.user_id:
                     chat_box = self.query_one("#chat_box", VerticalScroll)
                     msg_widget = Static(Align(Panel(Text(f"{peer_name} se ha desconectado."), style="dim white"), align="left"))
                     chat_box.mount(msg_widget)
@@ -757,7 +793,7 @@ class MessengerTUI(App):
         if target_child:
             self.peer_last_seen[target_child.user_id] = time.time()
             target_child.set_online_status(True)
-            if self.current_chat_addr == (ip, port):
+            if self.current_chat_user_id == target_child.user_id:
                 self.peer_last_read[target_child.user_id] = time.time()
         
         text = msg.get('text', '')
@@ -780,9 +816,12 @@ class MessengerTUI(App):
             )
 
         # Si el chat está abierto, mostrar mensaje, si no, notificar log
-        curr_ip = self.current_chat_addr[0] if self.current_chat_addr else None
+        # Comparar por user_id del target, NO por IP/puerto (que puede cambiar)
+        is_current_chat = False
+        if target_child and self.current_chat_user_id:
+            is_current_chat = (target_child.user_id == self.current_chat_user_id)
         
-        if curr_ip == ip: 
+        if is_current_chat: 
             chat_box = self.query_one("#chat_box", VerticalScroll)
             is_at_bottom = chat_box.scroll_y >= (chat_box.max_scroll_y - 2)
             

@@ -236,24 +236,9 @@ class NoiseIKState:
         self.decryptor = ChaCha20Poly1305(k1)
         self.encryptor = ChaCha20Poly1305(k2)
 
-    def encrypt_message(self, plaintext):
-        """
-        Cifra un mensaje de aplicación.
-        Formato: [IndexRemoto 4B] + [Nonce 8B] + [Ciphertext]
-        """
-        if self.encryptor is None: raise Exception("Handshake no completado")
-        
-        nonce_bytes = struct.pack('<Q', self.tx_nonce)
-        iv = nonce_bytes + b'\x00'*4 # 12 bytes nonce para ChaCha
-        
-        ciphertext = self.encryptor.encrypt(iv, plaintext, b'')
-        self.tx_nonce += 1
-        
-        return struct.pack('<I', self.remote_index) + nonce_bytes + ciphertext
-
     def zeroize_session(self):
         """
-        Limpia las claves criptográficas de la sesión.
+        Limpia las claves criptográficas de la sesión de forma segura.
         
         Debe llamarse cuando:
         - La sesión se cierra explícitamente
@@ -283,53 +268,3 @@ class NoiseIKState:
         self.tx_nonce = 0
         self.rx_nonce = 0
         self.replay_bitmap = 0
-
-    def decrypt_message(self, data_with_nonce):
-        """
-        Descifra un mensaje y aplica la validación Anti-Replay.
-        
-        La ventana deslizante permite recibir paquetes ligeramente desordenados (UDP),
-        pero rechaza duplicados o paquetes muy viejos.
-        """
-        if self.decryptor is None: raise Exception("Handshake no completado")
-        
-        if len(data_with_nonce) < 8: raise Exception("Falta nonce")
-
-        nonce_bytes = data_with_nonce[:8]
-        ciphertext = data_with_nonce[8:]
-        received_seq = struct.unpack('<Q', nonce_bytes)[0]
-        
-        # --- LÓGICA DE VENTANA DESLIZANTE ---
-        # Caso 1: Mensaje viejo (seq < esperado)
-        if received_seq < self.rx_nonce:
-            diff = self.rx_nonce - received_seq
-            if diff > self.replay_window_size:
-                raise Exception(f"Replay Error: Mensaje muy antiguo ({received_seq})")
-            
-            # Verificar en bitmap si ya se recibió
-            bit_index = diff - 1
-            if (self.replay_bitmap >> bit_index) & 1:
-                raise Exception(f"Replay Error: Mensaje duplicado ({received_seq})")
-
-        # Intentar descifrar (Autenticación AEAD)
-        iv = nonce_bytes + b'\x00'*4
-        plaintext = self.decryptor.decrypt(iv, ciphertext, b'')
-        
-        # Actualizar estado de ventana SOLO si descifrado OK
-        if received_seq >= self.rx_nonce:
-            # Caso 2: Mensaje nuevo o futuro
-            jump = received_seq - self.rx_nonce + 1
-            if jump >= self.replay_window_size:
-                self.replay_bitmap = 0 # Salto grande, reiniciar ventana
-            else:
-                self.replay_bitmap <<= jump # Desplazar ventana
-            
-            self.replay_bitmap |= 1 # Marcar bit 0 (actual)
-            self.rx_nonce = received_seq + 1
-        else:
-            # Caso 3: Mensaje viejo pero válido, marcar en el pasado
-            diff = self.rx_nonce - received_seq
-            bit_index = diff - 1
-            self.replay_bitmap |= (1 << bit_index)
-            
-        return plaintext

@@ -15,8 +15,6 @@ import base64
 import aiosqlite
 from zeroize import zeroize1
 from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import x25519
 
 class Storage:
     def __init__(self, key_bytes, data_dir="data"):
@@ -35,8 +33,7 @@ class Storage:
         # Inicializar motor de cifrado Fernet (Symmetric Auth Encryption)
         self.fernet = Fernet(base64.urlsafe_b64encode(key_bytes))
         self.db = None
-        # Cache en memoria de claves efímeras de contactos (no persistidas)
-        self.ephemeral_keys = {} 
+        self._closed = False
 
     async def init(self):
         """Conecta a SQLite y crea las tablas si no existen."""
@@ -44,14 +41,13 @@ class Storage:
         # Activar modo WAL (Write Ahead Log) para mejor concurrencia
         await self.db.execute("PRAGMA journal_mode=WAL;")
         
-        # Tabla de Contactos
+        # Tabla de Contactos (sin pub_key - las claves X25519 son efímeras y vienen de mDNS)
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
                 user_id TEXT PRIMARY KEY,
                 real_name BLOB,       -- Cifrado
                 ip TEXT,
                 port INTEGER,
-                pub_key BLOB,         -- Clave pública estática
                 trusted INTEGER DEFAULT 0
             )
         """)
@@ -76,6 +72,7 @@ class Storage:
         print(f"💾 Storage initialized at {self.db_path} (SQLite + Full Privacy Encryption)")
 
     async def close(self):
+        self._closed = True
         if self.db:
             await self.db.close()
             print("💾 Database connection closed.")
@@ -91,17 +88,30 @@ class Storage:
         
         # Limpiar el objeto Fernet (no podemos acceder a su clave interna)
         self.fernet = None
-        
-        # Limpiar cache de claves efímeras
-        self.ephemeral_keys.clear()
 
     def _encrypt(self, text: str) -> bytes:
-        """Helper para cifrar texto plano antes de insertar en SQL."""
+        """
+        Cifra texto plano con Fernet (AES-128-CBC + HMAC).
+        
+        Args:
+            text: Texto en claro a cifrar.
+            
+        Returns:
+            bytes: Datos cifrados listos para almacenar en SQLite.
+        """
         if text is None: return b''
         return self.fernet.encrypt(text.encode('utf-8'))
 
     def _decrypt(self, data: bytes) -> str:
-        """Helper para descifrar BLOBs al leer de SQL."""
+        """
+        Descifra datos almacenados en SQLite.
+        
+        Args:
+            data: Bytes cifrados con Fernet.
+            
+        Returns:
+            str: Texto descifrado, o mensaje de error si falla.
+        """
         if not data: return ""
         try:
             return self.fernet.decrypt(data).decode('utf-8')
@@ -110,7 +120,7 @@ class Storage:
 
     async def get_all_contacts(self):
         """Retorna todos los contactos conocidos, descifrando sus nombres."""
-        query = "SELECT user_id, real_name, ip, port, pub_key, trusted FROM contacts"
+        query = "SELECT user_id, real_name, ip, port, trusted FROM contacts"
         async with self.db.execute(query) as cursor:
             rows = await cursor.fetchall()
             
@@ -122,31 +132,27 @@ class Storage:
                 "real_name": decrypted_real_name,
                 "ip": r[2],
                 "port": r[3],
-                "trusted": r[5]
+                "trusted": r[4]
             })
-            # Cachear clave pública si existe
-            if r[4]: 
-                try:
-                    key_obj = x25519.X25519PublicKey.from_public_bytes(r[4])
-                    self.ephemeral_keys[(r[2], r[3])] = key_obj
-                except: pass
                     
         return contacts
 
-    async def register_contact(self, ip, port, pubkey_obj, user_id=None, real_name=None):
+    async def register_contact(self, ip, port, user_id=None, real_name=None):
         """
         Registra o actualiza un contacto (Upsert).
+        
+        Nota: Las claves públicas X25519 son efímeras y se obtienen de mDNS,
+        no se almacenan en la base de datos.
         
         Lógica:
         - Si conocemos el user_id, actualizamos.
         - Si no, intentamos buscar por IP/Puerto.
         - Si no existe, insertamos nuevo.
         """
-        self.ephemeral_keys[(ip, port)] = pubkey_obj
-        pub_bytes = pubkey_obj.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
+        # Evitar operaciones si la DB ya está cerrada
+        if self._closed or not self.db:
+            return
+        
         encrypted_real_name = self._encrypt(real_name) if real_name else None
         target_uuid = None
 
@@ -163,8 +169,8 @@ class Storage:
 
         # 2. Update o Insert
         if target_uuid:
-            update_sql = "UPDATE contacts SET ip=?, port=?, pub_key=?"
-            params = [ip, port, pub_bytes]
+            update_sql = "UPDATE contacts SET ip=?, port=?"
+            params = [ip, port]
             if real_name:
                 update_sql += ", real_name=?"
                 params.append(encrypted_real_name)
@@ -174,15 +180,27 @@ class Storage:
         else:
             final_id = user_id if user_id else f"Unknown_{ip}_{port}"
             await self.db.execute("""
-                INSERT INTO contacts (user_id, real_name, ip, port, pub_key, trusted)
-                VALUES (?, ?, ?, ?, ?, 1)
-            """, (final_id, encrypted_real_name, ip, port, pub_bytes))
+                INSERT INTO contacts (user_id, real_name, ip, port, trusted)
+                VALUES (?, ?, ?, ?, 1)
+            """, (final_id, encrypted_real_name, ip, port))
             
         await self.db.commit()
 
-    async def get_pubkey_by_addr(self, ip, port):
-        """Recupera clave pública efímera desde caché."""
-        return self.ephemeral_keys.get((ip, port))
+    async def update_contact_real_name(self, user_id: str, real_name: str):
+        """
+        Actualiza el nombre real (verificado por DNIe) de un contacto existente.
+        El nombre se guarda cifrado.
+        """
+        if not user_id or not real_name:
+            return False
+        
+        encrypted_real_name = self._encrypt(real_name)
+        result = await self.db.execute(
+            "UPDATE contacts SET real_name = ? WHERE user_id = ?",
+            (encrypted_real_name, user_id)
+        )
+        await self.db.commit()
+        return result.rowcount > 0
 
     async def save_chat_message(self, user_id, direction, text, timestamp):
         """Persiste un mensaje cifrado."""

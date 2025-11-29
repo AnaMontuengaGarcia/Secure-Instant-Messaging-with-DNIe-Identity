@@ -102,19 +102,66 @@ class DNIeCard:
         digest.update(data_to_hash)
         return digest.finalize().hex()
 
-    def authenticate(self, pin):
+    def authenticate(self, pin, max_retries=3):
         """
         Realiza el 'Login' en la tarjeta usando el PIN del usuario.
         Esto eleva privilegios para permitir operaciones de firma.
+        
+        Incluye reintentos para manejar problemas intermitentes de
+        comunicación PKCS#11 con la tarjeta.
         """
-        try:
-            if self.session: self.session.close()
-            # Abrir sesión autenticada
-            self.session = self.token.open(user_pin=pin)
-        except pkcs11.exceptions.PinIncorrect:
-            raise DNIeCardError("PIN Incorrecto.")
-        except Exception as e:
-            raise DNIeCardError(f"Error de Autenticación: {e}")
+        import time
+        
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # Cerrar sesión previa si existe
+                if self.session:
+                    try:
+                        self.session.close()
+                    except:
+                        pass
+                    self.session = None
+                
+                # Pequeña pausa entre reintentos para dar tiempo al hardware
+                if attempt > 0:
+                    time.sleep(0.3)
+                
+                # Abrir sesión autenticada
+                self.session = self.token.open(user_pin=pin)
+                return  # Éxito, salir del bucle
+                
+            except pkcs11.exceptions.PinIncorrect:
+                raise DNIeCardError("PIN Incorrecto.")
+            except pkcs11.exceptions.PinLocked:
+                raise DNIeCardError("PIN Bloqueado. Contacte con la policía para desbloquearlo.")
+            except pkcs11.exceptions.UserAlreadyLoggedIn:
+                # Ya hay una sesión activa, intentar usarla o cerrarla
+                try:
+                    if self.session:
+                        self.session.close()
+                        self.session = None
+                except:
+                    pass
+                last_error = "Sesión previa activa"
+                continue
+            except pkcs11.exceptions.DeviceRemoved:
+                raise DNIeCardError("La tarjeta fue retirada del lector.")
+            except pkcs11.exceptions.TokenNotPresent:
+                raise DNIeCardError("No se detecta la tarjeta en el lector.")
+            except pkcs11.exceptions.SessionClosed:
+                # La sesión se cerró inesperadamente, reintentar
+                last_error = "Sesión cerrada inesperadamente"
+                continue
+            except Exception as e:
+                # Capturar el tipo de excepción para mejor diagnóstico
+                error_type = type(e).__name__
+                error_msg = str(e).strip() if str(e).strip() else error_type
+                last_error = f"{error_type}: {error_msg}" if error_msg != error_type else error_type
+                continue
+        
+        # Si llegamos aquí, fallaron todos los reintentos
+        raise DNIeCardError(f"Error de Autenticación tras {max_retries} intentos. {last_error or 'Error desconocido'}")
 
     def _get_label(self, obj):
         """Decodifica de forma segura la etiqueta (Label) de un objeto PKCS#11."""
