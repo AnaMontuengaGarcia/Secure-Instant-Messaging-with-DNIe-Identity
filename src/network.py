@@ -35,7 +35,6 @@ from aioquic.quic.events import (
     ConnectionTerminated,
     StreamReset
 )
-from aioquic.quic.connection import QuicConnection
 
 from zeroconf import ServiceInfo, IPVersion, InterfaceChoice
 from zeroconf.asyncio import AsyncZeroconf
@@ -649,6 +648,9 @@ class MeshQuicProtocol(QuicConnectionProtocol):
             
             # Añadir identidad del remitente
             msg_struct['sender_identity'] = self.peer_identity
+            
+            # Añadir user_id del remitente para desambiguación (nombres duplicados)
+            msg_struct['sender_user_id'] = self.target_user_id
             
             # Notificar a la capa superior
             # IMPORTANTE: Usar la dirección del servidor del peer (puerto anunciado),

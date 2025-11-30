@@ -88,10 +88,12 @@ class ChatItem(ListItem):
             status_icon = "[grey50]●[/]" 
 
         if self.real_name:
+            # Mostrar parte del user_id para desambiguar nombres duplicados
+            short_id = f"#{self.user_id[:4]}" if self.user_id else ""
             if self.verified:
-                display_name = f"{self.real_name}"
+                display_name = f"{self.real_name} [dim]{short_id}[/]"
             else:
-                display_name = f"{self.real_name} (?)"
+                display_name = f"{self.real_name} (?) [dim]{short_id}[/]"
         else:
             display_name = f"{self.user_id}"
 
@@ -735,23 +737,39 @@ class MessengerTUI(App):
         peer_name = f"Peer_{ip}"
         target_child = None
         
-        # IMPORTANTE: Usar sender_identity del mensaje para identificar al peer
-        # Esto permite que los mensajes lleguen al chat correcto independientemente
-        # del puerto de origen (que puede ser efímero)
-        sender_identity = msg.get('sender_identity')
+        # Identificadores del mensaje
+        sender_identity = msg.get('sender_identity')  # Nombre real del DNIe
+        sender_user_id = msg.get('sender_user_id')    # Hash del serial DNIe (único)
         
-        # Buscar primero por sender_identity (nombre real del DNIe)
-        if sender_identity:
+        # PRIORIDAD 1: Buscar por user_id (único y no ambiguo)
+        if sender_user_id:
+            for child in lst.children:
+                if isinstance(child, ChatItem) and child.user_id == sender_user_id:
+                    known = True
+                    peer_name = child.real_name if child.real_name else child.user_id
+                    target_child = child
+                    break
+        
+        # PRIORIDAD 2: Buscar por sender_identity + IP (desambigua nombres iguales)
+        if not known and sender_identity:
             for child in lst.children:
                 if isinstance(child, ChatItem):
-                    # Coincidir por nombre real o por user_id si el nombre coincide
-                    if child.real_name == sender_identity:
+                    if child.real_name == sender_identity and child.contact_ip == ip:
                         known = True
                         peer_name = child.real_name
                         target_child = child
                         break
         
-        # Si no se encontró por identidad, buscar por user_id en known_names
+        # PRIORIDAD 3: Buscar solo por sender_identity (fallback)
+        if not known and sender_identity:
+            for child in lst.children:
+                if isinstance(child, ChatItem) and child.real_name == sender_identity:
+                    known = True
+                    peer_name = child.real_name
+                    target_child = child
+                    break
+        
+        # PRIORIDAD 4: Buscar por user_id en known_names
         if not known and sender_identity:
             for uid, name in self.known_names.items():
                 if name == sender_identity:
@@ -763,7 +781,7 @@ class MessengerTUI(App):
                             break
                     break
         
-        # Fallback: buscar por IP (para compatibilidad)
+        # PRIORIDAD 5: Fallback por IP (legacy)
         if not known:
             for child in lst.children:
                 if isinstance(child, ChatItem) and child.contact_ip == ip:

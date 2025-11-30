@@ -14,8 +14,6 @@ Responsabilidades:
 
 import platform
 import pkcs11
-import sys
-import os
 from pkcs11 import Mechanism, ObjectClass, Attribute
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend

@@ -19,8 +19,8 @@ import ipaddress
 
 # IMPORTANTE: En Windows, asyncio usa ProactorEventLoop por defecto que tiene
 # problemas con UDP/datagram endpoints. Forzamos SelectorEventLoop para QUIC.
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+#if sys.platform == 'win32':
+#    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from zeroize import zeroize1
 from network import QuicNetworkManager, SessionManager, DiscoveryService
