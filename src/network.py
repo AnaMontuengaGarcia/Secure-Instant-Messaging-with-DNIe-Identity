@@ -704,13 +704,17 @@ class MeshQuicProtocol(QuicConnectionProtocol):
             return
         
         # Stream completo - procesar datos acumulados
-        full_data = self._chat_buffers.pop(stream_id)
+        full_data = self._chat_buffers.pop(stream_id, b"")
+        
+        # Ignorar streams vacíos o sin datos suficientes (nonce 12B + tag 16B mínimo)
+        if len(full_data) < 28:
+            # Solo loggear si hay datos pero son insuficientes (no streams vacíos)
+            if len(full_data) > 0:
+                self._log(f"⚠️ Stream {stream_id} con datos insuficientes ({len(full_data)} bytes), ignorando")
+            return
         
         try:
             # 1. Extraer el Nonce (los primeros 12 bytes)
-            if len(full_data) < 12:
-                self._log("❌ Mensaje muy corto, ignorando")
-                return
             
             received_nonce = full_data[:12]
             ciphertext = full_data[12:]
