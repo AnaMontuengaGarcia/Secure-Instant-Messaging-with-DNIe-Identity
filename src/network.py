@@ -4,13 +4,15 @@ Módulo de Red y Comunicaciones (Networking) - Versión QUIC
 Gestiona toda la comunicación de bajo nivel usando QUIC/TLS 1.3, incluyendo:
 1. Conexiones QUIC con aioquic (transporte fiable y cifrado).
 2. Handshake Noise IK sobre QUIC para autenticación DNIe.
-3. Descubrimiento de pares mediante mDNS (Multicast DNS).
-4. Verificación de certificados X.509 del DNIe.
+3. Cifrado WireGuard-style (ChaCha20-Poly1305) en capa de aplicación.
+4. Protección anti-replay mediante ventana deslizante de 64 bits.
+5. Descubrimiento de pares mediante mDNS (Multicast DNS).
+6. Verificación de certificados X.509 del DNIe.
 
-Arquitectura Híbrida:
-- QUIC (TLS 1.3 Autofirmado) para el transporte fiable y cifrado base.
-- Noise IK corriendo DENTRO de QUIC únicamente para autenticar 
-  que "el dueño de este túnel tiene el DNIe X".
+Arquitectura Híbrida (3 capas de seguridad):
+- Capa 1: QUIC/TLS 1.3 (autofirmado) para transporte fiable y cifrado base.
+- Capa 2: Noise IK para autenticar identidad DNIe y derivar claves de sesión.
+- Capa 3: ChaCha20-Poly1305 para cifrado E2E independiente del transporte.
 """
 
 import asyncio
