@@ -184,9 +184,9 @@ class NoiseIKState:
         
         msg = self.e_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         
-        # DH(e, re) y DH(e, rs)
+        # DH: ee (e_resp, e_init), se (s_init, e_resp)
         self.ck, k = self._mix_key(self.ck, self._dh(self.e_priv, self.re_pub))
-        self.ck, k = self._mix_key(self.ck, self._dh(self.s_priv, self.re_pub))
+        self.ck, k = self._mix_key(self.ck, self._dh(self.e_priv, self.rs_pub))
         
         payload_data = self._prepare_identity_payload()
         chacha = ChaCha20Poly1305(k)
@@ -216,10 +216,10 @@ class NoiseIKState:
         self.remote_index = sender_idx
         actual_msg = data[8:]
         
-        # Mezclas DH finales
+        # Mezclas DH finales: ee, se
         self.re_pub = x25519.X25519PublicKey.from_public_bytes(actual_msg[:32])
         self.ck, k = self._mix_key(self.ck, self._dh(self.e_priv, self.re_pub))
-        self.ck, k = self._mix_key(self.ck, self._dh(self.e_priv, self.rs_pub))
+        self.ck, k = self._mix_key(self.ck, self._dh(self.s_priv, self.re_pub))
         
         # Descifrar identidad servidor
         encrypted_payload = actual_msg[32:]
