@@ -488,7 +488,6 @@ class MeshQuicProtocol(QuicConnectionProtocol):
             # Verificar identidad DNIe
             try:
                 real_name, issuer = verify_peer_identity(remote_pub, self.noise_session.remote_proofs)
-                self._log(f"✅ Conectado con: {real_name} (Firmado por: {issuer})")
                 self.peer_identity = real_name
             except Exception as e:
                 self._log(f"⛔ ALERTA DE SEGURIDAD: Identidad inválida ({e})")
@@ -499,41 +498,80 @@ class MeshQuicProtocol(QuicConnectionProtocol):
             # Registrar sesión con identidad
             self.network_manager.sessions.update_session_identity(self.noise_session, real_name)
             
-            # Crear y enviar respuesta (Mensaje B)
+            # Crear y enviar respuesta (Mensaje B) - SIEMPRE completar el handshake
             resp_data = self.noise_session.create_handshake_response()
             self._send_signal(SIGNAL_NOISE_RESPONSE, resp_data)
             
-            # Marcar como autenticado
-            self.is_authenticated = True
-            self._register_connection()
+            # Verificar si ya existe una conexión activa con este peer
+            # Buscar primero el user_id del peer para verificar correctamente
+            raw_peer_addr = normalize_addr(self._quic._network_paths[0].addr) if self._quic._network_paths else None
+            peer_user_id = None
+            if self.network_manager:
+                # Buscar user_id por dirección IP
+                if raw_peer_addr:
+                    for uid, addr in self.network_manager.peer_addresses.items():
+                        if addr[0] == raw_peer_addr[0]:  # Misma IP
+                            peer_user_id = uid
+                            break
+            
+            existing_proto = None
+            if peer_user_id:
+                existing_proto = self.network_manager.active_connections.get(peer_user_id)
+                if existing_proto and existing_proto.is_authenticated and existing_proto is not self:
+                    pass  # Encontrada conexión existente
+                else:
+                    existing_proto = None
+            
+            if existing_proto:
+                # Ya tenemos conexión activa con este peer
+                # Completamos el handshake pero cerramos esta conexión redundante
+                self._log(f"ℹ️ Conexión entrante de {real_name} - reutilizando conexión existente")
+                self.is_authenticated = True  # Para que el cierre sea limpio
+                # NO registrar esta conexión - cerrarla después de responder
+                # Dar tiempo a que el handshake response llegue
+                asyncio.get_event_loop().call_later(0.5, self._close_redundant)
+                return
+            
+            # Es una conexión nueva - registrarla
+            self._log(f"✅ Conectado con: {real_name} (Firmado por: {issuer})")
             
             # Obtener dirección de conexión (puede ser puerto efímero)
             raw_peer_addr = normalize_addr(self._quic._network_paths[0].addr) if self._quic._network_paths else None
             
-            # Buscar la dirección correcta (puerto anunciado) del peer
+            # Buscar la dirección correcta (puerto anunciado) del peer y su user_id
             announced_addr = None
+            peer_user_id = None
             if self.network_manager:
                 # Buscar por identidad primero
                 announced_addr = self.network_manager.peer_addresses.get(real_name)
+                if announced_addr:
+                    # Buscar user_id para esta dirección
+                    peer_user_id = self.network_manager.addr_to_identity.get(announced_addr)
+                
                 if not announced_addr and raw_peer_addr:
                     # Buscar por IP (normalizada)
                     for uid, addr in self.network_manager.peer_addresses.items():
                         if addr[0] == raw_peer_addr[0]:  # Misma IP
                             announced_addr = addr
+                            peer_user_id = uid
                             # Actualizar mapeo de identidad
                             self.network_manager.peer_addresses[real_name] = addr
                             self.network_manager.addr_to_identity[addr] = real_name
                             break
             
+            # Guardar user_id del peer para identificación
+            self.target_user_id = peer_user_id
+            
+            # Marcar como autenticado y registrar conexión
+            self.is_authenticated = True
+            self._register_connection()
+            
             # Usar dirección anunciada si existe, sino la de conexión
             peer_addr = announced_addr or raw_peer_addr
             
             # Registrar clave pública en memoria (NO en DB, cambia cada sesión)
-            if peer_addr and self.network_manager:
-                # Buscar user_id por dirección
-                uid = self.network_manager.addr_to_identity.get(peer_addr)
-                if uid:
-                    self.network_manager.peer_pubkeys[uid] = remote_pub
+            if peer_user_id and self.network_manager:
+                self.network_manager.peer_pubkeys[peer_user_id] = remote_pub
             
             # Notificar a UI si hay callback
             if self.network_manager.on_handshake_success:
@@ -578,10 +616,27 @@ class MeshQuicProtocol(QuicConnectionProtocol):
             # Actualizar sesión con identidad
             self.network_manager.sessions.update_session_identity(self.noise_session, real_name)
             
+            # Verificar si ya existe una conexión entrante de este peer
+            # (el peer pudo habernos conectado mientras nosotros le conectábamos)
+            # En el lado cliente, target_user_id ya debería estar asignado
+            existing_proto = None
+            if self.target_user_id:
+                existing_proto = self.network_manager.active_connections.get(self.target_user_id)
+                if existing_proto and existing_proto.is_authenticated and existing_proto is not self:
+                    pass  # Hay conexión existente
+                else:
+                    existing_proto = None
+            
+            if existing_proto:
+                # El peer ya nos conectó - esta conexión es redundante
+                # Pero la usamos para enviar nuestros mensajes pendientes primero
+                self._log(f"ℹ️ Conexión con {real_name} redundante - reutilizando entrante")
+            else:
+                self._log(f"🎉 Canal seguro establecido con {real_name} (Firmado por: {issuer})")
+            
             # Marcar como autenticado
             self.is_authenticated = True
             self._register_connection()
-            self._log(f"🎉 Canal seguro establecido con {real_name} (Firmado por: {issuer})")
             
             # Registrar clave pública en memoria (NO en DB, cambia cada sesión)
             peer_addr = normalize_addr(self._quic._network_paths[0].addr) if self._quic._network_paths else None
@@ -765,9 +820,40 @@ class MeshQuicProtocol(QuicConnectionProtocol):
         self.peer_identity = None
 
     def _register_connection(self):
-        """Registra esta conexión como activa en el NetworkManager."""
-        if self.network_manager and self.peer_identity:
-            self.network_manager.active_connections[self.peer_identity] = self
+        """
+        Registra esta conexión como activa en el NetworkManager.
+        
+        Usa target_user_id (hash del serial DNIe) como clave, que es lo que
+        usa send_message() para buscar conexiones existentes.
+        """
+        if not self.network_manager:
+            return
+        
+        # Determinar la clave de registro (preferir user_id sobre peer_identity)
+        registration_key = self.target_user_id or self.peer_identity
+        if not registration_key:
+            return
+        
+        # Si ya existe una conexión con este peer, reemplazarla
+        old_proto = self.network_manager.active_connections.get(registration_key)
+        if old_proto and old_proto is not self:
+            # Cerrar la conexión antigua de forma limpia
+            old_proto._close_redundant()
+        
+        self.network_manager.active_connections[registration_key] = self
+
+    def _close_redundant(self):
+        """Cierra esta conexión de forma limpia (es redundante)."""
+        try:
+            # Limpiar sesión Noise
+            if self.noise_session:
+                self.network_manager.sessions.remove_session(self.noise_session)
+                self.noise_session = None
+            # Cerrar conexión QUIC sin notificar desconeción
+            self._quic.close()
+            self.transmit()
+        except:
+            pass
 
     def _send_signal(self, signal_type: int, payload: bytes):
         """Envía un paquete de señalización por Stream 0.
