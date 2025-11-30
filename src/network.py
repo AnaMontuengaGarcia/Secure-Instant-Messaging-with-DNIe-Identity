@@ -374,6 +374,7 @@ class MeshQuicProtocol(QuicConnectionProtocol):
         self._pending_messages = []  # Mensajes pendientes hasta autenticación
         self._unacked_messages = {}  # msg_id -> msg_struct (enviados pero sin ACK)
         self._signal_buffer = b""    # Buffer para Stream 0
+        self._chat_buffers = {}       # Buffer para streams de chat: stream_id -> bytes
 
     def set_network_manager(self, manager: 'QuicNetworkManager'):
         """Inyecta referencia al gestor de red."""
@@ -693,14 +694,26 @@ class MeshQuicProtocol(QuicConnectionProtocol):
         if not self.is_authenticated or not self.noise_session:
             return
         
+        # Acumular datos en buffer hasta que el stream termine
+        if stream_id not in self._chat_buffers:
+            self._chat_buffers[stream_id] = b""
+        self._chat_buffers[stream_id] += data
+        
+        # Si el stream no ha terminado, esperar más datos
+        if not end_stream:
+            return
+        
+        # Stream completo - procesar datos acumulados
+        full_data = self._chat_buffers.pop(stream_id)
+        
         try:
             # 1. Extraer el Nonce (los primeros 12 bytes)
-            if len(data) < 12:
+            if len(full_data) < 12:
                 self._log("❌ Mensaje muy corto, ignorando")
                 return
             
-            received_nonce = data[:12]
-            ciphertext = data[12:]
+            received_nonce = full_data[:12]
+            ciphertext = full_data[12:]
             
             # 2. Protección Anti-Replay con Ventana Deslizante (WireGuard-style)
             # Extraer el contador del nonce (primeros 8 bytes, Little Endian)
