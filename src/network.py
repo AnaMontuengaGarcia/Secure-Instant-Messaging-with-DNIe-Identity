@@ -505,18 +505,32 @@ class MeshQuicProtocol(QuicConnectionProtocol):
             resp_data = self.noise_session.create_handshake_response()
             self._send_signal(SIGNAL_NOISE_RESPONSE, resp_data)
             
-            # Verificar si ya existe una conexión activa con este peer
-            # Buscar primero el user_id del peer para verificar correctamente
+            # Buscar el user_id del peer usando múltiples estrategias
             raw_peer_addr = normalize_addr(self._quic._network_paths[0].addr) if self._quic._network_paths else None
             peer_user_id = None
+            announced_addr = None
+            
             if self.network_manager:
-                # Buscar user_id por dirección IP
-                if raw_peer_addr:
+                # PRIORIDAD 1: Buscar user_id usando el mapeo real_name -> user_id
+                peer_user_id = self.network_manager.real_name_to_user_id.get(real_name)
+                if peer_user_id:
+                    announced_addr = self.network_manager.peer_addresses.get(peer_user_id)
+                
+                # PRIORIDAD 2: Buscar por IP (normalizada)
+                if not peer_user_id and raw_peer_addr:
                     for uid, addr in self.network_manager.peer_addresses.items():
                         if addr[0] == raw_peer_addr[0]:  # Misma IP
                             peer_user_id = uid
+                            announced_addr = addr
                             break
+                
+                # PRIORIDAD 3: Usar callback de la TUI si existe
+                if not peer_user_id and self.network_manager.get_user_id_for_name_callback:
+                    peer_user_id = self.network_manager.get_user_id_for_name_callback(real_name)
+                    if peer_user_id:
+                        announced_addr = self.network_manager.peer_addresses.get(peer_user_id)
             
+            # Verificar si ya existe una conexión activa con este peer
             existing_proto = None
             if peer_user_id:
                 existing_proto = self.network_manager.active_connections.get(peer_user_id)
@@ -530,6 +544,8 @@ class MeshQuicProtocol(QuicConnectionProtocol):
                 # Completamos el handshake pero cerramos esta conexión redundante
                 self._log(f"ℹ️ Conexión entrante de {real_name} - reutilizando conexión existente")
                 self.is_authenticated = True  # Para que el cierre sea limpio
+                # Guardar user_id para cleanup correcto
+                self.target_user_id = peer_user_id
                 # NO registrar esta conexión - cerrarla después de responder
                 # Dar tiempo a que el handshake response llegue
                 asyncio.get_event_loop().call_later(0.5, self._close_redundant)
@@ -538,29 +554,19 @@ class MeshQuicProtocol(QuicConnectionProtocol):
             # Es una conexión nueva - registrarla
             self._log(f"✅ Conectado con: {real_name} (Firmado por: {issuer})")
             
-            # Obtener dirección de conexión (puede ser puerto efímero)
-            raw_peer_addr = normalize_addr(self._quic._network_paths[0].addr) if self._quic._network_paths else None
-            
-            # Buscar la dirección correcta (puerto anunciado) del peer y su user_id
-            announced_addr = None
-            peer_user_id = None
-            if self.network_manager:
-                # Buscar por identidad primero
-                announced_addr = self.network_manager.peer_addresses.get(real_name)
-                if announced_addr:
-                    # Buscar user_id para esta dirección
-                    peer_user_id = self.network_manager.addr_to_identity.get(announced_addr)
-                
-                if not announced_addr and raw_peer_addr:
-                    # Buscar por IP (normalizada)
-                    for uid, addr in self.network_manager.peer_addresses.items():
-                        if addr[0] == raw_peer_addr[0]:  # Misma IP
-                            announced_addr = addr
-                            peer_user_id = uid
-                            # Actualizar mapeo de identidad
-                            self.network_manager.peer_addresses[real_name] = addr
-                            self.network_manager.addr_to_identity[addr] = real_name
-                            break
+            # Si encontramos el user_id, actualizar el mapeo real_name -> user_id
+            if peer_user_id and self.network_manager:
+                self.network_manager.real_name_to_user_id[real_name] = peer_user_id
+                # Actualizar dirección si la IP cambió
+                if raw_peer_addr and (not announced_addr or announced_addr[0] != raw_peer_addr[0]):
+                    # Usar IP nueva pero mantener puerto anunciado si existe
+                    new_port = announced_addr[1] if announced_addr else raw_peer_addr[1]
+                    new_addr = (raw_peer_addr[0], new_port)
+                    self.network_manager.peer_addresses[peer_user_id] = new_addr
+                    if announced_addr:
+                        self.network_manager.addr_to_identity.pop(announced_addr, None)
+                    self.network_manager.addr_to_identity[new_addr] = peer_user_id
+                    announced_addr = new_addr
             
             # Guardar user_id del peer para identificación
             self.target_user_id = peer_user_id
@@ -618,6 +624,10 @@ class MeshQuicProtocol(QuicConnectionProtocol):
             
             # Actualizar sesión con identidad
             self.network_manager.sessions.update_session_identity(self.noise_session, real_name)
+            
+            # Actualizar mapeo real_name -> user_id si tenemos el user_id
+            if self.target_user_id and self.network_manager:
+                self.network_manager.real_name_to_user_id[real_name] = self.target_user_id
             
             # Verificar si ya existe una conexión entrante de este peer
             # (el peer pudo habernos conectado mientras nosotros le conectábamos)
@@ -1120,6 +1130,10 @@ class QuicNetworkManager:
         # Claves públicas conocidas: user_id -> X25519PublicKey
         self.peer_pubkeys: Dict[str, Any] = {}
         
+        # Mapeo inverso: real_name (certificado DNIe) -> user_id (hash mDNS)
+        # Permite encontrar conexiones activas cuando solo conocemos el nombre del certificado
+        self.real_name_to_user_id: Dict[str, str] = {}
+        
         # Servidor QUIC
         self._server = None
         self._server_task = None
@@ -1141,6 +1155,7 @@ class QuicNetworkManager:
         self.get_peer_addr_callback = None
         self.get_user_id_callback = None
         self.is_peer_online_callback = None
+        self.get_user_id_for_name_callback = None  # real_name -> user_id
 
     def _create_server_config(self) -> QuicConfiguration:
         """Crea configuración TLS para el servidor."""

@@ -299,6 +299,7 @@ class MessengerTUI(App):
         self.proto.get_peer_addr_callback = self._get_peer_addr_from_list
         self.proto.get_user_id_callback = self._get_user_id_for_addr
         self.proto.is_peer_online_callback = self._is_peer_online
+        self.proto.get_user_id_for_name_callback = self._get_user_id_for_name
         
         self.discovery.on_found_callback = self.add_peer
         self.discovery.on_log = self.add_log 
@@ -390,6 +391,21 @@ class MessengerTUI(App):
                 if isinstance(child, ChatItem):
                     if child.contact_ip == addr[0] and child.contact_port == addr[1]:
                         return child.user_id
+        except: pass
+        return None
+
+    def _get_user_id_for_name(self, real_name):
+        """Obtiene el user_id dado el nombre real del certificado DNIe."""
+        # Buscar en el diccionario known_names (invertido)
+        for uid, name in self.known_names.items():
+            if name == real_name:
+                return uid
+        # Fallback: buscar en la lista de contactos
+        try:
+            lst = self.query_one("#contact_list", ListView)
+            for child in lst.children:
+                if isinstance(child, ChatItem) and child.real_name == real_name:
+                    return child.user_id
         except: pass
         return None
 
