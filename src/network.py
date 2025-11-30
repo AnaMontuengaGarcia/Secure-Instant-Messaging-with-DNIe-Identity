@@ -687,15 +687,40 @@ class MeshQuicProtocol(QuicConnectionProtocol):
         self._cleanup()
 
     def _handle_chat_data(self, stream_id: int, data: bytes, end_stream: bool):
-        """Procesa datos de chat recibidos."""
-        if not self.is_authenticated:
+        """Procesa datos de chat recibidos (Descifrado ChaCha20Poly1305 WireGuard-style)."""
+        if not self.is_authenticated or not self.noise_session:
             return
         
         try:
-            # Los datos vienen en JSON plano (QUIC/TLS ya descifró)
-            msg_struct = json.loads(data.decode('utf-8'))
+            # 1. Extraer el Nonce (los primeros 12 bytes)
+            if len(data) < 12:
+                self._log("❌ Mensaje muy corto, ignorando")
+                return
             
-            # Verificación de integridad del mensaje (Hash Check)
+            received_nonce = data[:12]
+            ciphertext = data[12:]
+            
+            # 2. Protección Anti-Replay con Ventana Deslizante (WireGuard-style)
+            # Extraer el contador del nonce (primeros 8 bytes, Little Endian)
+            counter = struct.unpack('<Q', received_nonce[:8])[0]
+            
+            # Verificar si el contador es válido usando ventana deslizante
+            if not self._check_replay(counter):
+                self._log(f"⚠️ Paquete rechazado por anti-replay (contador: {counter})")
+                return
+            
+            # 3. Descifrar usando el decryptor de la sesión
+            # Si el descifrado falla (Poly1305 no coincide), lanzará excepción
+            # protegiendo automáticamente contra modificaciones
+            plaintext = self.noise_session.decryptor.decrypt(received_nonce, ciphertext, None)
+            
+            # 4. Actualizar ventana anti-replay DESPUÉS de descifrado exitoso
+            self._update_replay_window(counter)
+            
+            # 5. Parsear el JSON (ahora ya es texto plano seguro)
+            msg_struct = json.loads(plaintext.decode('utf-8'))
+            
+            # Verificación de integridad del mensaje (Hash Check de aplicación)
             if 'text' in msg_struct and 'hash' in msg_struct:
                 content = msg_struct['text']
                 local_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
@@ -732,9 +757,9 @@ class MeshQuicProtocol(QuicConnectionProtocol):
                     self._send_msg_ack(msg_struct['id'])
                 
         except json.JSONDecodeError as e:
-            self._log(f"❌ Error en mensaje recibido")
+            self._log(f"❌ Error en mensaje recibido (JSON inválido)")
         except Exception as e:
-            self._log(f"❌ Error procesando mensaje: {e}")
+            self._log(f"❌ Error descifrando o procesando mensaje: {e}")
 
     def _handle_connection_closed(self, event: ConnectionTerminated):
         """Maneja el cierre de conexión."""
@@ -869,29 +894,120 @@ class MeshQuicProtocol(QuicConnectionProtocol):
         """
         Envía un mensaje de chat.
         
-        El mensaje va en JSON plano porque QUIC/TLS ya cifra.
+        Cifrado WireGuard-style: El mensaje se cifra con ChaCha20Poly1305
+        usando la clave de sesión Noise antes de enviarlo por QUIC.
+        Esto proporciona cifrado de capa de aplicación independiente de TLS.
         """
-        if not self.is_authenticated:
+        if not self.is_authenticated or not self.noise_session:
             # Encolar para cuando se autentique
             self._pending_messages.append(msg_struct)
             return False
         
         try:
+            # 1. Serializar el JSON a bytes
             json_bytes = json.dumps(msg_struct).encode('utf-8')
+            
+            # 2. Obtener y preparar el Nonce (12 bytes: 8 bytes contador + 4 bytes padding ceros)
+            # Usamos 'Little Endian' (<) para el contador de 64 bits (Q)
+            nonce = struct.pack('<Q', self.noise_session.tx_nonce) + b'\x00\x00\x00\x00'
+            
+            # 3. Cifrar usando el encryptor de la sesión
+            # El encryptor ya tiene la clave de sesión (k1) configurada desde el handshake
+            ciphertext = self.noise_session.encryptor.encrypt(nonce, json_bytes, None)
+            
+            # 4. Incrementar el contador local para el siguiente mensaje
+            self.noise_session.tx_nonce += 1
+            
+            # 5. Empaquetar para envío: Enviamos [Nonce (12B)] + [Ciphertext]
+            # Es vital enviar el nonce para que el receptor sepa cuál usar
+            final_payload = nonce + ciphertext
+            
+            # 6. Enviar por el stream de QUIC
             stream_id = self._quic.get_next_available_stream_id()
-            self._quic.send_stream_data(stream_id, json_bytes, end_stream=True)
+            self._quic.send_stream_data(stream_id, final_payload, end_stream=True)
             self.transmit()
             
-            # Guardar mensaje como pendiente de ACK
+            # Guardar mensaje como pendiente de ACK (usando msg_struct original)
             if 'id' in msg_struct:
                 self._unacked_messages[msg_struct['id']] = msg_struct.copy()
             
             return True
         except Exception as e:
-            self._log(f"❌ Error enviando mensaje: {e}")
+            self._log(f"❌ Error cifrando/enviando mensaje: {e}")
             import traceback
             traceback.print_exc()
             return False
+
+    def _check_replay(self, counter: int) -> bool:
+        """
+        Verifica si un contador de paquete es válido (protección anti-replay).
+        
+        Implementa ventana deslizante estilo WireGuard:
+        - Si counter > rx_nonce: Es un paquete nuevo (válido)
+        - Si counter <= rx_nonce - window_size: Es demasiado antiguo (rechazar)
+        - Si counter está en la ventana: Verificar bitmap para ver si ya se usó
+        
+        Returns:
+            True si el paquete es válido (no es replay), False si debe rechazarse.
+        """
+        if not self.noise_session:
+            return False
+        
+        rx_nonce = self.noise_session.rx_nonce
+        window_size = self.noise_session.replay_window_size
+        bitmap = self.noise_session.replay_bitmap
+        
+        # Caso 1: Paquete más nuevo que cualquiera visto
+        if counter > rx_nonce:
+            return True
+        
+        # Caso 2: Paquete demasiado antiguo (fuera de la ventana)
+        if counter + window_size <= rx_nonce:
+            return False
+        
+        # Caso 3: Paquete dentro de la ventana - verificar bitmap
+        # El bit en posición (rx_nonce - counter) indica si ya se recibió
+        bit_position = rx_nonce - counter
+        if bitmap & (1 << bit_position):
+            # Ya se recibió este paquete - es un replay
+            return False
+        
+        return True
+
+    def _update_replay_window(self, counter: int):
+        """
+        Actualiza la ventana anti-replay después de un descifrado exitoso.
+        
+        - Si counter > rx_nonce: Desliza la ventana y marca el bit 0
+        - Si counter está en la ventana: Marca el bit correspondiente
+        """
+        if not self.noise_session:
+            return
+        
+        rx_nonce = self.noise_session.rx_nonce
+        window_size = self.noise_session.replay_window_size
+        bitmap = self.noise_session.replay_bitmap
+        
+        if counter > rx_nonce:
+            # Nuevo paquete más alto - deslizar ventana
+            shift = counter - rx_nonce
+            if shift >= window_size:
+                # Gran salto - reiniciar bitmap
+                bitmap = 1
+            else:
+                # Deslizar bitmap y marcar posición 0
+                bitmap = (bitmap << shift) | 1
+                # Mantener solo los bits dentro de la ventana
+                bitmap &= (1 << window_size) - 1
+            
+            # Actualizar contador máximo
+            self.noise_session.rx_nonce = counter
+        else:
+            # Paquete dentro de la ventana - marcar su bit
+            bit_position = rx_nonce - counter
+            bitmap |= (1 << bit_position)
+        
+        self.noise_session.replay_bitmap = bitmap
 
     def _send_msg_ack(self, msg_id: str):
         """Envía ACK de recepción de mensaje."""
